@@ -692,6 +692,7 @@ def _csa_fwd_flash_mla(
     attn_sink: Optional[Tensor] = None,
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
+    use_vllm_flashmla: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
 
@@ -701,11 +702,21 @@ def _csa_fwd_flash_mla(
     assert not (
         indexer_topk > 0 and topk_length is not None
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
-    _ensure_flash_mla()
+    if use_vllm_flashmla:
+        if indexer_topk:
+            raise ValueError("vLLM FlashMLA does not return indexer LSE")
+        from vllm.third_party.flashmla.flash_mla_interface import flash_mla_sparse_fwd
+
+        forward_kernel = flash_mla_sparse_fwd
+        extra_args = {}
+    else:
+        _ensure_flash_mla()
+        forward_kernel = _flash_mla_sparse_fwd
+        extra_args = {"indexer_topk": indexer_topk}
 
     _total_S_q, _H, _D = q.shape
     TopK = topk_idxs.shape[-1]
-    topk_align = get_flash_mla_topk_alignment()
+    topk_align = 128 if use_vllm_flashmla else get_flash_mla_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
     if TopK_padded != TopK:
         pad_width = TopK_padded - TopK
@@ -715,7 +726,7 @@ def _csa_fwd_flash_mla(
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
 
     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
-        res = _flash_mla_sparse_fwd(
+        res = forward_kernel(
             q,
             kv_3d,
             indices,
@@ -723,7 +734,7 @@ def _csa_fwd_flash_mla(
             d_v=d_v,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            indexer_topk=indexer_topk,
+            **extra_args,
         )
         if indexer_topk > 0:
             out, _max_logits, lse, lse_indexer = res
@@ -1380,6 +1391,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         softmax_scale: float,
         indexer_topk: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+        use_vllm_flashmla: bool = False,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -1390,6 +1402,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             attn_sink=attn_sink,
             topk_length=topk_length,
             indexer_topk=indexer_topk,
+            use_vllm_flashmla=use_vllm_flashmla,
         )
 
         ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
@@ -1427,7 +1440,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length=ctx.topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None, None
+        return (dq, dkv, d_sink) + (None,) * (len(ctx.needs_input_grad) - 3)
 
 
 def csa_sparse_attn(
@@ -1440,6 +1453,7 @@ def csa_sparse_attn(
     indexer_topk: int = 0,
     is_thd: bool = False,
     kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
+    use_vllm_flashmla: bool = False,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -1467,6 +1481,8 @@ def csa_sparse_attn(
         indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
+        use_vllm_flashmla: Select vLLM's bundled forward with cuDNN backward.
+            This interface requires ``indexer_topk=0``.
         kv_reconstruction_parts: Optional ``(boundary_kv, local_kv, compressed_kv)``
             tuple used only to reconstruct THD ``kv`` during backward. Supplying
             the direct producer tensors lets selective MLA-up-projection
@@ -1510,6 +1526,7 @@ def csa_sparse_attn(
         softmax_scale,
         indexer_topk,
         kv_reconstruction_parts,
+        use_vllm_flashmla,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),

@@ -582,6 +582,7 @@ def _apply_rope(
         max_total = None
 
     use_fused = config.apply_rope_fusion
+    rope_dtype = torch.float32 if config.csa_inference_rope_fp32 else x.dtype
 
     if use_fused:
         # ``mscale=1.0`` keeps the cached cos/sin free of yarn's
@@ -589,7 +590,7 @@ def _apply_rope(
         # split-rotate path (DSv4 "pure rotation" contract).
         if packed_seq:
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                max_total, dtype=x.dtype, packed_seq=True, mscale=1.0
+                max_total, dtype=rope_dtype, packed_seq=True, mscale=1.0
             )
             if ratio > 1:
                 cos = cos[:max_total:ratio]
@@ -597,7 +598,7 @@ def _apply_rope(
         else:
             total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                total, dtype=x.dtype, packed_seq=False, mscale=1.0
+                total, dtype=rope_dtype, packed_seq=False, mscale=1.0
             )
             if ratio > 1:
                 cos = cos[:total:ratio][:rotary_seq_len]
@@ -840,6 +841,7 @@ def _unfused_indexer_sparse_attn_from_topk(
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    attention_forward=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -849,7 +851,8 @@ def _unfused_indexer_sparse_attn_from_topk(
     ``_max_seqlen_q`` is unused here; it is retained to match the fused
     callable's signature, with the leading underscore marking it as unused.
     """
-    output = unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
+    attention_forward = attention_forward or unfused_compressed_sparse_attn
+    output = attention_forward(query, kv_full, attn_sink, topk_indices, softmax_scale)
 
     total_q, np_, hn = query.shape
     cu_seqlens_q, cu_seqlens_k, q_causal_offsets = indexer_layout
@@ -1376,7 +1379,14 @@ class Compressor(MegatronModule):
             )
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
+                    int(max_seqlen_q),
+                    dtype=(
+                        torch.float32
+                        if self.config.csa_inference_rope_fp32
+                        else compressed_thd.dtype
+                    ),
+                    packed_seq=True,
+                    mscale=1.0,
                 )
                 compressed_thd = fused_mla_rope_inplace(
                     compressed_thd,
@@ -1801,6 +1811,14 @@ class CompressedSparseAttention(MegatronModule):
 
         self.use_fused_kernels = use_fused_dsa_kernels(config)
 
+        if config.csa_inference_kv_quantization or config.csa_use_vllm_flashmla:
+            if self.use_fused_kernels or config.dsa_indexer_loss_coeff != 0:
+                raise ValueError(
+                    "Inference KV quantization requires unfused attention and zero indexer loss"
+                )
+            if config.v_head_dim != 512 or config.qk_pos_emb_head_dim != 64:
+                raise ValueError("Inference KV quantization requires 448 NoPE and 64 RoPE channels")
+
         # Learnable attention sink per head, kept in high precision
         # (FP32 in the reference DeepSeek V4 checkpoint)
         self.attn_sink = mark_keep_in_fp32(
@@ -1861,6 +1879,23 @@ class CompressedSparseAttention(MegatronModule):
             self.compressor.backward_dw()
         if self.indexer is not None:
             self.indexer.backward_dw()
+
+    def _attention_kv(self, kv: torch.Tensor) -> torch.Tensor:
+        if not self.config.csa_inference_kv_quantization:
+            return kv
+        from .csa_utils.inference_precision import quantize_kv_nope
+
+        return quantize_kv_nope(kv)
+
+    def _attention_forward(self, query, kv, sink, indices, scale):
+        if not self.config.csa_use_vllm_flashmla:
+            return unfused_compressed_sparse_attn(query, kv, sink, indices, scale)
+        is_thd = query.ndim == 3
+        if not is_thd:
+            indices, _ = build_flat_topk_idxs(indices, batch_size=query.shape[1])
+        return csa_sparse_attn(
+            query, kv, sink, indices, scale, is_thd=is_thd, use_vllm_flashmla=True
+        )
 
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
@@ -2133,8 +2168,12 @@ class CompressedSparseAttention(MegatronModule):
         topk_idxs = topk_idxs.int()
 
         nvtx_range_push("sparse_attn_kernel")
-        output = unfused_compressed_sparse_attn(
-            query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
+        output = self._attention_forward(
+            query,
+            self._attention_kv(kv_full),
+            self.attn_sink.float(),
+            topk_idxs,
+            self.softmax_scale,
         )
         nvtx_range_pop("sparse_attn_kernel")
         return output, indexer_loss
@@ -2539,8 +2578,12 @@ class CompressedSparseAttention(MegatronModule):
             topk_idxs, batch_size=-1, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv_full
         )
 
-        output = unfused_compressed_sparse_attn(
-            query, kv_full_thd, self.attn_sink.float(), flat_idxs, self.softmax_scale
+        output = self._attention_forward(
+            query,
+            self._attention_kv(kv_full_thd),
+            self.attn_sink.float(),
+            flat_idxs,
+            self.softmax_scale,
         )
         return output.unsqueeze(1), indexer_loss
 
@@ -2954,10 +2997,21 @@ class CompressedSparseAttention(MegatronModule):
                 )
                 if self.config.apply_rope_fusion:
                     rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                        max_seqlen_q,
+                        dtype=(
+                            torch.float32
+                            if self.config.csa_inference_rope_fp32
+                            else q_indexer_cp.dtype
+                        ),
+                        packed_seq=True,
+                        mscale=1.0,
                     )
                     q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
-                        q_indexer_cp,
+                        (
+                            q_indexer_cp.float()
+                            if self.config.csa_inference_rope_fp32
+                            else q_indexer_cp
+                        ),
                         rotary_pos_cos,
                         rotary_pos_sin,
                         indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
@@ -2965,6 +3019,8 @@ class CompressedSparseAttention(MegatronModule):
                         cu_seqlens,
                         global_start,
                     )
+                    if self.config.csa_inference_rope_fp32:
+                        q_indexer_cp = q_indexer_cp.bfloat16()
                 else:
                     rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
                     rotary_pos_emb = (
@@ -3077,6 +3133,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv_rank_major.detach() if overlap_cp_backward else compressed_kv_rank_major
         )
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_for_attention), dim=0)
+        kv_full_thd = self._attention_kv(kv_full_thd)
         # ``kv_full_thd`` stays the autograd input so its cat edge owns dKV.
         # Saving the direct producers only changes which values survive until backward.
         kv_reconstruction_parts = (
@@ -3177,7 +3234,9 @@ class CompressedSparseAttention(MegatronModule):
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
-                    *indexer_loss_args, tp_group=indexer.pg_collection.tp
+                    *indexer_loss_args,
+                    tp_group=indexer.pg_collection.tp,
+                    attention_forward=self._attention_forward,
                 )
             if indexer_loss_coeff > 0:
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -3202,7 +3261,7 @@ class CompressedSparseAttention(MegatronModule):
                 kv_reconstruction_parts=kv_reconstruction_parts,
             )
         else:
-            output = unfused_compressed_sparse_attn(
+            output = self._attention_forward(
                 query, kv_full_thd, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
         return output.unsqueeze(1)

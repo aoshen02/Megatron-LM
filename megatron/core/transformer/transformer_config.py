@@ -400,6 +400,21 @@ class TransformerConfig(ModelParallelConfig):
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
 
+    csa_inference_kv_quantization: bool = False
+    """Round DSv4 NoPE KV to inference block64 FP8 precision before attention.
+    Currently requires the unfused attention backend and a disabled indexer loss."""
+
+    csa_inference_projection_quantization: bool = False
+    """Round grouped DSv4 output-projection inputs/weights to inference FP8 block scales."""
+
+    csa_inference_rope_fp32: bool = False
+    """Keep Q normalization and RoPE in FP32 until the inference quantization boundaries.
+    Requires fused RoPE and inference projection quantization."""
+
+    csa_use_vllm_flashmla: bool = False
+    """Use vLLM's bundled FlashMLA forward with cuDNN backward on the unfused CSA path.
+    Requires a disabled indexer loss; does not replace the indexer kernels."""
+
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
     sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
@@ -1292,6 +1307,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
+
+    mhc_inference_precision: bool = False
+    """Keep mHC mappings and stream accumulation in FP32, returning activation dtype."""
 
     use_fused_mhc: bool = False
     """Use unified fused kernels for mHC operations.

@@ -42,7 +42,9 @@ class TestHyperConnectionCheckpoint:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _create_hyper_connection_module(self, hidden_size=64, num_residual_streams=4):
+    def _create_hyper_connection_module(
+        self, hidden_size=64, num_residual_streams=4, use_fused_mhc=False
+    ):
         """Create a HyperConnectionModule for testing."""
         config = TransformerConfig(
             num_layers=2,
@@ -53,10 +55,72 @@ class TestHyperConnectionCheckpoint:
             num_residual_streams=num_residual_streams,
             mhc_sinkhorn_iterations=5,  # Fewer iterations for faster tests
             mhc_init_gating_factor=0.01,
+            use_fused_mhc=use_fused_mhc,
         )
         module = HyperConnectionModule(config=config, layer_number=1)
         module.cuda()
         return module
+
+    @pytest.mark.parametrize("use_fused_mhc", [False, True])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize("hidden_size", [64, 4096])
+    @pytest.mark.parametrize("checkpoint_post", [False, True])
+    def test_inference_precision_matches_explicit_fp32(
+        self, use_fused_mhc, with_bias, hidden_size, checkpoint_post
+    ):
+        """Match the diagnosed precision boundaries without disabling autograd."""
+        candidate = self._create_hyper_connection_module(hidden_size, use_fused_mhc=use_fused_mhc)
+        reference = self._create_hyper_connection_module(hidden_size, use_fused_mhc=use_fused_mhc)
+        reference.load_state_dict(candidate.state_dict())
+        candidate.config.mhc_inference_precision = True
+        x = torch.randn(
+            8, 1, 4 * hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        y = torch.randn(8, 1, hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        bias = (
+            torch.randn(hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            if with_bias
+            else None
+        )
+        xr = x.detach().clone().requires_grad_()
+        yr = y.detach().clone().requires_grad_()
+        br = bias.detach().clone().requires_grad_() if with_bias else None
+
+        hp, ho, hr = candidate.compute_mappings(x)
+        aggregate = candidate.aggregate(x, hp)
+        manager = MHCCheckpointManager() if checkpoint_post else None
+        out = candidate.fused_h_res_h_post_bda(
+            hr, x, ho, (y, bias), 0.0, True, False, manager=manager
+        )
+        rp, ro, rr = reference.compute_mappings(xr.float())
+        expected_aggregate = reference.aggregate(xr.float(), rp).to(x.dtype)
+        expected = reference.fused_h_res_h_post_bda(
+            rr, xr.float(), ro, (yr.float(), None if br is None else br.float()), 0.0, True, False
+        ).to(x.dtype)
+        for actual, expected_value in (
+            (hp, rp),
+            (ho, ro),
+            (hr, rr),
+            (aggregate, expected_aggregate),
+            (out, expected),
+        ):
+            torch.testing.assert_close(actual, expected_value, rtol=0, atol=0)
+        assert hp.dtype == ho.dtype == hr.dtype == torch.float32
+        assert out.dtype == aggregate.dtype == x.dtype
+        upstream = torch.randn_like(out)
+        loss = (out * upstream).float().sum() + aggregate.float().square().mean()
+        if manager is not None:
+            manager.discard_all_outputs_and_register_unified_recompute(loss)
+        loss.backward()
+        (
+            (expected * upstream).float().sum() + expected_aggregate.float().square().mean()
+        ).backward()
+        pairs = [(x, xr), (y, yr), *zip(candidate.parameters(), reference.parameters())]
+        if with_bias:
+            pairs.append((bias, br))
+        for actual, expected_value in pairs:
+            assert actual.grad is not None and torch.isfinite(actual.grad).all()
+            torch.testing.assert_close(actual.grad, expected_value.grad, rtol=0, atol=0)
 
     def test_apply_h_res_uses_h_res_transpose(self):
         """apply_h_res should compute H_res.T @ residual."""
@@ -87,7 +151,9 @@ class TestHyperConnectionCheckpoint:
         assert hidden_states.grad is not None
         assert module.mapping_proj.weight.grad is not None
 
-    def test_forward_normal_vs_checkpoint_correctness(self):
+    @pytest.mark.parametrize("inference_precision", [False, True])
+    @pytest.mark.parametrize("use_fused_mhc", [False, True])
+    def test_forward_normal_vs_checkpoint_correctness(self, inference_precision, use_fused_mhc):
         """
         Test that _forward_with_checkpoint produces the same outputs as _forward_normal.
         """
@@ -96,14 +162,26 @@ class TestHyperConnectionCheckpoint:
         seq_len = 8
         batch_size = 2
 
-        module = self._create_hyper_connection_module(hidden_size, num_streams)
+        module = self._create_hyper_connection_module(hidden_size, num_streams, use_fused_mhc)
+        module.config.mhc_inference_precision = inference_precision
+        dtype = torch.bfloat16 if inference_precision else torch.float32
 
         # Create input tensors
         hidden_states = torch.randn(
-            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+            seq_len,
+            batch_size,
+            num_streams * hidden_size,
+            device='cuda',
+            dtype=dtype,
+            requires_grad=True,
         )
         residual = torch.randn(
-            seq_len, batch_size, num_streams * hidden_size, device='cuda', requires_grad=True
+            seq_len,
+            batch_size,
+            num_streams * hidden_size,
+            device='cuda',
+            dtype=dtype,
+            requires_grad=True,
         )
 
         # Clone inputs for comparison
@@ -114,11 +192,15 @@ class TestHyperConnectionCheckpoint:
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
         aggregated_ref, h_res_ref, h_post_ref, residual_ref = module._forward_normal(hidden_states)
-        mixed_ref = module.apply_h_res(h_res_ref, residual)
+        mixed_ref = module.fused_h_res_h_post_bda(
+            h_res_ref, residual, h_post_ref, (aggregated_ref, None), 0.0, True, False
+        )
         loss_ref = aggregated_ref.sum() + mixed_ref.sum() + h_post_ref.sum()
         loss_ref.backward()
         grad_hidden_ref = hidden_states.grad.clone()
         grad_residual_ref = residual.grad.clone()
+        parameter_grads_ref = [p.grad.clone() for p in module.parameters()]
+        module.zero_grad(set_to_none=True)
 
         # Forward with checkpoint
         torch.manual_seed(42)
@@ -127,7 +209,17 @@ class TestHyperConnectionCheckpoint:
         aggregated_ckpt, h_res_ckpt, h_post_ckpt, residual_ckpt_out = (
             module._forward_with_checkpoint(hidden_states_ckpt, manager)
         )
-        mixed_ckpt = module.apply_h_res(h_res_ckpt, residual_ckpt)
+        mixed_ckpt = module.fused_h_res_h_post_bda(
+            h_res_ckpt,
+            residual_ckpt,
+            h_post_ckpt,
+            (aggregated_ckpt, None),
+            0.0,
+            True,
+            False,
+            manager=manager,
+        )
+        torch.testing.assert_close(mixed_ckpt, mixed_ref, rtol=0, atol=0)
         # Calculate loss before discarding outputs
         loss_ckpt = aggregated_ckpt.sum() + mixed_ckpt.sum() + h_post_ckpt.sum()
 
@@ -138,6 +230,9 @@ class TestHyperConnectionCheckpoint:
         loss_ckpt.backward()
         grad_hidden_ckpt = hidden_states_ckpt.grad.clone()
         grad_residual_ckpt = residual_ckpt.grad.clone()
+        for parameter, expected in zip(module.parameters(), parameter_grads_ref):
+            assert torch.isfinite(parameter.grad).all()
+            torch.testing.assert_close(parameter.grad, expected)
 
         # Verify gradients match
         assert torch.allclose(grad_hidden_ckpt, grad_hidden_ref, atol=1e-5), (
