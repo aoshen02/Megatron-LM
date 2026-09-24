@@ -25,6 +25,68 @@ except ImportError:
 _SEED = 42
 
 
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+@pytest.mark.parametrize("rows", [1, 7, 32])
+@pytest.mark.parametrize("matmul_precision", ["highest", "medium"])
+def test_inference_grouped_projection_quantized_forward_and_gradients(rows, matmul_precision):
+    """Match explicit block scales and analytical straight-through gradients."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.inference_precision import (
+        inference_precision_grouped_projection,
+    )
+
+    torch.manual_seed(_SEED)
+    x = torch.randn(rows, 2, 256, device="cuda", requires_grad=True)
+    weight = torch.randn(2, 128, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def reference_qdq(value, shape, axes):
+        blocks = value.detach().float().reshape(shape)
+        amax = blocks.abs().amax(axes, keepdim=True).clamp_min(1e-4)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448)))
+        return ((blocks / scale).to(torch.float8_e4m3fn).float() * scale).reshape_as(value)
+
+    qx = reference_qdq(x, (rows, 2, 2, 128), -1)
+    qw = reference_qdq(weight, (2, 1, 128, 2, 128), (-3, -1))
+    previous_precision = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision(matmul_precision)
+        actual = inference_precision_grouped_projection(x, weight)
+        expected = torch.einsum("ngk,gok->ngo", qx.bfloat16(), qw.bfloat16())
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        grad = torch.randn_like(actual)
+        actual.backward(grad)
+        dx = torch.einsum("ngo,gok->ngk", grad, qw.bfloat16()).float()
+        dw = torch.einsum("ngo,ngk->gok", grad, qx.bfloat16())
+        torch.testing.assert_close(x.grad, dx, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(weight.grad, dw, atol=0, rtol=0)
+    finally:
+        torch.set_float32_matmul_precision(previous_precision)
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is required")
+@pytest.mark.parametrize("rows", [1, 7, 65, 128])
+def test_inference_kv_precision_preserves_rope_and_gradient(rows):
+    """Match inference block scales without disconnecting training gradients."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.inference_precision import (
+        quantize_kv_nope,
+    )
+
+    torch.manual_seed(_SEED)
+    kv = torch.randn(rows, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    original = kv.detach().clone()
+    blocks = original[:, :448].float().reshape(rows, 7, 64)
+    scales = torch.exp2(
+        torch.ceil(torch.log2(blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) / 448))
+    )
+    expected = ((blocks / scales).to(torch.float8_e4m3fn).float() * scales).flatten(1)
+    actual = quantize_kv_nope(kv)
+    torch.testing.assert_close(actual[:, :448], expected.bfloat16(), atol=0, rtol=0)
+    torch.testing.assert_close(actual[:, 448:], original[:, 448:], atol=0, rtol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    torch.testing.assert_close(kv.grad, upstream, atol=0, rtol=0)
+    torch.testing.assert_close(kv, original, atol=0, rtol=0)
+
+
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return x * scale
 
@@ -301,6 +363,43 @@ class TestDSv4HybridAttentionForwardBackward:
 
         assert output.shape == (seq_len, batch_size, self.config.hidden_size)
         assert not torch.isnan(output).any()
+
+    @pytest.mark.parametrize("layer_number", [1, 2, 3])
+    @pytest.mark.parametrize("packed_input", [False, True])
+    @pytest.mark.parametrize(
+        "projection_quantization,rope_fp32,use_vllm_flashmla",
+        [(False, False, False), (True, False, False), (True, True, False), (True, True, True)],
+    )
+    def test_inference_kv_precision_backward(
+        self, layer_number, packed_input, projection_quantization, rope_fp32, use_vllm_flashmla
+    ):
+        """Quantize both window and compressed rows without losing compressor gradients."""
+        config = _make_config(
+            num_attention_heads=64 if use_vllm_flashmla else 2,
+            o_groups=8 if use_vllm_flashmla else 2,
+            o_lora_rank=128,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            csa_inference_kv_quantization=True,
+            csa_inference_projection_quantization=projection_quantization,
+            csa_inference_rope_fp32=rope_fp32,
+            csa_use_vllm_flashmla=use_vllm_flashmla,
+            apply_rope_fusion=True,
+            dsa_kernel_backend="none",
+        )
+        attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
+        hidden = torch.randn(
+            256, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        packed = _make_thd_packed_seq_params([128, 128]) if packed_input else None
+        output, _ = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=packed)
+        output.float().square().mean().backward()
+        assert torch.isfinite(output).all()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        for name, parameter in attn.named_parameters():
+            if "indexer" not in name and parameter.requires_grad:
+                assert parameter.grad is not None, name
+                assert torch.isfinite(parameter.grad).all(), name
 
     def test_different_seq_lengths(self):
         """Forward should handle various sequence lengths."""

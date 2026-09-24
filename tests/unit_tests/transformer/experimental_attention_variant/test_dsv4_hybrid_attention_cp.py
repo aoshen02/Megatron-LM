@@ -867,6 +867,103 @@ class TestDSv4HybridAttentionTHDCP:
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         _clear_cuda_test_state()
 
+    @pytest.mark.parametrize("layer_number", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "quantize_kv,rope_fp32,use_vllm_flashmla",
+        [(False, False, False), (True, False, False), (True, True, False), (True, True, True)],
+    )
+    def test_inference_kv_precision_cp_matches_reference(
+        self, layer_number, quantize_kv, rope_fp32, use_vllm_flashmla
+    ):
+        """KV rounding must reach the CP training/indexer path, including its backward."""
+        from unittest.mock import patch
+
+        from megatron.core.transformer.experimental_attention_variant.csa_utils.inference_precision import (
+            quantize_kv_nope,
+        )
+
+        def assert_match(actual, expected, label):
+            error = None
+            try:
+                _assert_cp_tensor_match(actual, expected, label)
+            except AssertionError as exc:
+                error = str(exc)
+                print(f"rank={dist.get_rank()} {label}: {error}", flush=True)
+                if actual.ndim == 3:
+                    rows = (actual.float() - expected.float()).abs().flatten(1).amax(1)
+                    values, indices = rows.topk(min(8, rows.numel()))
+                    print(
+                        f"rank={dist.get_rank()} worst_rows={indices.tolist()} max_abs={values.tolist()}",
+                        flush=True,
+                    )
+            failed = torch.tensor(error is not None, device="cuda", dtype=torch.int32)
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            assert not failed.item(), error or f"Peer failed {label}"
+
+        packed, total, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
+        valid = torch.cat(
+            [
+                torch.arange(padded, device="cuda") < real
+                for real, padded in zip(_DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_RAGGED_PADDED_SEG_LENS)
+            ]
+        )
+        local_valid = valid.index_select(0, local_idx)
+        configs = [
+            _make_config(
+                num_attention_heads=64 if use_vllm_flashmla else 2,
+                o_groups=8 if use_vllm_flashmla else 2,
+                o_lora_rank=128,
+                v_head_dim=512,
+                qk_pos_emb_head_dim=64,
+                csa_inference_kv_quantization=quantize_kv,
+                csa_inference_projection_quantization=rope_fp32,
+                csa_inference_rope_fp32=rope_fp32,
+                apply_rope_fusion=True,
+                csa_use_vllm_flashmla=use_vllm_flashmla,
+                dsa_kernel_backend="none",
+                context_parallel_size=cp,
+                cp_partition_mode="contiguous" if cp > 1 else "zigzag",
+                sequence_packing_scheduler="dp_balanced" if cp > 1 else None,
+            )
+            for cp in (self.cp_size, 1)
+        ]
+        model = _build_attention(configs[0], layer_number, self.pg).cuda()
+        reference = _build_attention(configs[1], layer_number, self.ref_pg).cuda()
+        _copy_module_parameters(model, reference)
+        for name, parameter in model.named_parameters():
+            root_value = parameter.detach().clone()
+            dist.broadcast(root_value, dist.get_global_rank(self.pg.cp, 0), group=self.pg.cp)
+            assert_match(parameter, root_value, f"same_cp_weight:{name}")
+        hidden = torch.randn(total, 1, configs[0].hidden_size, device="cuda", dtype=torch.bfloat16)
+        root_hidden = hidden.clone()
+        dist.broadcast(root_hidden, dist.get_global_rank(self.pg.cp, 0), group=self.pg.cp)
+        assert_match(hidden, root_hidden, "same_cp_input")
+        local = hidden.index_select(0, local_idx).detach().requires_grad_(True)
+        full = hidden.detach().requires_grad_(True)
+        target = "megatron.core.transformer.experimental_attention_variant.csa_utils.inference_precision.quantize_kv_nope"
+        with patch(target, wraps=quantize_kv_nope) as rounding:
+            actual, _ = model(hidden_states=local, attention_mask=None, packed_seq_params=packed)
+            assert rounding.call_count == int(quantize_kv)
+        expected, _ = reference(hidden_states=full, attention_mask=None, packed_seq_params=packed)
+        # CP and CP1 need not define the same output for padding queries.
+        assert_match(
+            actual[local_valid],
+            expected.index_select(0, local_idx)[local_valid],
+            "quantized_kv:output",
+        )
+        grad = torch.randn_like(expected)
+        grad.masked_fill_(~valid[:, None, None], 0)
+        actual.backward(grad.index_select(0, local_idx))
+        expected.backward(grad)
+        assert_match(local.grad, full.grad.index_select(0, local_idx), "quantized_kv:input_grad")
+        reference_params = dict(reference.named_parameters())
+        for name, parameter in model.named_parameters():
+            expected_grad = reference_params[name].grad
+            assert parameter.grad is not None and expected_grad is not None, name
+            summed = parameter.grad.clone()
+            dist.all_reduce(summed, group=self.pg.cp)
+            assert_match(summed, expected_grad, f"quantized_kv:{name}")
+
     def test_thd_cp_mxfp8_matches_full_reference_forward_backward(self):
         """MXFP8 CP top-k, loss, and gradients match the CP1 THD path."""
         if not _dsv4_cp_mxfp8_kernels_available():

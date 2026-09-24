@@ -99,6 +99,12 @@ class DSv4HybridAttention(Attention):
         ), "Offload qkv linear is not supported in DSv4 Hybrid Attention."
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
+        if self.config.csa_inference_rope_fp32 and not (
+            self.config.apply_rope_fusion and self.config.csa_inference_projection_quantization
+        ):
+            raise ValueError(
+                "Inference FP32 RoPE requires fused RoPE and inference projection quantization"
+            )
 
         self.q_head_dim = self.config.v_head_dim
 
@@ -343,6 +349,8 @@ class DSv4HybridAttention(Attention):
             self.qkv_up_checkpoint = None
 
         # inverse RoPE on last qk_pos_emb_head_dim of each head
+        if self.config.csa_inference_rope_fp32:
+            core_attn_out = core_attn_out.float()
         seq_len = core_attn_out.size(0)
         n_heads = self.num_attention_heads_per_partition
         pos_dim = self.config.qk_pos_emb_head_dim
@@ -372,7 +380,10 @@ class DSv4HybridAttention(Attention):
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rope_seqlen,
+                dtype=torch.float32 if self.config.csa_inference_rope_fp32 else hidden_states.dtype,
+                packed_seq=packed_seq,
+                mscale=mscale,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -465,7 +476,12 @@ class DSv4HybridAttention(Attention):
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        if self.config.csa_inference_projection_quantization:
+            from .csa_utils.inference_precision import inference_precision_grouped_projection
+
+            core_attn_out = inference_precision_grouped_projection(core_attn_out, wo_a_weight)
+        else:
+            core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
@@ -628,7 +644,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rotary_seq_len,
+                dtype=torch.float32 if self.config.csa_inference_rope_fp32 else hidden_states.dtype,
+                packed_seq=packed_seq,
+                mscale=mscale,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -708,6 +727,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+            if self.config.csa_inference_rope_fp32:
+                q = q.float()
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
@@ -719,6 +740,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             kv, _ = self.linear_kv_proj(kv_projection_input)
             kv = self.kv_layernorm(kv)
+            if self.config.csa_inference_rope_fp32:
+                kv = kv.float()
             boundary_kv = None
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
@@ -853,6 +876,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
                     key = value = kv
 
+            if self.config.csa_inference_rope_fp32:
+                query = query.bfloat16()
+                key = value = key.bfloat16()
+                if boundary_kv is not None:
+                    boundary_kv = boundary_kv.bfloat16()
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()

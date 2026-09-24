@@ -382,6 +382,8 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights (2*sigmoid activated)
             h_res: [s, b, n, n] - residual mixing matrix (doubly stochastic)
         """
+        if self.config.mhc_inference_precision:
+            x = x.float()
         s, b, _ = x.shape
 
         if self._proj_rms_compute_h_op is not None:
@@ -518,6 +520,10 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
+        if self.config.mhc_inference_precision:
+            if out is not None:
+                raise ValueError("FP32 mHC aggregation does not support caller-owned output yet")
+            return self._h_aggregate_op(x_streams.float(), h_pre).to(x.dtype)
         if out is None:
             return self._h_aggregate_op(x_streams, h_pre)
         return self._h_aggregate_into_op(x_streams, h_pre, out)
@@ -747,8 +753,13 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output after all operations
         """
+        output_dtype = original_residual.dtype
+        if self.config.mhc_inference_precision:
+            original_residual = original_residual.float()
+            x, bias = layer_output_with_bias
+            layer_output_with_bias = (x.float(), None if bias is None else bias.float())
         if manager is not None:
-            return self._fused_h_res_h_post_bda_with_checkpoint(
+            result = self._fused_h_res_h_post_bda_with_checkpoint(
                 h_res,
                 original_residual,
                 h_post,
@@ -759,7 +770,7 @@ class HyperConnectionModule(MegatronModule):
                 manager,
             )
         else:
-            return self._fused_h_res_h_post_bda_native(
+            result = self._fused_h_res_h_post_bda_native(
                 h_res,
                 original_residual,
                 h_post,
@@ -768,6 +779,8 @@ class HyperConnectionModule(MegatronModule):
                 training,
                 fused,
             )
+
+        return result.to(output_dtype) if self.config.mhc_inference_precision else result
 
     def _fused_h_res_h_post_bda_native(
         self,

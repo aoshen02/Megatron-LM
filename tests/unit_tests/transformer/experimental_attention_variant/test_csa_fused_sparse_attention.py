@@ -3661,18 +3661,30 @@ class TestRealKernelDsaSparseAttn:
         global_idxs = local_to_global_flat(topk_local, s['b']).contiguous()
         return query, kv, attn_sink, global_idxs
 
-    def test_real_csa_sparse_attn_fwd_bwd_matches_reference(self, reset_lazy_kernel_state):
+    @pytest.mark.parametrize("use_vllm_flashmla", [False, True])
+    def test_real_csa_sparse_attn_fwd_bwd_matches_reference(
+        self, reset_lazy_kernel_state, use_vllm_flashmla
+    ):
         """Forward output AND backward gradients (dq, dkv, d_sink) must
         match a pure-PyTorch sparse-attn reference. Combining both checks
         in one test halves cuDNN compile time vs running them separately,
         since they share the same kernel cache key.
         """
-        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        _skip_if_real_kernels_unavailable(need_flash_mla=not use_vllm_flashmla)
+        if use_vllm_flashmla:
+            pytest.importorskip("vllm.third_party.flashmla.flash_mla_interface")
         s = self.SHAPES
 
         # ---- Real path: forward + backward via csa_sparse_attn ----
         query, kv, attn_sink, global_idxs = self._make_inputs(requires_grad=True)
-        out = csa_sparse_attn(query, kv, attn_sink, global_idxs, softmax_scale=s['softmax_scale'])
+        out = csa_sparse_attn(
+            query,
+            kv,
+            attn_sink,
+            global_idxs,
+            softmax_scale=s['softmax_scale'],
+            use_vllm_flashmla=use_vllm_flashmla,
+        )
         torch.manual_seed(7)
         upstream = torch.randn_like(out)
         (out * upstream).sum().backward()
