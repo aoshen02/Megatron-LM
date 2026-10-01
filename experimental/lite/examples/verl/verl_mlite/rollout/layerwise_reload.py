@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import gc
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Mapping
 
 import torch
 from verl.utils.device import get_device_name, get_torch_device
@@ -14,6 +15,29 @@ from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from verl.workers.rollout.vllm_rollout.weight_update_utils import (
     drop_tied_alias_updates,
+)
+
+# Checkpoint-format tensors that vLLM creates but a Lightning NVFP4 checkpoint
+# never provides, keyed by (layer class, tensor name). Layers keeping them
+# unloaded are processed by finalize; every other tensor must arrive.
+ALLOWED_UNLOADED: Mapping[tuple[str, str], str] = {
+    # ModelOptNvFp4FusedMoE.create_weights registers per-expert activation
+    # scales (vllm modelopt.py:957-971); W4A16 experts have no activation
+    # quantization and the checkpoint has no expert input_scale.
+    ("RoutedExperts", "w13_input_scale"): "W4A16 experts: no activation scale",
+    ("RoutedExperts", "w2_input_scale"): "W4A16 experts: no activation scale",
+    # BaseKVCacheMethod.create_weights registers q/prob scales as -1 sentinels
+    # (vllm kv_cache.py:64-71); the checkpoint only stores k_scale/v_scale.
+    ("Attention", "q_scale"): "FP8 KV checkpoint stores only k/v scales",
+    ("Attention", "prob_scale"): "FP8 KV checkpoint stores only k/v scales",
+}
+
+# Checkpoint names a model legitimately consumes without loading anything on
+# this rank: MTP weights dropped by the main model, and non-local experts.
+_DROPPED_PREFIXES = ("mtp.",)
+_EXPERT_NAME = re.compile(
+    r"\.experts\.\d+\.(?:up_proj|down_proj)\."
+    r"(?:weight|weight_scale|weight_scale_2|input_scale)$"
 )
 
 
@@ -31,20 +55,82 @@ def require_layerwise_reload_support(vllm_config) -> None:
         )
 
 
-def load_checkpoint_bucket(
-    model: torch.nn.Module, weights: Iterable[tuple[str, torch.Tensor]]
-) -> int:
-    """Load one received bucket into a model inside a layerwise reload.
+class LayerwiseReloadSession:
+    """Load one full checkpoint-format update and audit it before finalize."""
 
-    The reload retains loader arguments until every tensor of a layer has
-    arrived, while the receiver reuses its transfer buffer for the next bucket.
-    """
-    weights = [
-        (name, tensor.clone())
-        for name, tensor in drop_tied_alias_updates(model, list(weights))
-    ]
-    model.load_weights(weights)
-    return len(weights)
+    def __init__(self, model: torch.nn.Module):
+        self.model = model
+        self.names: set[str] = set()
+        self.loaded: set[str] = set()
+
+    def load(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Load one received bucket, one tensor at a time.
+
+        The reload retains loader arguments until every tensor of a layer has
+        arrived while the receiver reuses its buffer, so tensors are cloned.
+        Loading per tensor exposes names the model accepts but never loads.
+        """
+        for name, tensor in drop_tied_alias_updates(self.model, list(weights)):
+            if name in self.names:
+                raise ValueError(f"Duplicate tensor in one weight update: {name}")
+            self.names.add(name)
+            loaded = set(self.model.load_weights([(name, tensor.clone())]) or ())
+            if not loaded and not self._may_load_nothing(name):
+                raise ValueError(f"Model loaded nothing for tensor {name!r}")
+            self.loaded |= loaded
+
+    def _may_load_nothing(self, name: str) -> bool:
+        if name.startswith(_DROPPED_PREFIXES):
+            mapper = getattr(self.model, "hf_to_vllm_mapper", None)
+            return mapper is not None and not mapper.apply_list([name])
+        return _EXPERT_NAME.search(name) is not None
+
+    def deficits(
+        self, allowed: Mapping[tuple[str, str], str] = ALLOWED_UNLOADED
+    ) -> list[dict]:
+        """List layers whose finalize would complete from stale or
+        uninitialized memory. Must run before ``finalize_layerwise_reload``."""
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+        from vllm.model_executor.model_loader.reload.meta import SKIP_LOAD_TENSORS
+        from vllm.model_executor.model_loader.reload.utils import (
+            get_tensor_load_numel,
+        )
+
+        report = []
+        for prefix, layer in self.model.named_modules():
+            info = LAYERWISE_INFO.get(layer)
+            if info is None or not info.can_load() or info.kernel_tensors is None:
+                continue
+            params, buffers = info.restore_metadata
+            required = {
+                n: t
+                for n, t in (params | buffers).items()
+                if n not in SKIP_LOAD_TENSORS
+            }
+            loaded = {n for n, _ in info.loaded_weights}
+            kind = type(layer).__name__
+            skipped = {n for n in required if (kind, n) in allowed} - loaded
+            missing = sorted(required.keys() - loaded - skipped)
+            expected = info.load_numel_total - sum(
+                get_tensor_load_numel(required[n]) for n in skipped
+            )
+            if missing or info.load_numel != expected:
+                report.append(
+                    {
+                        "layer": prefix,
+                        "type": kind,
+                        "missing": missing,
+                        "unloaded_allowed": sorted(skipped),
+                        "load_numel": info.load_numel,
+                        "expected_numel": expected,
+                        "total_numel": info.load_numel_total,
+                    }
+                )
+        for name, _ in self.model.named_parameters():
+            # Loaded in place, outside layerwise accounting (SKIP_LOAD_TENSORS).
+            if name.endswith(".e_score_correction_bias") and name not in self.loaded:
+                report.append({"layer": name, "type": "live", "missing": [name]})
+        return report
 
 
 class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
@@ -56,6 +142,11 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
     extension restores the checkpoint layout, loads each bucket, lets vLLM
     process every completed layer once and copies the result into the original
     kernel storage, so captured CUDA graphs keep reading valid addresses.
+
+    Every update must carry the complete checkpoint: finalize would otherwise
+    keep stale weights for absent layers and process partial layers from
+    uninitialized memory. Incomplete, duplicate or unknown payloads fail closed
+    and the worker refuses all later updates.
     """
 
     def __new__(cls, **kwargs):
@@ -64,8 +155,17 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
 
     @torch.no_grad()
     def update_weights_from_ipc(
-        self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        strict: bool = True,
     ):
+        """Receive and apply one full update.
+
+        ``strict=False`` is a diagnostic: it records every deficit, including
+        allowlisted ones, in ``last_reload_audit`` and finalizes anyway.
+        """
         from vllm.config import set_current_vllm_config
         from vllm.model_executor.model_loader.reload import (
             finalize_layerwise_reload,
@@ -90,37 +190,51 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
         receiver = BucketedWeightReceiver(
             zmq_handle=self._get_zmq_handle(), device=self.device, use_shm=use_shm
         )
-        loaded = 0
+        session = LayerwiseReloadSession(model)
         callback_error: BaseException | None = None
 
         def on_bucket_received(weights, is_last: bool) -> None:
-            nonlocal loaded, callback_error
+            nonlocal callback_error
             if callback_error is not None:
                 return
             try:
-                loaded += load_checkpoint_bucket(model, weights)
+                session.load(weights)
             except BaseException as exc:
                 # Keep acknowledging buckets so the sender is not left waiting.
                 callback_error = exc
 
-        # Until finalize returns, layers may still hold meta tensors.
+        # Cleared only after a complete payload passed the audit and finalize
+        # returned; until then layers may hold meta or stale tensors.
         self._layerwise_reload_failed = True
+        self.last_reload_audit = None
         with set_current_vllm_config(vllm_config):
             initialize_layerwise_reload(model)
             receiver.receive_weights(on_bucket_received=on_bucket_received)
             if callback_error is not None:
+                self.last_reload_audit = {"error": repr(callback_error)}
                 raise callback_error
+            deficits = session.deficits(ALLOWED_UNLOADED if strict else {})
+            self.last_reload_audit = {
+                "tensors": len(session.names),
+                "deficits": deficits,
+            }
+            if strict and deficits:
+                raise RuntimeError(
+                    "Incomplete layerwise reload payload; refusing to finalize:\n"
+                    + "\n".join(map(str, deficits))
+                )
             finalize_layerwise_reload(model, vllm_config.model_config)
         self._layerwise_reload_failed = False
 
         # Retained bucket clones are dead now; return them before KV cache wakes.
         gc.collect()
         get_torch_device().empty_cache()
-        return loaded
+        return len(session.names)
 
 
 __all__ = [
+    "ALLOWED_UNLOADED",
+    "LayerwiseReloadSession",
     "LayerwiseReloadWorkerExtension",
-    "load_checkpoint_bucket",
     "require_layerwise_reload_support",
 ]
