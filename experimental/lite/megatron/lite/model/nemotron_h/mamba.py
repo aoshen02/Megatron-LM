@@ -1,19 +1,12 @@
 """Packed Mamba primitives with explicit boundaries and mlite CP collectives."""
 
 from dataclasses import dataclass
-from functools import lru_cache
 
 import torch
 import torch.distributed as dist
 from megatron.lite.model.nemotron_h.functional import visible_forward
+from megatron.lite.model.nemotron_h.ssd_reference import chunk_scan as native_scan
 from megatron.lite.primitive.parallel.cp import all_to_all_hidden_shards
-
-
-@lru_cache(maxsize=1)
-def _low_memory_native_scan(scan):
-    from mamba_chunk_native import make_native_scan
-
-    return make_native_scan(scan)
 
 
 @dataclass(frozen=True)
@@ -108,15 +101,10 @@ def packed_conv(x, weight, bias, meta: SSMMeta):
 
 def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
     """Cache-free SSD, x[T,H,P], B/C[T,G,N]; inference forward and native VJP."""
-    from transformers.models.nemotron_h.modeling_nemotron_h import (
-        mamba2_chunk_scan,
-    )
-
     from vllm.model_executor.layers.mamba.ops.ssd_combined import (
         mamba_chunk_scan_combined_varlen,
     )
 
-    native_scan = _low_memory_native_scan(mamba2_chunk_scan)
     meta.validate_tokens(x.shape[0])
 
     def visible(x, dt, A, B, C, D, dt_bias):

@@ -126,6 +126,46 @@ def test_packed_conv_matches_independent_requests_and_native_vjp(lengths):
         assert torch.equal(a, b)
 
 
+@pytest.mark.parametrize("length", [1, 37, 256, 300])
+def test_chunked_ssd_reference_matches_transformers_scan_bitwise(length):
+    """The chunk-at-a-time contractions keep HF native SSD bits and VJP."""
+    from megatron.lite.model.nemotron_h.ssd_reference import chunk_scan
+    from transformers.models.nemotron_h.modeling_nemotron_h import mamba2_chunk_scan
+
+    hf_scan = getattr(mamba2_chunk_scan, "__wrapped__", mamba2_chunk_scan)
+    torch.manual_seed(0)
+
+    def leaves():
+        g = torch.Generator().manual_seed(1)
+        x = torch.randn(1, length, 4, 8, generator=g, dtype=torch.bfloat16)
+        dt = torch.randn(1, length, 4, generator=g, dtype=torch.bfloat16)
+        B = torch.randn(1, length, 2, 16, generator=g, dtype=torch.bfloat16)
+        C = torch.randn(1, length, 2, 16, generator=g, dtype=torch.bfloat16)
+        A = -torch.arange(1, 5, dtype=torch.float32)
+        D = torch.linspace(0.5, 1.5, 4)
+        bias = torch.full((4,), -1.0)
+        return [t.requires_grad_() for t in (x, dt, A, B, C, D, bias)]
+
+    def run(scan, x, dt, A, B, C, D, bias):
+        return scan(
+            x, dt, A, B, C, chunk_size=128, D=D, dt_bias=bias, dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+        )
+
+    ours, theirs = leaves(), leaves()
+    actual, expected = run(chunk_scan, *ours), run(hf_scan, *theirs)
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual, expected)
+    upstream = torch.randn(expected.shape, generator=torch.Generator().manual_seed(2))
+    for a, b in zip(
+        torch.autograd.grad(actual, ours, upstream),
+        torch.autograd.grad(expected, theirs, upstream),
+        strict=True,
+    ):
+        assert torch.isfinite(a).all()
+        assert torch.equal(a, b)
+
+
 @pytest.mark.gpus(1)
 @pytest.mark.parametrize("lengths", [(17, 19), (127, 129)])
 def test_packed_ssd_matches_independent_requests_and_native_vjp(lengths):
