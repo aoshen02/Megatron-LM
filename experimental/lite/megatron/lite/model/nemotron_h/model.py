@@ -5,12 +5,24 @@ from torch import nn
 
 from .attention import Attention
 from .experts import MoE
-from .functional import RMSNorm, linear
+from .functional import RMSNorm, projection
 from .mamba import MambaMixer, SSMMeta
+from .quantization import projection_layer
 
 
 class Block(nn.Module):
-    def __init__(self, config, ps, layer, *, device=None, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        config,
+        ps,
+        layer,
+        *,
+        device=None,
+        dtype=torch.bfloat16,
+        fp8_kv_scales=None,
+        projection_factory=None,
+        routed_factory=None,
+    ):
         super().__init__()
         self.norm = RMSNorm(
             config.hidden_size, config.layer_norm_epsilon, device=device, dtype=dtype
@@ -23,7 +35,18 @@ class Block(nn.Module):
         }
         if self.kind not in types:
             raise ValueError(f"Unsupported Nemotron block: {self.kind}")
-        self.mixer = types[self.kind](config, ps, device=device, dtype=dtype)
+        kwargs = {} if fp8_kv_scales is None else {"fp8_kv_scales": fp8_kv_scales}
+        if self.kind == "moe":
+            kwargs["routed_factory"] = routed_factory
+        self.mixer = types[self.kind](
+            config,
+            ps,
+            device=device,
+            dtype=dtype,
+            projection_factory=projection_factory,
+            hf_prefix=f"backbone.layers.{layer}.mixer",
+            **kwargs,
+        )
 
     def forward(self, hidden, residual, meta):
         if residual is None:
@@ -43,7 +66,16 @@ class NemotronModel(nn.Module):
     """
 
     def __init__(
-        self, config, ps, *, layer_range=None, device=None, dtype=torch.bfloat16
+        self,
+        config,
+        ps,
+        *,
+        layer_range=None,
+        device=None,
+        dtype=torch.bfloat16,
+        fp8_kv_scales=None,
+        projection_factory=None,
+        routed_factory=None,
     ):
         super().__init__()
         self.config, self.ps = config, ps
@@ -52,6 +84,16 @@ class NemotronModel(nn.Module):
             raise ValueError("Invalid contiguous layer range")
         if ps.pp_size > 1 and layer_range is None:
             raise ValueError("PP requires an explicit layer assignment from runtime")
+        if fp8_kv_scales is not None:
+            attention_layers = {
+                i
+                for i in range(start, end)
+                if config.layers_block_type[i] == "full_attention"
+            }
+            if set(fp8_kv_scales) != attention_layers:
+                raise ValueError(
+                    "FP8 KV scales must cover exactly the local attention layers"
+                )
         self.pre_process = start == 0
         self.post_process = end == config.num_hidden_layers
         if config.tie_word_embeddings:
@@ -66,7 +108,18 @@ class NemotronModel(nn.Module):
         )
         self.layers = nn.ModuleDict(
             {
-                str(i): Block(config, ps, i, device=device, dtype=dtype)
+                str(i): Block(
+                    config,
+                    ps,
+                    i,
+                    device=device,
+                    dtype=dtype,
+                    projection_factory=projection_factory,
+                    routed_factory=routed_factory,
+                    fp8_kv_scales=None
+                    if fp8_kv_scales is None
+                    else fp8_kv_scales.get(i),
+                )
                 for i in range(start, end)
             }
         )
@@ -81,7 +134,9 @@ class NemotronModel(nn.Module):
             else None
         )
         self.lm_head = (
-            nn.Linear(
+            projection_layer(
+                projection_factory,
+                "lm_head",
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
@@ -115,4 +170,4 @@ class NemotronModel(nn.Module):
         if not self.post_process:
             return torch.cat((hidden, residual), dim=-1).unsqueeze(1)
         hidden, _ = self.norm_f(hidden, residual)
-        return linear(hidden, self.lm_head.weight)
+        return projection(hidden, self.lm_head)

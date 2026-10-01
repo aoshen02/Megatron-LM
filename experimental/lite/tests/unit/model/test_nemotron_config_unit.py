@@ -82,3 +82,33 @@ def test_missing_mamba_heads_cannot_fall_back_to_expand(lightning_config):
     del lightning_config["mamba_num_heads"]
     with pytest.raises(ValueError, match="mamba_num_heads"):
         NemotronHConfig._from_hf_dict(lightning_config)
+
+
+def test_quantization_recipe_is_optional_and_owned(lightning_config):
+    """A model's precision recipe must not alias mutable HF metadata."""
+    assert NemotronHConfig._from_hf_dict(lightning_config).quantization_config is None
+    recipe = {"quant_algo": "MIXED_PRECISION", "quantized_layers": {"lm_head": {}}}
+    lightning_config["quantization_config"] = recipe
+    cfg = NemotronHConfig._from_hf_dict(lightning_config)
+    recipe["quantized_layers"]["lm_head"]["quant_algo"] = "FP8"
+    assert cfg.quantization_config["quantized_layers"]["lm_head"] == {}
+
+
+def test_compact_vjp_requires_installed_kernel_and_explicit_contract(tmp_path):
+    """Reject an external kernel even when its bytes match the packaged artifact."""
+    from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import (
+        COMPACT_BACKEND,
+        PADDED_BACKEND,
+        SURROGATE_CONTRACT,
+        compact_kernel_path,
+        validate_backend,
+    )
+
+    validate_backend(PADDED_BACKEND, None, None)
+    validate_backend(COMPACT_BACKEND, None, SURROGATE_CONTRACT)
+    with pytest.raises(ValueError, match="explicit V2"):
+        validate_backend(COMPACT_BACKEND, None, None)
+    external = tmp_path / "kernel.py"
+    external.write_bytes(compact_kernel_path().read_bytes())
+    with pytest.raises(ValueError, match="installed package"):
+        validate_backend(COMPACT_BACKEND, external, SURROGATE_CONTRACT)

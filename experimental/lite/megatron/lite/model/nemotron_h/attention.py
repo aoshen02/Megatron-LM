@@ -3,8 +3,9 @@
 import torch
 from torch import nn
 
-from .functional import linear, visible_forward
+from .functional import projection, visible_forward
 from .mamba import SSMMeta, exchange_sequence_channels
+from .quantization import projection_layer
 
 
 def packed_attention(q, k, v, meta: SSMMeta, *, scale):
@@ -55,7 +56,17 @@ def packed_attention(q, k, v, meta: SSMMeta, *, scale):
 class Attention(nn.Module):
     """Nemotron's non-rotary attention; query width is independent of hidden size."""
 
-    def __init__(self, config, ps, *, device=None, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        config,
+        ps,
+        *,
+        device=None,
+        dtype=torch.bfloat16,
+        fp8_kv_scales=None,
+        projection_factory=None,
+        hf_prefix=None,
+    ):
         super().__init__()
         if ps.tp_size != 1:
             raise ValueError("Nemotron attention currently requires TP1")
@@ -63,9 +74,28 @@ class Attention(nn.Module):
             raise ValueError("Expected bias-free Nemotron attention")
         if config.num_key_value_heads % ps.cp_size:
             raise ValueError("CP must divide KV heads")
+        if fp8_kv_scales is not None and ps.cp_size != 1:
+            raise ValueError("FP8 KV training attention currently requires CP1")
         self.cp_group = ps.cp_group if ps.cp_size > 1 else None
         self.head_dim = config.head_dim
         self.scale = config.head_dim**-0.5
+        self.kv_attention = None
+        if fp8_kv_scales is not None:
+            import vllm.envs as envs
+
+            from .fp8_attention import Fa4Fp8KVAttention, Fp8KVAttention
+
+            k_scale, v_scale = fp8_kv_scales
+            attention_class = (
+                Fa4Fp8KVAttention if envs.VLLM_BATCH_INVARIANT else Fp8KVAttention
+            )
+            self.kv_attention = attention_class(
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+                k_scale.to(device=device),
+                v_scale.to(device=device),
+            )
         for name, heads in (
             ("q_proj", config.num_attention_heads),
             ("k_proj", config.num_key_value_heads),
@@ -74,7 +104,9 @@ class Attention(nn.Module):
             setattr(
                 self,
                 name,
-                nn.Linear(
+                projection_layer(
+                    projection_factory,
+                    f"{hf_prefix}.{name}" if hf_prefix else None,
                     config.hidden_size,
                     heads * config.head_dim,
                     bias=False,
@@ -82,7 +114,9 @@ class Attention(nn.Module):
                     dtype=dtype,
                 ),
             )
-        self.o_proj = nn.Linear(
+        self.o_proj = projection_layer(
+            projection_factory,
+            f"{hf_prefix}.o_proj" if hf_prefix else None,
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
             bias=False,
@@ -93,11 +127,14 @@ class Attention(nn.Module):
     def forward(self, x, meta: SSMMeta):
         q, k, v = (
             exchange_sequence_channels(
-                linear(x, proj.weight).view(x.shape[0], -1, self.head_dim),
+                projection(x, proj).view(x.shape[0], -1, self.head_dim),
                 self.cp_group,
             )
             for proj in (self.q_proj, self.k_proj, self.v_proj)
         )
-        output = packed_attention(q, k, v, meta, scale=self.scale)
+        if self.kv_attention is None:
+            output = packed_attention(q, k, v, meta, scale=self.scale)
+        else:
+            output = self.kv_attention(q, k, v, meta)
         output = exchange_sequence_channels(output, self.cp_group, reverse=True)
-        return linear(output.flatten(1), self.o_proj.weight)
+        return projection(output.flatten(1), self.o_proj)

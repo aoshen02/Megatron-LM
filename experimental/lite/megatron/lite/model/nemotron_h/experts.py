@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from .functional import linear, visible_forward
+from .functional import projection, visible_forward
 
 
 def routed_experts(x, up, down, weights, ids):
@@ -159,16 +159,30 @@ class Router(nn.Module):
 
 
 class SharedExperts(nn.Module):
-    def __init__(self, config, *, device=None, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        config,
+        *,
+        device=None,
+        dtype=torch.bfloat16,
+        projection_factory=None,
+        hf_prefix=None,
+    ):
         super().__init__()
-        self.up_proj = nn.Linear(
+        from .quantization import projection_layer
+
+        self.up_proj = projection_layer(
+            projection_factory,
+            f"{hf_prefix}.up_proj" if hf_prefix else None,
             config.hidden_size,
             config.moe_shared_expert_intermediate_size,
             bias=False,
             device=device,
             dtype=dtype,
         )
-        self.down_proj = nn.Linear(
+        self.down_proj = projection_layer(
+            projection_factory,
+            f"{hf_prefix}.down_proj" if hf_prefix else None,
             config.moe_shared_expert_intermediate_size,
             config.hidden_size,
             bias=False,
@@ -177,18 +191,56 @@ class SharedExperts(nn.Module):
         )
 
     def forward(self, x):
-        x = torch.nn.functional.relu(linear(x, self.up_proj.weight)).square()
-        return linear(x, self.down_proj.weight)
+        x = torch.nn.functional.relu(projection(x, self.up_proj)).square()
+        return projection(x, self.down_proj)
 
 
 class MoE(nn.Module):
-    def __init__(self, config, ps, *, device=None, dtype=torch.bfloat16):
+    """Compose routing, unscaled routed output, and the shared expert.
+
+    An optional routed_factory(prefix, config, ps, *, device, dtype) returns
+    the final nn.Module accepting (x, ids, routing_weights). Its output must
+    exclude routed_scaling_factor and shared output, which are combined here.
+    """
+
+    def __init__(
+        self,
+        config,
+        ps,
+        *,
+        device=None,
+        dtype=torch.bfloat16,
+        projection_factory=None,
+        hf_prefix=None,
+        routed_factory=None,
+    ):
         super().__init__()
         if config.n_shared_experts != 1:
             raise ValueError("Nemotron MoE requires the single shared expert contract")
+        if routed_factory is not None and (
+            not callable(routed_factory)
+            or not isinstance(hf_prefix, str)
+            or not hf_prefix
+            or hf_prefix.endswith(".")
+        ):
+            raise ValueError("Routed factory requires an explicit HF mixer prefix")
         self.gate = Router(config, device=device, dtype=dtype)
-        self.experts = RoutedExperts(config, ps, device=device, dtype=dtype)
-        self.shared_experts = SharedExperts(config, device=device, dtype=dtype)
+        self.experts = (
+            RoutedExperts(config, ps, device=device, dtype=dtype)
+            if routed_factory is None
+            else routed_factory(
+                f"{hf_prefix}.experts", config, ps, device=device, dtype=dtype
+            )
+        )
+        if not isinstance(self.experts, nn.Module):
+            raise TypeError("Routed factory must return an nn.Module")
+        self.shared_experts = SharedExperts(
+            config,
+            device=device,
+            dtype=dtype,
+            projection_factory=projection_factory,
+            hf_prefix=f"{hf_prefix}.shared_experts" if hf_prefix else None,
+        )
         scale = config.routed_scaling_factor
 
         def combine(shared, routed):
