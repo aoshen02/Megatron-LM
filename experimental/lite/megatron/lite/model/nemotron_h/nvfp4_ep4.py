@@ -66,7 +66,7 @@ def install_ep4_reduction(expert, recipe=EP4_REDUCTION):
         raise RuntimeError("EP4 reduction already installed")
     original_apply = expert.apply
     signature = inspect.signature(original_apply)
-    state = {"calls": 0, "rows": 0, "busy": False, "recipe": recipe}
+    state = {"busy": False}
     maps = []
     for rank in range(4):
         mapping = torch.full((128,), -1, dtype=torch.int32, device=expert.locks.device)
@@ -109,8 +109,6 @@ def install_ep4_reduction(expert, recipe=EP4_REDUCTION):
                 for mapping in maps
             ]
             output.copy_(reduce_ep4_parts(parts, ids, recipe))
-            state["calls"] += 1
-            state["rows"] += ids.shape[0]
             return result
         finally:
             expert.humming_forward = original_forward

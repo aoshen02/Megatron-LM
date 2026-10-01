@@ -13,7 +13,7 @@ import torch
 SURROGATE_CONTRACT = "moe-fixedscale-grouped-bf16edges-v2"
 PADDED_BACKEND = "padded-v2"
 COMPACT_BACKEND = "compact-f32-tma-nosplit"
-COMPACT_KERNEL_SHA = "8b81ce2f2a197279c6159a8fd246e60b19ce11fded14f9bbe9d133e5ebc8faa5"
+COMPACT_KERNEL_SHA = "b30d3192f88a5dc324278f0b3f22b9cb44bcea6c8eb2c2cfa380c07d75368e74"
 
 
 def compact_kernel_path():

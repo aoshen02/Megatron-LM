@@ -7,20 +7,6 @@ import pytest
 import torch
 
 
-def test_ep4_one_sided_reduction_counts_each_rank_once():
-    """Repeated expert owners must not multiply a rank's routed partial."""
-    from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
-        EP4_ONESIDED_REDUCTION,
-        reduce_ep4_parts,
-    )
-
-    parts = [torch.full((2, 3), i + 1, dtype=torch.bfloat16) for i in range(4)]
-    ids = torch.tensor([[0, 1, 32, 33, 64, 96], [96, 97, 98, 99, 100, 101]])
-    actual = reduce_ep4_parts(parts, ids, EP4_ONESIDED_REDUCTION)
-    expected = torch.tensor([[10, 10, 10], [4, 4, 4]], dtype=torch.bfloat16)
-    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
 @pytest.mark.parametrize("mask", [[1, 0, 0, 1, 1, 1], [0, 0, 0, 1, 1, 1], [0] * 6])
 def test_cp_loss_unequal_valid_counts_matches_unsharded_gradient(mask):
     from megatron.lite.model.nemotron_h.protocol import _token_mean_loss

@@ -7,7 +7,7 @@ execution revision: no promise of V2 reduction-order or byte equivalence.
 import hashlib
 from pathlib import Path
 
-SOURCE_SHA = "8b81ce2f2a197279c6159a8fd246e60b19ce11fded14f9bbe9d133e5ebc8faa5"
+SOURCE_SHA = "b30d3192f88a5dc324278f0b3f22b9cb44bcea6c8eb2c2cfa380c07d75368e74"
 REVISION = "compact-grouped-tf32-r4-f32-tma-base"
 
 
