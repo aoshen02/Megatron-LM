@@ -1,7 +1,7 @@
 """Explicit quantized diagnostic construction, not a production recipe.
 
-The caller owns torch/vLLM distributed initialization, current VllmConfig and
-workspace lifetime. This module never creates or destroys those global objects.
+Torch distributed must be initialized. The vLLM config, groups and workspace
+are either caller-owned or created by vllm_runtime.ensure_vllm_runtime().
 """
 
 import json
@@ -265,6 +265,7 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             "Quantized proxy construction did not cover every stage recipe prefix"
         )
     model._quantized_proxy_root = str(Path(impl.hf_path).resolve())
+    model._vllm_config = cfg
     if impl.diagnostic_forward_only:
         model.register_forward_pre_hook(_reject_grad_enabled_forward)
     return model
@@ -277,8 +278,11 @@ def refresh_after_initial_optimizer_reload(optimizer, chunks):
         raise RuntimeError("Quantized dist_opt requires reload_model_params")
 
     def initial_reload(*args, **kwargs):
+        from .vllm_runtime import vllm_context
+
         result = reload(*args, **kwargs)
-        refresh_quantized_projections(chunks)
+        with vllm_context(chunks[0]):
+            refresh_quantized_projections(chunks)
         optimizer.reload_model_params = reload
         return result
 

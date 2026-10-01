@@ -22,6 +22,7 @@ from .config import NemotronHConfig
 from .functional import visible_forward
 from .mamba import SSMMeta
 from .model import NemotronModel
+from .vllm_runtime import vllm_context
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,11 @@ def _token_mean_loss(log_probs, local_mask, full_mask, cp_size):
 
 
 def forward_step(model, batch):
+    with vllm_context(model):
+        return _forward_step(model, batch)
+
+
+def _forward_step(model, batch):
     from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
 
     ps = parallel_state_from_model(model)
@@ -182,6 +188,24 @@ def unpack_forward_output(model, batch, output):
 
 
 def build_model(model_cfg, *, impl_cfg):
+    if model_cfg.quantization_config is None or not impl_cfg.hf_path:
+        return _build_model(model_cfg, impl_cfg)
+    from vllm.config import set_current_vllm_config
+
+    from .quantized_proxy import validate_proxy_config
+    from .vllm_runtime import ensure_vllm_runtime
+
+    validate_proxy_config(model_cfg, impl_cfg)
+    with set_current_vllm_config(ensure_vllm_runtime(impl_cfg.parallel.pp)):
+        return _build_model(model_cfg, impl_cfg)
+
+
+def _refresh_quantized(chunks):
+    with vllm_context(chunks[0]):
+        refresh_quantized_projections(chunks)
+
+
+def _build_model(model_cfg, impl_cfg):
     if impl_cfg.diagnostic_forward_only and model_cfg.quantization_config is None:
         raise ValueError("Full-depth forward-only requires a quantized checkpoint")
     if model_cfg.quantization_config is not None and not impl_cfg.hf_path:
@@ -192,10 +216,8 @@ def build_model(model_cfg, *, impl_cfg):
             build_quantized_proxy,
             caller_runtime,
             refresh_after_initial_optimizer_reload,
-            validate_proxy_config,
         )
 
-        validate_proxy_config(model_cfg, impl_cfg)
         caller_runtime(pipeline_size=impl_cfg.parallel.pp)
     elif impl_cfg.surrogate_contract is not None:
         raise ValueError("Surrogate contract requires a quantized checkpoint")
@@ -266,7 +288,7 @@ def build_model(model_cfg, *, impl_cfg):
         extras={
             "model_cfg": model_cfg,
             "optimizer_backend": impl_cfg.optimizer or "none",
-            "post_optimizer_step_hook": partial(refresh_quantized_projections, chunks),
+            "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
         },
     )
 
