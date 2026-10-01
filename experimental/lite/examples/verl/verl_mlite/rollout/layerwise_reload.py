@@ -18,19 +18,53 @@ from verl.workers.rollout.vllm_rollout.weight_update_utils import (
 )
 
 # Checkpoint-format tensors that vLLM creates but a Lightning NVFP4 checkpoint
-# never provides, keyed by (layer class, tensor name). Layers keeping them
-# unloaded are processed by finalize; every other tensor must arrive.
+# never provides, keyed by (layer kind, tensor name); see _layer_kind. Layers
+# keeping them unloaded are processed by finalize; every other tensor must
+# arrive. Citations are to the vLLM tree the image is built from.
 ALLOWED_UNLOADED: Mapping[tuple[str, str], str] = {
-    # ModelOptNvFp4FusedMoE.create_weights registers per-expert activation
-    # scales (vllm modelopt.py:957-971); W4A16 experts have no activation
-    # quantization and the checkpoint has no expert input_scale.
-    ("RoutedExperts", "w13_input_scale"): "W4A16 experts: no activation scale",
-    ("RoutedExperts", "w2_input_scale"): "W4A16 experts: no activation scale",
-    # BaseKVCacheMethod.create_weights registers q/prob scales as -1 sentinels
-    # (vllm kv_cache.py:64-71); the checkpoint only stores k_scale/v_scale.
-    ("Attention", "q_scale"): "FP8 KV checkpoint stores only k/v scales",
-    ("Attention", "prob_scale"): "FP8 KV checkpoint stores only k/v scales",
+    # ModelOptNvFp4FusedMoE.create_weights always registers per-expert
+    # activation scales (modelopt.py:957-971); W4A16 experts never quantize
+    # activations and the checkpoint/actor export has no expert input_scale.
+    ("W4A16NvFp4RoutedExperts", "w13_input_scale"): "modelopt.py:957-965",
+    ("W4A16NvFp4RoutedExperts", "w2_input_scale"): "modelopt.py:967-971",
+    # W4A16 NVFP4 linears register a NaN input_scale only to drop it after
+    # loading (_DropInputScale, modelopt.py:2519-2541, chosen at :2736).
+    ("W4A16NvFp4Linear", "input_scale"): "modelopt.py:2526-2541",
+    # BaseKVCacheMethod.create_weights adds q/prob scale placeholders
+    # (kv_cache.py:64-71); the checkpoint stores only k_scale/v_scale.
+    ("Attention", "q_scale"): "kv_cache.py:67,71",
+    ("Attention", "prob_scale"): "kv_cache.py:67,71",
+    # Runtime copies set by set_default_quant_scales (attention.py:133-141)
+    # and recomputed from k/v scales in process_weights_after_loading
+    # (kv_cache.py:76-194); never checkpoint tensors.
+    ("Attention", "_k_scale"): "attention.py:136",
+    ("Attention", "_v_scale"): "attention.py:137",
+    ("Attention", "_q_scale"): "attention.py:138",
+    ("Attention", "_prob_scale"): "attention.py:139",
 }
+
+
+def _layer_kind(layer: torch.nn.Module) -> str:
+    """Name W4A16 NVFP4 variants so their exemptions never cover FP8 layers."""
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+        ModelOptNvFp4FusedMoE,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kNvfp4Static,
+    )
+
+    method = getattr(layer, "quant_method", None)
+    if isinstance(method, ModelOptNvFp4FusedMoE) and method.use_a16:
+        return "W4A16NvFp4RoutedExperts"
+    if (
+        isinstance(method, ModelOptLinearMethod)
+        and method.spec.weight == kNvfp4Static
+        and method.spec.activation is None
+    ):
+        return "W4A16NvFp4Linear"
+    return type(layer).__name__
+
 
 # Checkpoint names a model legitimately consumes without loading anything on
 # this rank: MTP weights dropped by the main model, and non-local experts.
@@ -117,7 +151,7 @@ class LayerwiseReloadSession:
                 if n not in SKIP_LOAD_TENSORS
             }
             loaded = {n for n, _ in info.loaded_weights}
-            kind = type(layer).__name__
+            kind = _layer_kind(layer)
             skipped = {n for n in required if (kind, n) in allowed} - loaded
             missing = sorted(required.keys() - loaded - skipped)
             expected = info.load_numel_total - sum(

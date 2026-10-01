@@ -43,8 +43,8 @@ class _Projection(torch.nn.Module):
         self.weight_scale = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
 
 
-class RoutedExperts(torch.nn.Module):
-    """Named like vLLM's layer so the production allowlist applies."""
+class _Experts(torch.nn.Module):
+    """Has a tensor the checkpoint never ships, like W4A16 expert input scales."""
 
     def __init__(self):
         super().__init__()
@@ -57,7 +57,7 @@ class _Model(torch.nn.Module):
         super().__init__()
         self.proj = _Projection()
         self.other = _Projection()
-        self.experts = RoutedExperts()
+        self.experts = _Experts()
 
     def load_weights(self, weights):
         """Like vLLM expert loaders, silently skip names it does not know."""
@@ -87,6 +87,11 @@ def _full_payload(value):
     return payload + [("experts.w13_weight", torch.full((4,), value))]
 
 
+# The production table keys on vLLM's W4A16 NVFP4 quant methods; this model
+# has none, so it exempts the tensor by class name.
+ALLOWED = {("_Experts", "w13_input_scale"): "never in the checkpoint"}
+
+
 def _reload(model, payload, *, bucket=1):
     """Start a reload and stream the payload through one reused buffer."""
     initialize_layerwise_reload(model)
@@ -112,7 +117,7 @@ def test_complete_updates_reload_in_place_twice(model) -> None:
     storages = {n: p.data_ptr() for n, p in model.named_parameters()}
     for step in (1.0, 2.0):
         session = _reload(model, _full_payload(step))
-        assert session.deficits() == []
+        assert session.deficits(ALLOWED) == []
         finalize_layerwise_reload(model, None)
         for name in ("proj.weight", "other.weight_scale", "experts.w13_weight"):
             assert torch.equal(model.get_parameter(name), torch.full((4,), step))
@@ -129,15 +134,22 @@ def test_complete_updates_reload_in_place_twice(model) -> None:
 )
 def test_incomplete_layer_is_reported(model, dropped, layer, missing) -> None:
     payload = [(n, t) for n, t in _full_payload(1.0) if n != dropped]
-    (deficit,) = _reload(model, payload).deficits()
+    (deficit,) = _reload(model, payload).deficits(ALLOWED)
     assert deficit["layer"] == layer and deficit["missing"] == missing
     assert deficit["load_numel"] < deficit["expected_numel"]
 
 
 def test_absent_layer_is_reported(model) -> None:
     payload = [(n, t) for n, t in _full_payload(1.0) if not n.startswith("other.")]
-    (deficit,) = _reload(model, payload).deficits()
+    (deficit,) = _reload(model, payload).deficits(ALLOWED)
     assert deficit["layer"] == "other" and deficit["load_numel"] == 0
+
+
+def test_production_table_does_not_exempt_unrelated_layers(model) -> None:
+    """Exemptions are tied to W4A16 NVFP4 quant methods, not to names alone."""
+    (deficit,) = _reload(model, _full_payload(1.0)).deficits()
+    assert deficit["layer"] == "experts"
+    assert deficit["missing"] == ["w13_input_scale"]
 
 
 def test_duplicate_name_is_rejected(model) -> None:
