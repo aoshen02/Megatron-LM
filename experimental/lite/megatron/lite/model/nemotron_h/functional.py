@@ -37,10 +37,22 @@ def visible_forward(visible, native, *inputs):
 
 
 def linear(x, weight, bias=None):
-    from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
+    from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 
     inputs = (x, weight) if bias is None else (x, weight, bias)
     return visible_forward(linear_batch_invariant, torch.nn.functional.linear, *inputs)
+
+
+def projection(x, module):
+    """Dispatch quantized modules without bypassing their deployment and VJP."""
+    from .fp8_training import Fp8TrainingLinear
+    from .quantization import Nvfp4TrainingLinear
+
+    if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
+        return module(x)
+    if isinstance(module, torch.nn.Linear):
+        return linear(x, module.weight, module.bias)
+    raise TypeError(f"Unsupported Nemotron projection: {type(module).__name__}")
 
 
 class GatedRMSNorm(torch.nn.Module):

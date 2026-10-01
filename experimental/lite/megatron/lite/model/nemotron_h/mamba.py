@@ -1,11 +1,19 @@
 """Packed Mamba primitives with explicit boundaries and mlite CP collectives."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
 from megatron.lite.model.nemotron_h.functional import visible_forward
 from megatron.lite.primitive.parallel.cp import all_to_all_hidden_shards
+
+
+@lru_cache(maxsize=1)
+def _low_memory_native_scan(scan):
+    from mamba_chunk_native import make_native_scan
+
+    return make_native_scan(scan)
 
 
 @dataclass(frozen=True)
@@ -108,7 +116,7 @@ def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
         mamba_chunk_scan_combined_varlen,
     )
 
-    native_scan = getattr(mamba2_chunk_scan, "__wrapped__", mamba2_chunk_scan)
+    native_scan = _low_memory_native_scan(mamba2_chunk_scan)
     meta.validate_tokens(x.shape[0])
 
     def visible(x, dt, A, B, C, D, dt_bias):
@@ -162,9 +170,20 @@ def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
 class MambaMixer(torch.nn.Module):
     """Native TP1 Mamba2 mixer; weights retain HF names for lossless checkpoint IO."""
 
-    def __init__(self, config, parallel_state, *, device=None, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        config,
+        parallel_state,
+        *,
+        device=None,
+        dtype=torch.bfloat16,
+        projection_factory=None,
+        hf_prefix=None,
+    ):
         super().__init__()
         from megatron.lite.model.nemotron_h.functional import GatedRMSNorm
+
+        from .quantization import projection_layer
 
         if parallel_state.tp_size != 1:
             raise NotImplementedError("Nemotron alignment currently targets TP1")
@@ -174,7 +193,9 @@ class MambaMixer(torch.nn.Module):
             raise NotImplementedError("Mamba CP requires whole SSM groups per rank")
         self.config, self.ps = config, parallel_state
         factory = dict(device=device, dtype=dtype)
-        self.in_proj = torch.nn.Linear(
+        self.in_proj = projection_layer(
+            projection_factory,
+            f"{hf_prefix}.in_proj" if hf_prefix else None,
             config.hidden_size,
             config.mamba_in_proj_size,
             bias=config.use_bias,
@@ -199,19 +220,24 @@ class MambaMixer(torch.nn.Module):
             config.layer_norm_epsilon,
             **factory,
         )
-        self.out_proj = torch.nn.Linear(
-            config.mamba_inner_size, config.hidden_size, bias=config.use_bias, **factory
+        self.out_proj = projection_layer(
+            projection_factory,
+            f"{hf_prefix}.out_proj" if hf_prefix else None,
+            config.mamba_inner_size,
+            config.hidden_size,
+            bias=config.use_bias,
+            **factory,
         )
 
     def forward(self, hidden, meta: SSMMeta):
-        from megatron.lite.model.nemotron_h.functional import linear
+        from megatron.lite.model.nemotron_h.functional import projection
         from megatron.lite.primitive.parallel.cp import get_parameter_local_cp_headwise
 
         c, ps = self.config, self.ps
         meta.validate_tokens(hidden.shape[0] * ps.cp_size)
         if meta.chunk_size != c.chunk_size:
             raise ValueError("SSM metadata chunk size differs from model config")
-        projected = linear(hidden, self.in_proj.weight, self.in_proj.bias)
+        projected = projection(hidden, self.in_proj)
         gate, xbc, dt = projected.split(
             (c.mamba_inner_size, c.mamba_conv_dim, c.mamba_num_heads), dim=-1
         )
@@ -262,4 +288,4 @@ class MambaMixer(torch.nn.Module):
         normalized = self.norm(
             scanned.reshape(hidden.shape[0], c.mamba_inner_size), gate
         )
-        return linear(normalized, self.out_proj.weight, self.out_proj.bias)
+        return projection(normalized, self.out_proj)

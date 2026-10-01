@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nemotron-megatron-lite"
+version = "0.1.0+unified.r4"
+description = "Nemotron aligned actor implementation on the Megatron Lite runtime"
+requires-python = ">=3.12"
+
+[tool.setuptools]
+py-modules = ["mamba_chunk_contractions", "mamba_chunk_native"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["megatron.lite*"]
+namespaces = true

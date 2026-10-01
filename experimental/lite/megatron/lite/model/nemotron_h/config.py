@@ -1,8 +1,9 @@
-"""HF architecture mapping for the Nemotron-H Lightning BF16 implementation."""
+"""HF architecture and precision recipe for native Nemotron-H Lightning."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from copy import deepcopy
+from dataclasses import MISSING, dataclass, fields
 
 from megatron.lite.primitive.config import load_hf_config_dict
 
@@ -40,6 +41,7 @@ class NemotronHConfig:
     tie_word_embeddings: bool
     n_group: int
     topk_group: int
+    quantization_config: dict | None = None
 
     @property
     def num_hidden_layers(self) -> int:
@@ -133,12 +135,17 @@ class NemotronHConfig:
         if tuple((limit[0], upper)) != (0.0, float("inf")):
             raise ValueError("Aligned SSD currently requires time_step_limit=(0, inf)")
         names = {item.name for item in fields(cls)}
-        missing = names - hf.keys()
+        required = {
+            item.name
+            for item in fields(cls)
+            if item.default is MISSING and item.default_factory is MISSING
+        }
+        missing = required - hf.keys()
         if missing:
             raise ValueError(
                 f"Missing explicit Nemotron architecture fields: {sorted(missing)}"
             )
-        values = {name: hf[name] for name in names}
+        values = {name: deepcopy(hf[name]) for name in names if name in hf}
         aliases = {"mamba": "linear_attention", "attention": "full_attention"}
         values["layers_block_type"] = [
             aliases.get(kind, kind) for kind in values["layers_block_type"]

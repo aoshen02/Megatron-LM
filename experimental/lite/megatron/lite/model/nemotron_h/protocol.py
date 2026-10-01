@@ -1,6 +1,7 @@
 """Nemotron native mlite protocol; no HF model wrapper or custom scheduler."""
 
 from dataclasses import dataclass, field
+from functools import partial
 
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
@@ -16,6 +17,7 @@ from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.loss import get_loss_context
 
 from .checkpoint import load_hf_weights as _load_weights
+from .checkpoint import refresh_quantized_projections
 from .config import NemotronHConfig
 from .functional import visible_forward
 from .mamba import SSMMeta
@@ -28,6 +30,50 @@ class ImplConfig:
     optimizer: str | None = "dist_opt"
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
+    hf_path: str | None = None
+    surrogate_contract: str | None = None
+    routed_vjp_backend: str = "padded-v2"
+    routed_vjp_kernel_source: str | None = None
+    routed_vjp_token_limit: int | None = None
+    routed_forward_reduction: str | None = None
+    diagnostic_forward_only: bool = False
+    diagnostic_full_training: bool = False
+
+    def __post_init__(self):
+        from .nvfp4_ep4 import validate_reduction
+        from .nvfp4_moe_vjp import COMPACT_BACKEND, SURROGATE_CONTRACT, validate_backend
+
+        validate_reduction(self.routed_forward_reduction)
+        if type(self.diagnostic_forward_only) is not bool:
+            raise ValueError("diagnostic_forward_only must be boolean")
+        if type(self.diagnostic_full_training) is not bool:
+            raise ValueError("diagnostic_full_training must be boolean")
+        if self.diagnostic_full_training and (
+            self.diagnostic_forward_only or self.optimizer != "dist_opt"
+            or self.parallel.pp != 4
+            or self.surrogate_contract != SURROGATE_CONTRACT
+            or self.routed_vjp_backend != COMPACT_BACKEND
+        ):
+            raise ValueError("Full training diagnostic requires PP4, dist_opt and compact V2")
+        if self.diagnostic_forward_only and (
+            self.optimizer is not None or self.surrogate_contract is not None
+            or self.routed_vjp_backend != "padded-v2"
+            or self.routed_vjp_kernel_source is not None
+            or self.routed_vjp_token_limit is not None
+        ):
+            raise ValueError("Full-depth forward-only requires no optimizer or VJP")
+        from .nvfp4_moe import validate_token_limit
+        validate_token_limit(
+            self.routed_vjp_backend,
+            self.surrogate_contract,
+            self.routed_vjp_token_limit,
+        )
+
+        validate_backend(
+            self.routed_vjp_backend,
+            self.routed_vjp_kernel_source,
+            self.surrogate_contract,
+        )
 
 
 def build_model_config(source, **overrides):
@@ -136,10 +182,29 @@ def unpack_forward_output(model, batch, output):
 
 
 def build_model(model_cfg, *, impl_cfg):
+    if impl_cfg.diagnostic_forward_only and model_cfg.quantization_config is None:
+        raise ValueError("Full-depth forward-only requires a quantized checkpoint")
+    if model_cfg.quantization_config is not None and not impl_cfg.hf_path:
+        raise ValueError("Quantized Nemotron construction requires an explicit hf_path")
+    quantized = model_cfg.quantization_config is not None
+    if quantized:
+        from .quantized_proxy import (
+            build_quantized_proxy,
+            caller_runtime,
+            refresh_after_initial_optimizer_reload,
+            validate_proxy_config,
+        )
+
+        validate_proxy_config(model_cfg, impl_cfg)
+        caller_runtime(pipeline_size=impl_cfg.parallel.pp)
+    elif impl_cfg.surrogate_contract is not None:
+        raise ValueError("Surrogate contract requires a quantized checkpoint")
+    elif impl_cfg.routed_forward_reduction is not None:
+        raise ValueError("EP4 forward reduction requires a quantized checkpoint")
     p = impl_cfg.parallel
     if p.tp != 1 or (p.etp or 1) != 1 or p.vpp != 1:
         raise ValueError("Native Nemotron currently requires TP1/ETP1/VPP1")
-    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
     ps = init_parallel(p)
@@ -148,7 +213,15 @@ def build_model(model_cfg, *, impl_cfg):
         count * ps.pp_rank // ps.pp_size,
         count * (ps.pp_rank + 1) // ps.pp_size,
     )
-    chunks = [NemotronModel(model_cfg, ps, layer_range=(start, end), device="cuda")]
+    if quantized:
+        chunks = [
+            build_quantized_proxy(model_cfg, impl_cfg, ps, layer_range=(start, end))
+        ]
+        # Verify the checkpoint before an optimizer can bind these parameters.
+        _load_weights(chunks[0], impl_cfg.hf_path)
+        parameter_ids = {id(p) for chunk in chunks for p in chunk.parameters()}
+    else:
+        chunks = [NemotronModel(model_cfg, ps, layer_range=(start, end), device="cuda")]
     optimizer = finalize_grads = None
     if impl_cfg.optimizer == "dist_opt":
         from megatron.lite.primitive.optimizers.megatron_wrap import (
@@ -169,6 +242,17 @@ def build_model(model_cfg, *, impl_cfg):
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert
         )
+        if quantized:
+            if parameter_ids != {id(p) for chunk in chunks for p in chunk.parameters()}:
+                raise RuntimeError("Optimizer replaced quantized Parameter identities")
+            # DDP may rebind storage; never replace the Parameter objects.
+            refresh_quantized_projections(chunks)
+            for chunk in chunks:
+                current = chunk
+                while hasattr(current, "module"):
+                    current = current.module
+                _load_weights(current, impl_cfg.hf_path)
+            refresh_after_initial_optimizer_reload(optimizer, chunks)
     elif impl_cfg.optimizer is not None:
         raise ValueError(
             "Native Nemotron uses dist_opt, not the historical FSDP adapter"
@@ -182,6 +266,7 @@ def build_model(model_cfg, *, impl_cfg):
         extras={
             "model_cfg": model_cfg,
             "optimizer_backend": impl_cfg.optimizer or "none",
+            "post_optimizer_step_hook": partial(refresh_quantized_projections, chunks),
         },
     )
 
@@ -189,6 +274,13 @@ def build_model(model_cfg, *, impl_cfg):
 def load_hf_weights(chunk, hf_path, model_cfg, ps):
     while hasattr(chunk, "module"):
         chunk = chunk.module
+    if hasattr(chunk, "_quantized_proxy_root"):
+        from pathlib import Path
+
+        if str(Path(hf_path).resolve()) != chunk._quantized_proxy_root:
+            raise ValueError(
+                "Quantized proxy loader must use its construction checkpoint"
+            )
     _load_weights(chunk, hf_path)
 
 
