@@ -84,7 +84,7 @@ def test_real_seven_layer_model_logits_match_frozen_hf_alignment():
     from transformers import AutoConfig
     from transformers.models.nemotron_h import modeling_nemotron_h as hf
 
-    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     root = Path(os.environ["NEMOTRON_TEST_MODEL"])
     init_batch_invariance()
@@ -186,8 +186,6 @@ def test_real_seven_layer_native_runtime_forward(tmp_path, optimizer):
     torch.distributed.init_process_group(
         "nccl", init_method=f"file://{tmp_path / 'runtime-init'}", rank=0, world_size=1
     )
-    runtime = None
-    handle = None
     try:
         root = os.environ["NEMOTRON_TEST_MODEL"]
         config = MegatronLiteConfig(
@@ -255,8 +253,6 @@ def test_real_seven_layer_native_runtime_forward(tmp_path, optimizer):
                     flush=True,
                 )
     finally:
-        if runtime is not None and handle is not None:
-            runtime.close(handle)
         if optimizer is not None:
             from megatron.core import parallel_state
 
@@ -289,7 +285,6 @@ def _distributed_runtime_worker(rank, init_file, mode, layer_count=7, optimizer=
         rank=rank,
         world_size=8 if combined else 2,
     )
-    handle = None
     try:
         root = os.environ["NEMOTRON_TEST_MODEL"]
 
@@ -420,8 +415,6 @@ def _distributed_runtime_worker(rank, init_file, mode, layer_count=7, optimizer=
                     flush=True,
                 )
     finally:
-        if handle is not None:
-            runtime.close(handle)
         if optimizer is not None:
             from megatron.core import parallel_state
 
@@ -475,7 +468,6 @@ def test_native_full_model_frozen_rollout_logprobs():
 
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.distributed.init_process_group("nccl")
-    handle = None
     try:
         root = os.environ["NEMOTRON_TEST_MODEL"]
         runtime = MegatronLiteRuntime(
@@ -531,6 +523,4 @@ def test_native_full_model_frozen_rollout_logprobs():
                 flush=True,
             )
     finally:
-        if handle is not None:
-            runtime.close(handle)
         torch.distributed.destroy_process_group()
