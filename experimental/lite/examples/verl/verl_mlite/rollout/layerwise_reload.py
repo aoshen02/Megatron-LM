@@ -34,9 +34,11 @@ ALLOWED_UNLOADED: Mapping[tuple[str, str], str] = {
 
 # Checkpoint names a model legitimately consumes without loading anything on
 # this rank: MTP weights dropped by the main model, and non-local experts.
+# RoutedExperts.load_weights also silently skips expert ids it has no mapping
+# for, so the id must be within the model's routed experts.
 _DROPPED_PREFIXES = ("mtp.",)
 _EXPERT_NAME = re.compile(
-    r"\.experts\.\d+\.(?:up_proj|down_proj)\."
+    r"\.experts\.(?P<expert>\d+)\.(?:up_proj|down_proj)\."
     r"(?:weight|weight_scale|weight_scale_2|input_scale)$"
 )
 
@@ -83,7 +85,14 @@ class LayerwiseReloadSession:
         if name.startswith(_DROPPED_PREFIXES):
             mapper = getattr(self.model, "hf_to_vllm_mapper", None)
             return mapper is not None and not mapper.apply_list([name])
-        return _EXPERT_NAME.search(name) is not None
+        match = _EXPERT_NAME.search(name)
+        config = getattr(self.model, "config", None)
+        num_experts = getattr(config, "n_routed_experts", None)
+        return (
+            match is not None
+            and num_experts is not None
+            and int(match["expert"]) < num_experts
+        )
 
     def deficits(
         self, allowed: Mapping[tuple[str, str], str] = ALLOWED_UNLOADED
