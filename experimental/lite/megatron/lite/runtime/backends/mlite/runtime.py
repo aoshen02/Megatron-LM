@@ -162,7 +162,10 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     # hc_mult into the hidden dim ([B, S, hc_mult * H]); size the P2P buffer to match.
     # hc_mult defaults to 1, so this is a no-op for every other model.
     hc_mult = int(getattr(model_cfg, "hc_mult", 1) or 1)
-    return (local_seq_len, batch_size, int(model_cfg.hidden_size) * hc_mult)
+    hidden_size = getattr(model_cfg, "pipeline_hidden_size", None)
+    if hidden_size is None:
+        hidden_size = int(model_cfg.hidden_size) * hc_mult
+    return (local_seq_len, batch_size, int(hidden_size))
 
 
 def _last_loss_output(outputs: list[dict]) -> dict:
@@ -628,6 +631,10 @@ class MegatronLiteRuntime(RuntimeBase):
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        if update_successful:
+            hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(hook):
+                hook()
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
