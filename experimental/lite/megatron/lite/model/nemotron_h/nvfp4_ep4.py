@@ -4,8 +4,6 @@ Explicit measured AG/RS and FlashInfer one-sided recipes, not arbitrary
 collective-version parity. Reuses existing expert and ATen primitives.
 """
 
-import inspect
-
 import torch
 
 EP4_REDUCTION = "ep4-agrs-bf16-r0-r1r2r3-v1"
@@ -48,72 +46,67 @@ def reduce_ep4_parts(parts, ids, recipe):
     return total.to(torch.bfloat16)
 
 
-def install_ep4_reduction(expert, recipe=EP4_REDUCTION):
+def ep4_routed_experts(layer, x, topk_weights, topk_ids, recipe):
+    """Run unsharded Humming indexed experts with an EP4 serving combine.
+
+    Calls the experts' own stages in the order ``HummingIndexedExperts.apply``
+    does (no prepare quantization applies to W4A16), then replaces only its
+    final ``moe_fused_mul_sum`` with the four rank partials an EP4 deployment
+    computes and combines them in the selected serving order.
+    """
     validate_reduction(recipe)
     if recipe is None:
         raise ValueError("An explicit EP4 reduction recipe is required")
     from vllm import envs
     from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
 
+    experts = layer.quant_method.moe_kernel.fused_experts
     if (
-        type(expert).__name__ != "HummingIndexedExperts"
-        or expert.num_experts != 128
-        or expert.global_num_experts != 128
+        type(experts).__name__ != "HummingIndexedExperts"
+        or experts.num_experts != 128
+        or experts.global_num_experts != 128
         or not envs.VLLM_BATCH_INVARIANT
     ):
         raise RuntimeError("EP4 reduction requires BI1 full128 indexed experts")
-    if hasattr(expert, "_ep4_reduction_state"):
-        raise RuntimeError("EP4 reduction already installed")
-    original_apply = expert.apply
-    signature = inspect.signature(original_apply)
-    state = {"busy": False}
-    maps = []
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("EP4 reduction is eager only")
+    rows, topk = topk_ids.shape
+    if x.dtype != torch.bfloat16 or x.shape != (rows, 2688) or topk != 6:
+        raise ValueError("Expected BF16 Lightning top6 geometry")
+    activation = layer.activation
+    metas, required = experts.get_buffer_metas(rows, topk, activation)
+    buffers = {
+        name: torch.empty(metas[name]["shape"], dtype=metas[name]["dtype"], device=x.device)
+        for name in required
+        if name != "output"
+    }
+    w13_kwargs, w2_kwargs, scatter_idx = experts.prepare_humming_moe_kwargs(
+        topk_ids=topk_ids, expert_map=None, expert_tokens_meta=None
+    )
+    inputs, scale, scale_2 = experts.process_input(
+        "w13", inputs=x, input_scale=None,
+        quanted_input=buffers["quanted_gate_up_input"],
+    )
+    experts.humming_forward(
+        "w13", inputs=inputs, weight=layer.w13_weight, input_scale=scale,
+        input_scale_2=scale_2, outputs=buffers["gate_up_output"], **w13_kwargs,
+    )
+    inputs, scale, scale_2 = experts.process_input(
+        "w2", inputs=buffers["gate_up_output"],
+        quanted_input=buffers["quanted_down_input"], activation=activation,
+        scatter_idx=scatter_idx,
+    )
+    experts.humming_forward(
+        "w2", inputs=inputs, weight=layer.w2_weight, input_scale=scale,
+        input_scale_2=scale_2, outputs=buffers["down_output"].view(-1, x.shape[1]),
+        **w2_kwargs,
+    )
+    per_route = buffers["down_output"].view(rows, topk, x.shape[1])
+    parts = []
     for rank in range(4):
-        mapping = torch.full((128,), -1, dtype=torch.int32, device=expert.locks.device)
-        mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=mapping.device)
-        maps.append(mapping)
-
-    def aligned_apply(*args, **kwargs):
-        bound = signature.bind(*args, **kwargs).arguments
-        output, ids, weights = bound["output"], bound["topk_ids"], bound["topk_weights"]
-        if state["busy"] or torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("EP4 reduction is eager and non-reentrant")
-        if (
-            output.dtype != torch.bfloat16
-            or output.shape != (ids.shape[0], 2688)
-            or ids.shape[1] != 6
-        ):
-            raise ValueError("Expected BF16 Lightning top6 geometry")
-        if bound["expert_map"] is not None or bound["apply_router_weight_on_input"]:
-            raise ValueError("Require unsharded trainer with output routing weights")
-        original_forward = expert.humming_forward
-        captured = {}
-
-        def observe_forward(sublayer, *values, **options):
-            result = original_forward(sublayer, *values, **options)
-            if sublayer == "w2":
-                if captured:
-                    raise RuntimeError("Ambiguous repeated down projection")
-                captured["outputs"] = options["outputs"]
-            return result
-
-        state["busy"] = True
-        expert.humming_forward = observe_forward
-        try:
-            result = original_apply(*args, **kwargs)
-            if "outputs" not in captured:
-                raise RuntimeError("Down projection capture did not execute")
-            per_route = captured["outputs"].view(ids.shape[0], 6, 2688)
-            parts = [
-                moe_fused_mul_sum(per_route, weights, topk_ids=ids, expert_map=mapping)
-                for mapping in maps
-            ]
-            output.copy_(reduce_ep4_parts(parts, ids, recipe))
-            return result
-        finally:
-            expert.humming_forward = original_forward
-            state["busy"] = False
-
-    expert.apply = aligned_apply
-    expert._ep4_reduction_state = state
-    return state
+        mapping = torch.full((128,), -1, dtype=torch.int32, device=x.device)
+        mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=x.device)
+        parts.append(
+            moe_fused_mul_sum(per_route, topk_weights, topk_ids=topk_ids, expert_map=mapping)
+        )
+    return reduce_ep4_parts(parts, topk_ids, recipe)

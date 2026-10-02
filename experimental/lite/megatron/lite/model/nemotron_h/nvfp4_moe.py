@@ -227,11 +227,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
                 if dtype is not None and dtype.num_bits != 16:
                     raise RuntimeError("Unexpected activation quantization in W4A16")
             layer.requires_grad_(False)
-            if self.routed_forward_reduction is not None:
-                from .nvfp4_ep4 import install_ep4_reduction
-
-                self._ep4_reduction_state = install_ep4_reduction(
-                    experts, self.routed_forward_reduction)
         self._deployment = layer
         self._deployment_config = deployment_config
         self._deployed_versions = self.weights._versions()
@@ -379,9 +374,17 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         if x.shape[0] == 0:
             return torch.empty_like(x)
         with set_forward_context(None, self._deployment_config, num_tokens=x.shape[0]):
-            out = self._deployment.quant_method.apply(
-                self._deployment, x, routing_weights, ids, None, None
-            )
+            if self.routed_forward_reduction is None:
+                out = self._deployment.quant_method.apply(
+                    self._deployment, x, routing_weights, ids, None, None
+                )
+            else:
+                from .nvfp4_ep4 import ep4_routed_experts
+
+                out = ep4_routed_experts(
+                    self._deployment, x, routing_weights, ids,
+                    self.routed_forward_reduction,
+                )
         if (
             not isinstance(out, torch.Tensor)
             or out.shape != x.shape
