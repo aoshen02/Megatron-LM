@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from .checkpoint import load_fp8_kv_scales, refresh_quantized_projections
+from .checkpoint import load_fp8_kv_scales
 from .nvfp4_moe_vjp import SURROGATE_CONTRACT, validate_matmul_policy
 
 
@@ -272,21 +272,3 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
     if impl.diagnostic_forward_only:
         model.register_forward_pre_hook(_reject_grad_enabled_forward)
     return model
-
-
-def refresh_after_initial_optimizer_reload(optimizer, chunks):
-    """Runtime reloads optimizer masters after its HF loader; refresh afterwards."""
-    reload = getattr(optimizer, "reload_model_params", None)
-    if not callable(reload):
-        raise RuntimeError("Quantized dist_opt requires reload_model_params")
-
-    def initial_reload(*args, **kwargs):
-        from .vllm_runtime import vllm_context
-
-        result = reload(*args, **kwargs)
-        with vllm_context(chunks[0]):
-            refresh_quantized_projections(chunks)
-        optimizer.reload_model_params = reload
-        return result
-
-    optimizer.reload_model_params = initial_reload

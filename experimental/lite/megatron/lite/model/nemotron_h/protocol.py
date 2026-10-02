@@ -213,6 +213,13 @@ def _refresh_quantized(chunks):
         refresh_quantized_projections(chunks, recompute_scales=True)
 
 
+def _refresh_after_model_load(chunks):
+    # The runtime's HF loader rewrites the masters after build_model; re-encode
+    # with the checkpoint scales before the optimizer copies them.
+    with vllm_context(chunks[0]):
+        refresh_quantized_projections(chunks)
+
+
 def _build_model(model_cfg, impl_cfg):
     if impl_cfg.diagnostic_forward_only and model_cfg.quantization_config is None:
         raise ValueError("Full-depth forward-only requires a quantized checkpoint")
@@ -223,7 +230,6 @@ def _build_model(model_cfg, impl_cfg):
         from .quantized_proxy import (
             build_quantized_proxy,
             caller_runtime,
-            refresh_after_initial_optimizer_reload,
         )
 
         caller_runtime(pipeline_size=impl_cfg.parallel.pp)
@@ -282,22 +288,24 @@ def _build_model(model_cfg, impl_cfg):
                 while hasattr(current, "module"):
                     current = current.module
                 _load_weights(current, impl_cfg.hf_path)
-            refresh_after_initial_optimizer_reload(optimizer, chunks)
     elif impl_cfg.optimizer is not None:
         raise ValueError(
             "Native Nemotron uses dist_opt, not the historical FSDP adapter"
         )
+    extras = {
+        "model_cfg": model_cfg,
+        "optimizer_backend": impl_cfg.optimizer or "none",
+        "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
+    }
+    if quantized and optimizer is not None:
+        extras["post_model_load_hook"] = partial(_refresh_after_model_load, chunks)
     return ModelBundle(
         chunks=chunks,
         parallel_state=ps,
         optimizer=optimizer,
         finalize_grads=finalize_grads,
         forward_step=forward_step,
-        extras={
-            "model_cfg": model_cfg,
-            "optimizer_backend": impl_cfg.optimizer or "none",
-            "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
-        },
+        extras=extras,
     )
 
 
