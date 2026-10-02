@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from functools import partial
 
+import torch
+
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
@@ -196,6 +198,10 @@ def build_model(model_cfg, *, impl_cfg):
     from .vllm_runtime import ensure_vllm_runtime
 
     validate_proxy_config(model_cfg, impl_cfg)
+    if impl_cfg.surrogate_contract is not None:
+        # The surrogate VJPs are defined in FP32 matmul arithmetic; this
+        # protocol owns that policy instead of relying on each launcher.
+        torch.backends.cuda.matmul.allow_tf32 = False
     with set_current_vllm_config(ensure_vllm_runtime(impl_cfg.parallel.pp)):
         return _build_model(model_cfg, impl_cfg)
 
