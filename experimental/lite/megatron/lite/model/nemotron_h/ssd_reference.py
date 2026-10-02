@@ -3,11 +3,13 @@
 
 ``chunk_scan`` follows ``mamba2_chunk_scan`` from Transformers 5.16.1
 ``models/nemotron_h/modeling_nemotron_h.py`` (Apache-2.0) operation by
-operation. The only change is that the four broadcast contractions
-(``G``, ``Y_diag``, ``states`` and ``C @ states``) go through
-``chunk_product_sum``, which evaluates one SSD chunk at a time so the
-broadcast intermediates of a 9216-token sequence fit in memory. Each chunk
-reduces the full contraction axis exactly as the dense expression does.
+operation. The only change is that the five broadcast contractions
+(``G``, ``Y_diag``, ``states``, the inter-chunk state recurrence and
+``C @ states``) go through ``chunk_product_sum``, which evaluates one chunk at a
+time so the broadcast intermediates of a 16384-token sequence fit in memory
+(the dense recurrence alone is quadratic in the chunk count: 32.5 GiB at 16384
+tokens). Each chunk reduces the full contraction axis exactly as the dense
+expression does.
 """
 
 import torch
@@ -32,15 +34,17 @@ class _ChunkProductSum(torch.autograd.Function):
         if (
             reduce_dim == chunk_dim
             or left.shape[chunk_dim] < 1
-            or left.shape[chunk_dim] != right.shape[chunk_dim]
+            or right.shape[chunk_dim] not in (1, left.shape[chunk_dim])
         ):
-            raise ValueError("Only independent, non-broadcast chunk axes may split")
+            raise ValueError("Only independent chunk axes (right may broadcast) may split")
         ctx.reduce_dim, ctx.chunk_dim = reduce_dim, chunk_dim
         ctx.save_for_backward(left, right)
         output_dim = chunk_dim - (reduce_dim < chunk_dim)
         parts = []
+        shared = right.shape[chunk_dim] == 1 < left.shape[chunk_dim]
         for index in range(left.shape[chunk_dim]):
-            a, b = (value.narrow(chunk_dim, index, 1) for value in (left, right))
+            a = left.narrow(chunk_dim, index, 1)
+            b = right if shared else right.narrow(chunk_dim, index, 1)
             parts.append((a * b).sum(dim=reduce_dim))
         return torch.cat(parts, dim=output_dim)
 
@@ -51,14 +55,20 @@ class _ChunkProductSum(torch.autograd.Function):
         dim, chunk = ctx.reduce_dim, ctx.chunk_dim
         output_dim = chunk - (dim < chunk)
         dleft = torch.empty_like(left) if ctx.needs_input_grad[0] else None
-        dright = torch.empty_like(right) if ctx.needs_input_grad[1] else None
+        shared = right.shape[chunk] == 1 < left.shape[chunk]
+        dright = None
+        if ctx.needs_input_grad[1]:
+            dright = torch.zeros_like(right) if shared else torch.empty_like(right)
         for index in range(left.shape[chunk]):
-            a, b = (value.narrow(chunk, index, 1) for value in (left, right))
+            a = left.narrow(chunk, index, 1)
+            b = right if shared else right.narrow(chunk, index, 1)
             upstream = grad.narrow(output_dim, index, 1).unsqueeze(dim)
             upstream = upstream.expand(torch.broadcast_shapes(a.shape, b.shape))
             if dleft is not None:
                 dleft.narrow(chunk, index, 1).copy_((upstream * b).sum_to_size(a.shape))
-            if dright is not None:
+            if dright is not None and shared:
+                dright.add_((upstream * a).sum_to_size(b.shape))
+            elif dright is not None:
                 dright.narrow(chunk, index, 1).copy_((upstream * a).sum_to_size(b.shape))
         return dleft, dright, None, None
 
@@ -126,7 +136,7 @@ def chunk_scan(
     )
     states = torch.cat([previous_states, states], dim=1)
     decay_chunk = torch.exp(segment_sum(F.pad(A_cumsum[:, :, :, -1], (1, 0)))).transpose(1, 3)
-    new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+    new_states = chunk_product_sum(decay_chunk[..., None, None], states[:, :, None, ...], 1, 2)
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
     state_decay_out = torch.exp(A_cumsum)

@@ -126,7 +126,7 @@ def test_packed_conv_matches_independent_requests_and_native_vjp(lengths):
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("length", [1, 37, 256, 300])
+@pytest.mark.parametrize("length", [1, 37, 256, 300, 1300])
 def test_chunked_ssd_reference_matches_transformers_scan_bitwise(length):
     """The chunk-at-a-time contractions keep HF native SSD bits and VJP."""
     from megatron.lite.model.nemotron_h.ssd_reference import chunk_scan
