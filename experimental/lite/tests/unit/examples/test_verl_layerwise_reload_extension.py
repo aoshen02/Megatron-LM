@@ -94,7 +94,7 @@ ALLOWED = {("_Experts", "w13_input_scale"): "never in the checkpoint"}
 
 def _reload(model, payload, *, bucket=1):
     """Start a reload and stream the payload through one reused buffer."""
-    initialize_layerwise_reload(model)
+    initialize_layerwise_reload(model, copy_immediately=True)
     session = LayerwiseReloadSession(model)
     for start in range(0, len(payload), bucket):
         chunk = payload[start : start + bucket]

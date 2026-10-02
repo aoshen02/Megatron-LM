@@ -102,15 +102,15 @@ class LayerwiseReloadSession:
     def load(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load one received bucket, one tensor at a time.
 
-        The reload retains loader arguments until every tensor of a layer has
-        arrived while the receiver reuses its buffer, so tensors are cloned.
+        The reload copies every tensor into staged checkpoint-format storage
+        before ``load_weights`` returns, so the receiver may reuse its buffer.
         Loading per tensor exposes names the model accepts but never loads.
         """
         for name, tensor in drop_tied_alias_updates(self.model, list(weights)):
             if name in self.names:
                 raise ValueError(f"Duplicate tensor in one weight update: {name}")
             self.names.add(name)
-            loaded = set(self.model.load_weights([(name, tensor.clone())]) or ())
+            loaded = set(self.model.load_weights([(name, tensor)]) or ())
             if not loaded and not self._may_load_nothing(name):
                 raise ValueError(f"Model loaded nothing for tensor {name!r}")
             self.loaded |= loaded
@@ -182,9 +182,10 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
     verl's base extension treats ``ModelOptMixedPrecisionConfig`` as
     unquantized: it loads checkpoint tensors into already processed kernel
     layouts and reruns non-idempotent ``process_weights_after_loading``. This
-    extension restores the checkpoint layout, loads each bucket, lets vLLM
-    process every completed layer once and copies the result into the original
-    kernel storage, so captured CUDA graphs keep reading valid addresses.
+    extension restores the checkpoint layout, copies each received tensor into
+    it immediately, lets vLLM process every completed layer once and copies the
+    result into the original kernel storage, so captured CUDA graphs keep
+    reading valid addresses.
 
     Every update must carry the complete checkpoint: finalize would otherwise
     keep stale weights for absent layers and process partial layers from
@@ -251,7 +252,7 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
         self._layerwise_reload_failed = True
         self.last_reload_audit = None
         with set_current_vllm_config(vllm_config):
-            initialize_layerwise_reload(model)
+            initialize_layerwise_reload(model, copy_immediately=True)
             receiver.receive_weights(on_bucket_received=on_bucket_received)
             if callback_error is not None:
                 self.last_reload_audit = {"error": repr(callback_error)}
@@ -269,7 +270,8 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
             finalize_layerwise_reload(model, vllm_config.model_config)
         self._layerwise_reload_failed = False
 
-        # Retained bucket clones are dead now; return them before KV cache wakes.
+        # Staged checkpoint-format tensors are dead now; return them before
+        # the KV cache wakes.
         gc.collect()
         get_torch_device().empty_cache()
         return len(session.names)
