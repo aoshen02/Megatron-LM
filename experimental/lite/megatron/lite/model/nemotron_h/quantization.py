@@ -115,6 +115,45 @@ class CheckpointProjectionFactory:
         )
 
 
+def quantize_master(algorithm, master):
+    """Quantize an FP32 master with scales recomputed from its current value.
+
+    Follows vLLM's own weight quantizers on the master's BF16 value, as the
+    DeepSeek-V4 aligned actor does after its first update: NVFP4 takes one FP32
+    global scale ``amax / (6 * 448)`` (as ``_quantize_moe_weight_to_nvfp4``)
+    and group-16 E4M3 scales from ``scaled_fp4_quant``; FP8 takes the dynamic
+    per-tensor ``scaled_fp8_quant`` scale. Calibrated activation scales are not
+    touched. Returns checkpoint-domain tensors.
+    """
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        weight_amax,
+    )
+
+    if master.dtype != torch.float32 or master.ndim != 2 or not master.is_cuda:
+        raise ValueError("Expected a CUDA FP32 master matrix")
+    if not torch.isfinite(master).all():
+        raise ValueError("Expected finite FP32 master weights")
+    value = master.to(torch.bfloat16).contiguous()
+    if algorithm == "FP8":
+        weight, scale = ops.scaled_fp8_quant(value, scale=None)
+        return {"weight": weight, "weight_scale": scale.reshape(())}
+    if algorithm != "W4A16_NVFP4" or value.shape[-1] % 16:
+        raise ValueError(f"Unsupported dynamic quantization: {algorithm}")
+    amax = weight_amax(value).to(torch.float32).clamp_min(1e-8)
+    global_scale = (6.0 * 448.0) / amax
+    weight, scale = ops.scaled_fp4_quant(
+        value, global_scale.reshape(1), is_sf_swizzled_layout=False
+    )
+    return {
+        "weight": weight.view(torch.uint8),
+        "weight_scale": scale.view(torch.float8_e4m3fn).reshape(
+            value.shape[0], value.shape[1] // 16
+        ),
+        "weight_scale_2": (1.0 / global_scale).to(torch.float32),
+    }
+
+
 @dataclass(frozen=True)
 class QuantizedWeight:
     """Keep serialized scales separate from runtime-specific packed layouts."""
@@ -152,8 +191,12 @@ class QuantizedWeight:
             factors = scale.float().repeat_interleave(16, -1) * global_scale
         else:
             raise ValueError(f"Unsupported quantization: {self.algorithm}")
-        if not torch.isfinite(factors).all() or not (factors > 0).all():
-            raise ValueError("Weight scales must be finite and positive")
+        if not torch.isfinite(factors).all() or (factors < 0).any():
+            raise ValueError("Weight scales must be finite and nonnegative")
+        if self.algorithm == "FP8" and not (factors > 0).all():
+            raise ValueError("FP8 weight scales must be positive")
+        if self.algorithm == "W4A16_NVFP4" and not (global_scale > 0).all():
+            raise ValueError("NVFP4 global scales must be positive")
         result = values * factors
         if not torch.isfinite(result).all():
             raise ValueError("Nonfinite checkpoint weights")
@@ -180,7 +223,8 @@ class QuantizedWeight:
                 .to(torch.float8_e4m3fn)
             )
         factors = scale.repeat_interleave(16, -1) * self.tensors["weight_scale_2"]
-        normalized = master / factors
+        # A zero group scale encodes an all-zero block; never divide by it.
+        normalized = torch.where(factors > 0, master / factors, 0.0)
         midpoints = master.new_tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
         magnitude = normalized.abs().contiguous()
         index = torch.bucketize(magnitude, midpoints, right=False)
@@ -263,8 +307,23 @@ class Nvfp4TrainingLinear(torch.nn.Module):
         )
 
     @torch.no_grad()
-    def refresh_deployment(self):
-        packed = self._checkpoint(self._packed).encode_master(self.weight)
+    def refresh_deployment(self, recompute_scales=False):
+        """Re-encode the master; after the first update, also its scales.
+
+        Scales stay the checkpoint's until ``recompute_scales`` is first set
+        (after the first optimizer update) and are recomputed from then on.
+        """
+        self._recompute_scales = getattr(self, "_recompute_scales", False)
+        self._recompute_scales |= recompute_scales
+        if not self._recompute_scales:
+            packed = self._checkpoint(self._packed).encode_master(self.weight)
+        else:
+            tensors = quantize_master("W4A16_NVFP4", self.weight)
+            self.weight_scale.copy_(tensors["weight_scale"])
+            self.weight_scale_2.copy_(
+                tensors["weight_scale_2"].reshape(self.weight_scale_2.shape)
+            )
+            packed = tensors["weight"]
         self._install(packed)
 
     def export_quantized(self):

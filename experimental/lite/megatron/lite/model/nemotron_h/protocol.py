@@ -201,8 +201,10 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def _refresh_quantized(chunks):
+    # Post-optimizer hook: checkpoint scales are only valid for the initial
+    # weights (DeepSeek-V4 invalidates them after its first update too).
     with vllm_context(chunks[0]):
-        refresh_quantized_projections(chunks)
+        refresh_quantized_projections(chunks, recompute_scales=True)
 
 
 def _build_model(model_cfg, impl_cfg):

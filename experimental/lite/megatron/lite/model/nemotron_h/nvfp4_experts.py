@@ -9,7 +9,11 @@ from .quantization import QuantizedWeight, load_quantized_weight
 
 
 class Nvfp4ExpertWeights(torch.nn.Module):
-    """TP1/EP1 FP32 masters and immutable group16 scales, with explicit refresh.
+    """TP1/EP1 FP32 masters and group16 scales, with explicit refresh.
+
+    Scales are the checkpoint's until the first ``refresh_quantized`` with
+    ``recompute_scales`` (after the first optimizer update), then recomputed
+    from each expert's master on every refresh.
 
     No forward, backward, routing, Humming packing, or deployment is implemented.
     Ordinary optimizer mutations are version-checked. Runtime updates through
@@ -195,6 +199,8 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         )
 
     def _validate_fixed_scales(self):
+        if getattr(self, "_recompute_scales", False):
+            return
         for projection in ("up_proj", "down_proj"):
             for suffix in ("scale", "global"):
                 current = getattr(self, f"_{projection}_{suffix}")
@@ -210,17 +216,33 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         self._dirty = True
 
     @torch.no_grad()
-    def refresh_quantized(self):
-        """Re-encode masters without rebinding parameters or recalibrating scales."""
+    def refresh_quantized(self, recompute_scales=False):
+        """Re-encode masters without rebinding parameters or storage."""
+        from .quantization import quantize_master
+
         self._dirty = True
         self._validate_storage()
         self._validate_fixed_scales()
+        self._recompute_scales = getattr(self, "_recompute_scales", False)
+        self._recompute_scales |= recompute_scales
         for projection in ("up_proj", "down_proj"):
             parameter = getattr(self, projection)
             for expert in range(self.num_experts):
                 checkpoint = self._checkpoint(projection, expert)
-                packed = checkpoint.encode_master(parameter[expert])
-                checkpoint.tensors["weight"].copy_(packed)
+                if not self._recompute_scales:
+                    packed = checkpoint.encode_master(parameter[expert])
+                    checkpoint.tensors["weight"].copy_(packed)
+                    continue
+                tensors = quantize_master("W4A16_NVFP4", parameter[expert])
+                getattr(self, f"_{projection}_scale")[expert].copy_(
+                    tensors["weight_scale"]
+                )
+                getattr(self, f"_{projection}_global")[expert].copy_(
+                    tensors["weight_scale_2"]
+                )
+                getattr(self, f"_{projection}_packed")[expert].copy_(
+                    tensors["weight"]
+                )
         self._synced_versions = self._versions()
         self._dirty = False
 

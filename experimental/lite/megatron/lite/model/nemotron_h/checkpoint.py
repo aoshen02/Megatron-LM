@@ -124,8 +124,12 @@ class NemotronExport:
 
 
 @torch.no_grad()
-def refresh_quantized_projections(chunks):
-    """Refresh explicitly after updates, including updates bypassing _version."""
+def refresh_quantized_projections(chunks, *, recompute_scales=False):
+    """Refresh explicitly after updates, including updates bypassing _version.
+
+    ``recompute_scales`` (set by the post-optimizer hook) switches every module
+    from checkpoint scales to scales recomputed from its master, for good.
+    """
     from .fp8_training import Fp8TrainingLinear
     from .nvfp4_experts import Nvfp4ExpertWeights
     from .nvfp4_moe import Nvfp4RoutedDeployment
@@ -151,9 +155,9 @@ def refresh_quantized_projections(chunks):
     for module in modules:
         if isinstance(module, Nvfp4ExpertWeights):
             if module not in owned_weights:
-                module.refresh_quantized()
+                module.refresh_quantized(recompute_scales=recompute_scales)
         else:
-            module.refresh_deployment()
+            module.refresh_deployment(recompute_scales=recompute_scales)
 
 
 def hf_tensor_views(model):

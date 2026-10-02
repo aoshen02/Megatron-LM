@@ -2,7 +2,7 @@
 
 import torch
 
-from .quantization import QuantizedWeight
+from .quantization import QuantizedWeight, quantize_master
 
 
 class _Fp8LinearVJP(torch.autograd.Function):
@@ -44,7 +44,9 @@ class Fp8TrainingLinear(torch.nn.Module):
 
     Master weights and VJP arithmetic are FP32; activations, output and dX are
     BF16. dX uses dequantized deployment weights and dW uses the actual quantized
-    then dequantized input. Scales are fixed non-trainable buffers. This module
+    then dequantized input. Scales are non-trainable buffers: the
+    input scale stays calibrated; the weight scale stays the checkpoint's until
+    the first optimizer update and is recomputed from the master afterwards. This module
     does not establish training quality or select the final gradient recipe.
 
     Refresh explicitly after updates, outside capture. Graph pointer stability,
@@ -131,14 +133,22 @@ class Fp8TrainingLinear(torch.nn.Module):
             )
 
     @torch.no_grad()
-    def refresh_deployment(self):
+    def refresh_deployment(self, recompute_scales=False):
         self._validate_types()
         if self.weight.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Refresh deployment outside CUDA Graph capture")
+        self._recompute_scales = getattr(self, "_recompute_scales", False)
+        self._recompute_scales |= recompute_scales
+        if self._recompute_scales:
+            tensors = quantize_master("FP8", self.weight)
+            self.weight_scale.copy_(tensors["weight_scale"].reshape(1))
         for scale in (self.input_scale, self.weight_scale):
             if not torch.isfinite(scale).all() or not (scale > 0).all():
                 raise ValueError("FP8 scales must remain finite and positive")
-        packed = self._checkpoint().encode_master(self.weight)
+        if self._recompute_scales:
+            packed = tensors["weight"]
+        else:
+            packed = self._checkpoint().encode_master(self.weight)
         self._packed = packed.detach().clone()
         self._dequantized = self._packed.float() * self.weight_scale
         self._deployed_versions = self._versions()
