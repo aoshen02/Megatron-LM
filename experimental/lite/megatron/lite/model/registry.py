@@ -117,7 +117,7 @@ register_model(
     "nemotron_h",
     package="megatron.lite.model.nemotron_h",
     hf_model_types=["nemotron_h"],
-    impls={"lite": "megatron.lite.model.nemotron_h.protocol"},
+    impls={"vllm": "megatron.lite.model.nemotron_h.protocol"},
 )
 
 

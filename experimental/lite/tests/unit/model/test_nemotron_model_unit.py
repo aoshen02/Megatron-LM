@@ -190,6 +190,7 @@ def test_real_seven_layer_native_runtime_forward(tmp_path, optimizer):
         root = os.environ["NEMOTRON_TEST_MODEL"]
         config = MegatronLiteConfig(
             model_name="nemotron_h",
+            impl="vllm",
             hf_path=root,
             impl_cfg={"optimizer": optimizer},
             model_config_hook=first_seven,
@@ -300,6 +301,7 @@ def _distributed_runtime_worker(rank, init_file, mode, layer_count=7, optimizer=
         }[mode]
         config = MegatronLiteConfig(
             model_name="nemotron_h",
+            impl="vllm",
             hf_path=root,
             parallel=parallel,
             impl_cfg={"optimizer": optimizer},
@@ -474,6 +476,7 @@ def test_native_full_model_frozen_rollout_logprobs():
             root,
             MegatronLiteConfig(
                 model_name="nemotron_h",
+                impl="vllm",
                 hf_path=root,
                 parallel=ParallelConfig(pp=2, cp=2, ep=4),
                 impl_cfg={"optimizer": None},

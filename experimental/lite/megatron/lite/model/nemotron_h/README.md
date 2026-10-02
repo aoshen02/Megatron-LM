@@ -1,54 +1,39 @@
-# Native Nemotron-H alignment adapter
+# Nemotron-H (vLLM-aligned implementation)
 
-This correctness-first adapter implements BF16 Nemotron-H with native mlite
-pipeline/context/expert parallelism and the distributed optimizer. It is not
-the FSDP adapter. Expert dispatch uses all-to-all, not DeepEP.
+Nemotron-H Lightning NVFP4 training whose forward is bitwise equal to vLLM
+batch-invariant serving. It is registered as `impl="vllm"`, as DeepSeek-V4's
+aligned implementation is; there is no `lite` implementation. Every compute
+module calls vLLM kernels, so this package always requires the companion vLLM
+build. With verl, select it with `actor_rollout_ref.actor.engine.impl=vllm`.
 
-Forward uses the companion vLLM alignment arithmetic; backward recomputes native
-PyTorch/Transformers VJPs. In particular, this requires the non-stock vLLM
-`nemotron_h_alignment` module, batch-invariant linear/logprob kernels, and aligned
-Mamba kernels. Installing this change with an arbitrary stock vLLM is insufficient.
+## What runs where
 
-## Validated environment
+- **Quantized layers keep the checkpoint format.**
+  - Routed experts (W4A16 NVFP4, group 16) run the vLLM Humming MoE kernel
+    on packed FP4 weights with the serving EP4 one-sided reduction order.
+  - NVFP4 and FP8 linears run vLLM's ModelOpt linear methods.
+  - Attention runs the fixed-schedule FA4 kernel over an FP8 KV cache,
+    replaying `vllm.model_executor.models.nemotron_h_fa4`.
+- **Unquantized layers** (Mamba2, norms, embeddings, router) are BF16 and use
+  vLLM's batch-invariant kernels; Mamba2 uses vLLM's exact-replay SSD.
+- **Parameters.**
+  - Each quantized weight is an FP32 master `Parameter`. The forward never
+    reads it; it reads the FP4/FP8 encoding refreshed by the
+    `post_optimizer_step_hook` after every successful optimizer step.
+  - The actor forward and the rollout export read the same refreshed bytes,
+    so the rollout serves exactly the weights the actor computes with.
+- **Backward.**
+  - Weight gradients use a straight-through estimator onto the FP32 masters.
+  - The routed-expert VJP follows the surrogate contract
+    `moe-fixedscale-grouped-bf16edges-v2`.
+  - Sequence length is bounded by `routed_vjp_token_limit` (at most 16384).
+- **Parallelism.** The validated topology is PP4 with `dist_opt`.
 
-- Torch 2.13.0+cu130, Transformers 5.16.1, Transformer Engine 2.19.0.
-- Megatron-Core `15c83d2fcd00e283bb59ff26dce40266a445c615` on a separate source path.
-- Companion vLLM 0.28.1rc1.dev580+g385dce36b plus Nemotron alignment patches.
-- Full 52-layer BF16 historical `Nemotron-52L-aligned-cp2-sgd-step1` weights,
-  not unmodified initial HF weights.
-- GB200: two nodes, four GPUs each; TP1/PP2/CP2/EP4, dense DP2, ETP1.
-- Rollout DP8/EP8, CUDA Graph FULL_AND_PIECEWISE, prefix cache disabled.
+## Limits
 
-The example entry is `examples/verl/scripts/run_nemotron_alignment.sh` relative
-to `experimental/lite`. Supply MODEL_PATH, TRAIN_FILES and OUTPUT_ROOT on an
-already configured two-node Ray cluster. Both actor and rollout must enable
-`nemotron_shared_norms`; the wrapper supplies both overrides. The tested verl
-integration also has the raw-logprob equality gate, centralized-DP launch fix,
-and per-session deterministic sampling seeds; those changes are not in this PR.
+Validated on GB200 with the companion vLLM build. Quality, throughput and
+full-depth distributed checkpoint resume are not covered here.
 
-For the final two-step workload, set TRAIN_BATCH_SIZE=32, leave ROLLOUT_N=2,
-and pass these overrides to the example:
-
-```bash
-actor_rollout_ref.actor.use_dynamic_bsz=False \
-actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
-```
-
-This uses one sequence per micro-batch. Dynamic packing previously exceeded
-GPU memory in the second backward. Input/output limits are 2048/8192; observed
-prompt maxima were only 278/268, while outputs reached 8192 in both steps.
-
-## Evidence and limits
-
-Both steps completed rollout, old-logprob recomputation, backward, optimizer,
-and weight synchronization. Raw response logprobs were byte-identical across
-126085 and 119482 tokens; probability-diff max, log-ppl diff and k3-KL were zero.
-Rewards were all -1 and advantages/gradients zero in both steps. This does not
-demonstrate consecutive alignment after a nonzero learning update, model
-quality, production throughput, or full52 distributed checkpoint resume.
-
-[Two-step metrics](https://wandb.ai/vime/nemotron-mlite-alignment/runs/native-two-step-15340-seedfix-micro1)
-
-CPU correctness suites live in `tests/unit/model/test_nemotron_*_unit.py`.
-CUDA/real-weight cases require the companion environment and NEMOTRON_TEST_MODEL;
+CPU suites live in `tests/unit/model/test_nemotron_*_unit.py`. CUDA and
+real-weight cases need the companion environment and `NEMOTRON_TEST_MODEL`;
 skipped CUDA cases are not evidence of GPU correctness.

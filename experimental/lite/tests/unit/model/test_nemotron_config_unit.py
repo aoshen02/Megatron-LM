@@ -101,3 +101,11 @@ def test_routed_vjp_token_limit_admits_only_listed_extended_bounds():
         validate_token_limit(PADDED_BACKEND, SURROGATE_CONTRACT, 16384)
     with pytest.raises(ValueError):
         validate_token_limit(COMPACT_BACKEND, None, 16384)
+
+
+def test_nemotron_registers_only_the_vllm_aligned_impl():
+    from megatron.lite.model.registry import resolve_runtime_model_name
+
+    assert resolve_runtime_model_name("nemotron_h", "vllm") == "nemotron_h"
+    with pytest.raises(ValueError):
+        resolve_runtime_model_name("nemotron_h", "lite")
