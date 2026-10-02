@@ -3,8 +3,9 @@
 Fixed-scale STE onto the FP32 masters with BF16 intermediate edges. The expert
 GEMMs of the compact backend read FP32 storage as TF32 operands (the dequantized
 weights are truncated toward zero; BF16 activations are exact) and accumulate in
-FP32. The padded backend evaluates the same graph with FP32 GEMMs and serves as
-an FP32 diagnostic reference. This module establishes no SFT/RL quality approval.
+FP32. The padded backend evaluates the same graph with torch GEMMs and serves as
+a diagnostic reference only; it is not an FP32 reference when batch invariance
+replaces those GEMMs. This module establishes no SFT/RL quality approval.
 """
 
 import hashlib
