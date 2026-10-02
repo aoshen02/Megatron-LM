@@ -1,13 +1,12 @@
 """Checkpoint-domain NVFP4/FP8 encoding used by the Nemotron-H actor.
 
 The actor forward and the rollout export read the same encoding, so these tests
-pin the encoding itself: zero group scales, dynamic (post-update) scales, and
-determinism. GPU cases call vLLM's native quantizers.
+pin the encoding itself: zero group scales and post-update scale growth.
 """
 
 import pytest
 import torch
-from megatron.lite.model.nemotron_h.quantization import QuantizedWeight, quantize_master
+from megatron.lite.model.nemotron_h.quantization import QuantizedWeight, grow_scales
 
 LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
@@ -42,66 +41,56 @@ def test_nonpositive_global_scale_is_rejected():
         _nvfp4(weight, scale, torch.tensor(0.0)).initial_master()
 
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="vLLM native quantizers need CUDA"
-)
+def _checkpoint(rows=8, cols=64, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    weight = torch.randint(0, 256, (rows, cols // 2), generator=g, dtype=torch.uint8)
+    scale = (torch.rand(rows, cols // 16, generator=g) * 200 + 8).to(torch.float8_e4m3fn)
+    return _nvfp4(weight, scale, torch.tensor(1e-4))
 
 
-@requires_cuda
-def test_dynamic_nvfp4_matches_checkpoint_format_and_bounds_error():
-    torch.manual_seed(0)
-    master = torch.randn(64, 256, device="cuda") * 0.02
-    master[3, 32:48] = 0  # one all-zero group
-    master[5, 7] = 0.5  # one outlier dominating the global scale
-
-    tensors = quantize_master("W4A16_NVFP4", master)
-
-    assert tensors["weight"].dtype == torch.uint8
-    assert tensors["weight"].shape == (64, 128)
-    assert tensors["weight_scale"].dtype == torch.float8_e4m3fn
-    assert tensors["weight_scale"].shape == (64, 16)
-    assert tensors["weight_scale_2"].dtype == torch.float32
-    expected_global = master.to(torch.bfloat16).abs().max().float() / (6 * 448)
-    torch.testing.assert_close(tensors["weight_scale_2"], expected_global)
-    assert tensors["weight_scale"][3, 2].float() == 0
-
-    decoded = QuantizedWeight("W4A16_NVFP4", tensors).initial_master()
-    assert torch.equal(decoded[3, 32:48], torch.zeros(16, device="cuda"))
-    # Each value lies within half the widest grid step (2 units) of its group.
-    factors = tensors["weight_scale"].float().repeat_interleave(16, -1)
-    factors = factors * tensors["weight_scale_2"]
-    reference = master.to(torch.bfloat16).float()
-    assert ((decoded - reference).abs() <= factors + 1e-12).all()
-    assert torch.equal(decoded[5, 7], reference[5, 7])
-
-
-@requires_cuda
-def test_dynamic_quantization_is_deterministic_and_handles_all_zero():
-    master = torch.randn(32, 64, device="cuda")
-    first = quantize_master("W4A16_NVFP4", master)
-    second = quantize_master("W4A16_NVFP4", master.clone())
-    for name in first:
+def test_unchanged_master_reencodes_to_identical_bytes():
+    """Scales recomputed from a dequantized checkpoint would requantize every
+    layer at the first update; an unchanged master must keep its bytes."""
+    checkpoint = _checkpoint()
+    out = grow_scales("W4A16_NVFP4", checkpoint.initial_master(), checkpoint.tensors)
+    for name in ("weight", "weight_scale", "weight_scale_2"):
         assert torch.equal(
-            first[name].reshape(-1).view(torch.uint8),
-            second[name].reshape(-1).view(torch.uint8),
+            out[name].reshape(-1).view(torch.uint8),
+            checkpoint.tensors[name].reshape(-1).view(torch.uint8),
         ), name
 
-    zeros = quantize_master("W4A16_NVFP4", torch.zeros(32, 64, device="cuda"))
-    assert not zeros["weight"].any()
-    assert not zeros["weight_scale"].float().any()
-    assert torch.isfinite(zeros["weight_scale_2"]) and zeros["weight_scale_2"] > 0
+
+def test_small_overflow_keeps_the_scale_large_overflow_grows_only_that_block():
+    checkpoint = _checkpoint()
+    master = checkpoint.initial_master()
+    factors = checkpoint.tensors["weight_scale"].float() * 1e-4
+    master[0, 0] = 6.9 * factors[0, 0]  # within the top code's rounding range
+    master[1, 0] = 9.0 * factors[1, 0]  # beyond it
+    out = grow_scales("W4A16_NVFP4", master, checkpoint.tensors)
+    grown = out["weight_scale"].float() != checkpoint.tensors["weight_scale"].float()
+    assert grown.nonzero().tolist() == [[1, 0]]
+    decoded = QuantizedWeight("W4A16_NVFP4", out).initial_master()
+    new_factors = (out["weight_scale"].float() * out["weight_scale_2"]).repeat_interleave(16, -1)
+    assert ((decoded - master).abs() <= new_factors + 1e-12).all()
 
 
-@requires_cuda
-def test_dynamic_fp8_scale_follows_the_master():
-    master = torch.randn(32, 64, device="cuda") * 3
-    tensors = quantize_master("FP8", master)
+def test_block_beyond_e4m3_range_grows_the_global_scale():
+    checkpoint = _checkpoint()
+    master = checkpoint.initial_master()
+    master[2, 5] = 6 * 448 * 1e-4 * 2  # needs a block scale of 896 at the old global
+    out = grow_scales("W4A16_NVFP4", master, checkpoint.tensors)
+    assert out["weight_scale_2"] > checkpoint.tensors["weight_scale_2"]
+    decoded = QuantizedWeight("W4A16_NVFP4", out).initial_master()
+    assert torch.isclose(decoded[2, 5], master[2, 5], rtol=1e-6, atol=0)
 
-    assert tensors["weight"].dtype == torch.float8_e4m3fn
-    expected = master.to(torch.bfloat16).abs().max().float() / 448
-    torch.testing.assert_close(tensors["weight_scale"], expected)
-    decoded = QuantizedWeight(
-        "FP8",
-        {"weight": tensors["weight"], "weight_scale": tensors["weight_scale"]},
-    ).initial_master()
-    assert decoded.abs().max() <= master.abs().max() * (1 + 2**-3)
+
+def test_fp8_scale_grows_only_past_the_top_rounding_range():
+    master = torch.tensor([[1.0, -2.0], [0.5, 3.0]])
+    current = {"weight_scale": torch.tensor(3.0 / 448)}
+    assert torch.equal(grow_scales("FP8", master, current)["weight_scale"], current["weight_scale"])
+    assert torch.equal(
+        grow_scales("FP8", master * (464 / 448) * 0.999, current)["weight_scale"],
+        current["weight_scale"],
+    )
+    grown = grow_scales("FP8", master * 2, current)
+    assert torch.isclose(grown["weight_scale"], torch.tensor(6.0 / 448))

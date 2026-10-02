@@ -115,43 +115,66 @@ class CheckpointProjectionFactory:
         )
 
 
-def quantize_master(algorithm, master):
-    """Quantize an FP32 master with scales recomputed from its current value.
+_E4M3_MAX = 448.0
 
-    Follows vLLM's own weight quantizers on the master's BF16 value, as the
-    DeepSeek-V4 aligned actor does after its first update: NVFP4 takes one FP32
-    global scale ``amax / (6 * 448)`` (as ``_quantize_moe_weight_to_nvfp4``)
-    and group-16 E4M3 scales from ``scaled_fp4_quant``; FP8 takes the dynamic
-    per-tensor ``scaled_fp8_quant`` scale. Calibrated activation scales are not
-    touched. Returns checkpoint-domain tensors.
+
+def _e4m3_ceil(value):
+    """Smallest E4M3 value >= ``value`` (``value`` finite, positive, <= 448)."""
+    rounded = value.to(torch.float8_e4m3fn)
+    short = rounded.float() < value
+    bumped = (rounded.view(torch.uint8) + short.to(torch.uint8)).view(torch.float8_e4m3fn)
+    return bumped
+
+
+def grow_scales(algorithm, master, current):
+    """Encode a master, enlarging the current scales only where it overflows.
+
+    ``current`` holds the scales in use (checkpoint-domain ``weight_scale`` and,
+    for NVFP4, ``weight_scale_2``). A block keeps its scale while its largest
+    magnitude still rounds to the top code without exceeding the top grid's
+    rounding error (|x| <= 7 * factor for NVFP4, whose top codes are 4 and 6;
+    <= 464 * scale for FP8, whose top values are 448 and the 480 it lacks).
+    Otherwise it gets the smallest E4M3 scale that holds it, and the NVFP4
+    global only grows when a block would exceed the E4M3 range. An unchanged
+    master therefore re-encodes to identical bytes.
     """
-    from vllm import _custom_ops as ops
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        weight_amax,
-    )
-
-    if master.dtype != torch.float32 or master.ndim != 2 or not master.is_cuda:
-        raise ValueError("Expected a CUDA FP32 master matrix")
+    if master.dtype != torch.float32 or master.ndim != 2:
+        raise ValueError("Expected an FP32 master matrix")
     if not torch.isfinite(master).all():
         raise ValueError("Expected finite FP32 master weights")
-    value = master.to(torch.bfloat16).contiguous()
     if algorithm == "FP8":
-        weight, scale = ops.scaled_fp8_quant(value, scale=None)
-        return {"weight": weight, "weight_scale": scale.reshape(())}
-    if algorithm != "W4A16_NVFP4" or value.shape[-1] % 16:
-        raise ValueError(f"Unsupported dynamic quantization: {algorithm}")
-    amax = weight_amax(value).to(torch.float32).clamp_min(1e-8)
-    global_scale = (6.0 * 448.0) / amax
-    weight, scale = ops.scaled_fp4_quant(
-        value, global_scale.reshape(1), is_sf_swizzled_layout=False
-    )
-    return {
-        "weight": weight.view(torch.uint8),
-        "weight_scale": scale.view(torch.float8_e4m3fn).reshape(
-            value.shape[0], value.shape[1] // 16
-        ),
-        "weight_scale_2": (1.0 / global_scale).to(torch.float32),
+        scale = current["weight_scale"].float().reshape(())
+        amax = master.abs().max()
+        if amax > 464.0 * scale:
+            scale = amax / _E4M3_MAX
+        weight = QuantizedWeight("FP8", {"weight": master.to(torch.float8_e4m3fn),
+                                         "weight_scale": scale}).encode_master(master)
+        return {"weight": weight, "weight_scale": scale}
+    if algorithm != "W4A16_NVFP4" or master.shape[-1] % 16:
+        raise ValueError(f"Unsupported scale update: {algorithm}")
+    rows, cols = master.shape
+    block_amax = master.abs().reshape(rows, cols // 16, 16).amax(-1)
+    global_scale = current["weight_scale_2"].float().reshape(())
+    scale = current["weight_scale"].float().reshape(rows, cols // 16)
+    needed = block_amax / (6.0 * global_scale)
+    if needed.max() > _E4M3_MAX:
+        old = global_scale
+        global_scale = block_amax.max() / (6.0 * _E4M3_MAX)
+        # Rescaled scales leave the E4M3 grid; round up so no block clips.
+        scale = _e4m3_ceil((scale * (old / global_scale)).clamp_max(_E4M3_MAX)).float()
+        needed = block_amax / (6.0 * global_scale)
+    grow = needed > scale * (7.0 / 6.0)
+    scale = torch.where(grow, _e4m3_ceil(needed.clamp_max(_E4M3_MAX)).float(), scale)
+    encoded = {
+        "weight_scale": scale.to(torch.float8_e4m3fn),
+        "weight_scale_2": global_scale.to(torch.float32),
     }
+    packed_shape = (rows, cols // 2)
+    weight = QuantizedWeight(
+        "W4A16_NVFP4",
+        {"weight": torch.zeros(packed_shape, dtype=torch.uint8, device=master.device), **encoded},
+    ).encode_master(master)
+    return {"weight": weight, **encoded}
 
 
 @dataclass(frozen=True)
@@ -308,17 +331,22 @@ class Nvfp4TrainingLinear(torch.nn.Module):
 
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
-        """Re-encode the master; after the first update, also its scales.
+        """Re-encode the master; after the first update, grow overflowing scales.
 
         Scales stay the checkpoint's until ``recompute_scales`` is first set
-        (after the first optimizer update) and are recomputed from then on.
+        (after the first optimizer update); from then on a block's scale only
+        grows where the master overflows it (``grow_scales``).
         """
         self._recompute_scales = getattr(self, "_recompute_scales", False)
         self._recompute_scales |= recompute_scales
         if not self._recompute_scales:
             packed = self._checkpoint(self._packed).encode_master(self.weight)
         else:
-            tensors = quantize_master("W4A16_NVFP4", self.weight)
+            tensors = grow_scales(
+                "W4A16_NVFP4",
+                self.weight,
+                {"weight_scale": self.weight_scale, "weight_scale_2": self.weight_scale_2},
+            )
             self.weight_scale.copy_(tensors["weight_scale"])
             self.weight_scale_2.copy_(
                 tensors["weight_scale_2"].reshape(self.weight_scale_2.shape)

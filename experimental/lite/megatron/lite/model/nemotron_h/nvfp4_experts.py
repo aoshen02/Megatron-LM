@@ -12,8 +12,8 @@ class Nvfp4ExpertWeights(torch.nn.Module):
     """TP1/EP1 FP32 masters and group16 scales, with explicit refresh.
 
     Scales are the checkpoint's until the first ``refresh_quantized`` with
-    ``recompute_scales`` (after the first optimizer update), then recomputed
-    from each expert's master on every refresh.
+    ``recompute_scales`` (after the first optimizer update); from then on each
+    refresh grows a block's scale only where its expert master overflows it.
 
     No forward, backward, routing, Humming packing, or deployment is implemented.
     Ordinary optimizer mutations are version-checked. Runtime updates through
@@ -218,7 +218,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
     @torch.no_grad()
     def refresh_quantized(self, recompute_scales=False):
         """Re-encode masters without rebinding parameters or storage."""
-        from .quantization import quantize_master
+        from .quantization import grow_scales
 
         self._dirty = True
         self._validate_storage()
@@ -233,7 +233,14 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                     packed = checkpoint.encode_master(parameter[expert])
                     checkpoint.tensors["weight"].copy_(packed)
                     continue
-                tensors = quantize_master("W4A16_NVFP4", parameter[expert])
+                tensors = grow_scales(
+                    "W4A16_NVFP4",
+                    parameter[expert],
+                    {
+                        "weight_scale": getattr(self, f"_{projection}_scale")[expert],
+                        "weight_scale_2": getattr(self, f"_{projection}_global")[expert],
+                    },
+                )
                 getattr(self, f"_{projection}_scale")[expert].copy_(
                     tensors["weight_scale"]
                 )

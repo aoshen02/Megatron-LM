@@ -2,7 +2,7 @@
 
 import torch
 
-from .quantization import QuantizedWeight, quantize_master
+from .quantization import QuantizedWeight, grow_scales
 
 
 class _Fp8LinearVJP(torch.autograd.Function):
@@ -46,7 +46,8 @@ class Fp8TrainingLinear(torch.nn.Module):
     BF16. dX uses dequantized deployment weights and dW uses the actual quantized
     then dequantized input. Scales are non-trainable buffers: the
     input scale stays calibrated; the weight scale stays the checkpoint's until
-    the first optimizer update and is recomputed from the master afterwards. This module
+    the first optimizer update and afterwards only grows where the master overflows
+    it (``grow_scales``). This module
     does not establish training quality or select the final gradient recipe.
 
     Refresh explicitly after updates, outside capture. Graph pointer stability,
@@ -140,7 +141,7 @@ class Fp8TrainingLinear(torch.nn.Module):
         self._recompute_scales = getattr(self, "_recompute_scales", False)
         self._recompute_scales |= recompute_scales
         if self._recompute_scales:
-            tensors = quantize_master("FP8", self.weight)
+            tensors = grow_scales("FP8", self.weight, {"weight_scale": self.weight_scale})
             self.weight_scale.copy_(tensors["weight_scale"].reshape(1))
         for scale in (self.input_scale, self.weight_scale):
             if not torch.isfinite(scale).all() or not (scale > 0).all():
