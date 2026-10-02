@@ -1,4 +1,4 @@
-"""Humming routed forward with an explicit diagnostic-only V2 surrogate."""
+"""Humming routed forward with the explicit v3 routed surrogate VJP."""
 
 from copy import copy
 
@@ -27,7 +27,7 @@ def validate_token_limit(backend, contract, token_limit):
             "Explicit routed VJP token limit must be 2048, 8192, 9216 or 16384"
         )
     if backend != COMPACT_BACKEND or contract != SURROGATE_CONTRACT:
-        raise ValueError("Extended token limit requires compact and the V2 contract")
+        raise ValueError("Extended token limit requires compact and the v3 contract")
     return token_limit
 
 
@@ -38,8 +38,8 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     Inputs are fixed expert IDs and continuous routing weights; this adapter does
     not route, normalize scores, apply routed_scaling_factor, or add shared output.
     No Graph/compile/concurrent-host dispatch support is claimed. Default forward
-    rejects active autograd. The optional V2 surrogate is a bounded proxy
-    experiment, not an approved training-quality policy or V1 parity claim.
+    rejects active autograd. Training requires the explicit v3 surrogate
+    contract (see ``nvfp4_moe_vjp``).
     """
 
     def __init__(
@@ -61,12 +61,12 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         if surrogate_contract not in (None, SURROGATE_CONTRACT):
             raise ValueError("Unknown routed surrogate contract")
         if surrogate_contract is not None and model_config.num_experts_per_tok != 6:
-            raise ValueError("Diagnostic V2 surrogate requires top6")
+            raise ValueError("Routed surrogate requires top6")
         self.surrogate_contract = surrogate_contract
         if type(recompute_surrogate) is not bool or (
             recompute_surrogate and surrogate_contract != SURROGATE_CONTRACT
         ):
-            raise ValueError("Surrogate recomputation requires explicit V2 training")
+            raise ValueError("Surrogate recomputation requires the explicit v3 contract")
         self.recompute_surrogate = recompute_surrogate
         validate_backend(
             routed_vjp_backend, routed_vjp_kernel_source, surrogate_contract

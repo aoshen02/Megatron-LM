@@ -1,7 +1,8 @@
 """Diagnostic SM100 grouped TF32 adapter, dynamic-dummy revision r2.
 
 FP32 storage and TMA format; TFloat32 MMA interpretation, FP32 accumulation/output. New
-execution revision: no promise of V2 reduction-order or byte equivalence.
+execution revision: implements the v3 surrogate contract (TF32 operands, FP32
+accumulation); no reduction-order or byte equivalence with the padded FP32 reference.
 """
 
 import hashlib

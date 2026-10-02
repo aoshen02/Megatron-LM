@@ -77,7 +77,7 @@ def validate_proxy_config(config, impl):
     proxy_depth = config.num_hidden_layers in (4, 5)
     full_depth = forward_only or (full_training and not proxy_depth)
     if not forward_only and impl.surrogate_contract != SURROGATE_CONTRACT:
-        raise ValueError("Quantized proxy requires explicit diagnostic V2 contract")
+        raise ValueError("Quantized training requires the explicit v3 surrogate contract")
     if not forward_only and impl.optimizer_config is None:
         raise ValueError("Quantized proxy requires explicit optimizer_config")
     if any(value != 1 for value in (p.tp, p.etp or 1, p.ep, p.cp, p.vpp)):

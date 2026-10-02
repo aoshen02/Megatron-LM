@@ -25,7 +25,9 @@ build. With verl, select it with `actor_rollout_ref.actor.engine.impl=vllm`.
 - **Backward.**
   - Weight gradients use a straight-through estimator onto the FP32 masters.
   - The routed-expert VJP follows the surrogate contract
-    `moe-fixedscale-grouped-bf16edges-v2`.
+    `moe-fixedscale-grouped-tf32rz-bf16edges-v3`: TF32 operands (the
+    dequantized weights are truncated toward zero), FP32 accumulation, BF16
+    intermediate edges.
   - Sequence length is bounded by `routed_vjp_token_limit` (at most 16384).
 - **Parallelism.** The validated topology is PP4 with `dist_opt`.
 

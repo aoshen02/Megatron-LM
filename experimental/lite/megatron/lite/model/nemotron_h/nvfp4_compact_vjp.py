@@ -1,4 +1,4 @@
-"""Diagnostic compact V2 execution; fixed-scale STE and BF16 edges unchanged.
+"""Compact v3 execution: TF32-operand grouped GEMMs, fixed-scale STE, BF16 edges.
 
 Ported from the frozen compact_moe_vjp_splitk diagnostic, using F32-TMA
 without split K. Eager single-owner execution only; not a quality approval.
