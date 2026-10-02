@@ -82,7 +82,8 @@ def test_dynamic_quantization_is_deterministic_and_handles_all_zero():
     second = quantize_master("W4A16_NVFP4", master.clone())
     for name in first:
         assert torch.equal(
-            first[name].view(torch.uint8), second[name].view(torch.uint8)
+            first[name].reshape(-1).view(torch.uint8),
+            second[name].reshape(-1).view(torch.uint8),
         ), name
 
     zeros = quantize_master("W4A16_NVFP4", torch.zeros(32, 64, device="cuda"))
