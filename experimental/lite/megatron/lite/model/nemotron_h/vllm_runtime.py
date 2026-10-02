@@ -43,9 +43,12 @@ def ensure_vllm_runtime(pipeline_size):
         return _owned_config
     if not dist.is_initialized():
         raise RuntimeError("Initialize torch.distributed before the vLLM runtime")
+    # The trainer never builds a vLLM executor or model runner; its pipeline is
+    # mlite's. Do not declare external_launcher: with PP > 1 that requests the
+    # runner's PP output broadcast, which Model Runner V2 rejects.
     config = VllmConfig(
         parallel_config=ParallelConfig(
-            pipeline_parallel_size=pipeline_size, distributed_executor_backend="external_launcher"
+            pipeline_parallel_size=pipeline_size, distributed_executor_backend="mp"
         ),
         compilation_config=CompilationConfig(custom_ops=["none", "+quant_fp8"]),
     )
