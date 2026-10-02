@@ -22,8 +22,10 @@ def validate_token_limit(backend, contract, token_limit):
         raise ValueError("Unknown routed VJP backend")
     if token_limit is None:
         return 512 if backend == COMPACT_BACKEND else 128
-    if type(token_limit) is not int or token_limit not in (2048, 8192, 9216):
-        raise ValueError("Explicit routed VJP token limit must be 2048, 8192 or 9216")
+    if type(token_limit) is not int or token_limit not in (2048, 8192, 9216, 16384):
+        raise ValueError(
+            "Explicit routed VJP token limit must be 2048, 8192, 9216 or 16384"
+        )
     if backend != COMPACT_BACKEND or contract != SURROGATE_CONTRACT:
         raise ValueError("Extended token limit requires compact and the V2 contract")
     return token_limit

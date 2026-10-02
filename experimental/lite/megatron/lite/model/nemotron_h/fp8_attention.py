@@ -206,20 +206,27 @@ class Fa4Fp8KVAttention(Fp8KVAttention):
         super().__init__(*args, backend="fa4", **kwargs)
 
     def _visible(self, q, k, v, boundaries, *, return_query=False):
+        from vllm.model_executor.models.nemotron_h_fa4 import (
+            MAX_SEQ_LEN,
+            NUM_SPLITS,
+            SEQLEN_K_PER_SPLIT,
+        )
         from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
         if len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != q.shape[0]:
             raise ValueError("Expected complete zero-origin packed boundaries")
         lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
-        if any(length <= 0 or length > 9216 for length in lengths):
-            raise ValueError("Expected nonempty sequences no longer than 9216")
+        if any(length <= 0 or length > MAX_SEQ_LEN for length in lengths):
+            raise ValueError(f"Expected nonempty sequences no longer than {MAX_SEQ_LEN}")
+        pages = -(-MAX_SEQ_LEN // 6768)
         table = torch.arange(
-            len(lengths) * 2, device=q.device, dtype=torch.int32
-        ).reshape(-1, 2)
+            len(lengths) * pages, device=q.device, dtype=torch.int32
+        ).reshape(-1, pages)
         slots = torch.cat(
             [
-                torch.arange(length, device=q.device, dtype=torch.int64) + index * 13536
+                torch.arange(length, device=q.device, dtype=torch.int64)
+                + index * pages * 6768
                 for index, length in enumerate(lengths)
             ]
         )
@@ -245,8 +252,8 @@ class Fa4Fp8KVAttention(Fp8KVAttention):
             value_cache,
             cu_seqlens_q=cu,
             seqused_k=lengths,
-            max_seqlen_q=9216,
-            max_seqlen_k=9216,
+            max_seqlen_q=MAX_SEQ_LEN,
+            max_seqlen_k=MAX_SEQ_LEN,
             page_table=table,
             softmax_scale=self.scale,
             causal=True,
@@ -255,8 +262,8 @@ class Fa4Fp8KVAttention(Fp8KVAttention):
             v_descale=vs.expand(scale_shape),
             tile_mn=(128, 128),
             pack_gqa=True,
-            num_splits=16,
-            seqlen_k_per_split=640,
+            num_splits=NUM_SPLITS,
+            seqlen_k_per_split=SEQLEN_K_PER_SPLIT,
             disable_scheduler_metadata=True,
             out=output,
         )
