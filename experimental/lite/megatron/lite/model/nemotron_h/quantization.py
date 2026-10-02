@@ -135,7 +135,8 @@ def grow_scales(algorithm, master, current):
     rounding error (|x| <= 7 * factor for NVFP4, whose top codes are 4 and 6;
     <= 464 * scale for FP8, whose top values are 448 and the 480 it lacks).
     Otherwise it gets the smallest E4M3 scale that holds it, and the NVFP4
-    global only grows when a block would exceed the E4M3 range. An unchanged
+    global only grows when a block exceeds the top E4M3 scale by the same
+    tolerance. An unchanged
     master therefore re-encodes to identical bytes.
     """
     if master.dtype != torch.float32 or master.ndim != 2:
@@ -157,7 +158,8 @@ def grow_scales(algorithm, master, current):
     global_scale = current["weight_scale_2"].float().reshape(())
     scale = current["weight_scale"].float().reshape(rows, cols // 16)
     needed = block_amax / (6.0 * global_scale)
-    if needed.max() > _E4M3_MAX:
+    # Same tolerance as a block: the top scale still rounds |x| <= 7/6 of it.
+    if needed.max() > _E4M3_MAX * (7.0 / 6.0):
         old = global_scale
         global_scale = block_amax.max() / (6.0 * _E4M3_MAX)
         # Rescaled scales leave the E4M3 grid; round up so no block clips.

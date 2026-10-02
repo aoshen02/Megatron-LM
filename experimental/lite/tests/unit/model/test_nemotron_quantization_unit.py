@@ -94,3 +94,14 @@ def test_fp8_scale_grows_only_past_the_top_rounding_range():
     )
     grown = grow_scales("FP8", master * 2, current)
     assert torch.isclose(grown["weight_scale"], torch.tensor(6.0 / 448))
+
+
+def test_global_scale_uses_the_block_tolerance():
+    """A block just past the E4M3 range still rounds to the top code at scale
+    448; only beyond 7/6 of it does the global grow."""
+    checkpoint = _checkpoint()
+    master = checkpoint.initial_master()
+    master[2, 5] = 6 * 448 * 1e-4 * 1.1  # needs 492.8 < 448 * 7 / 6
+    out = grow_scales("W4A16_NVFP4", master, checkpoint.tensors)
+    assert torch.equal(out["weight_scale_2"], checkpoint.tensors["weight_scale_2"])
+    assert out["weight_scale"][2, 0].float() == 448
