@@ -12,10 +12,15 @@ rejects checkpoints without a `quantization_config`.
 
 ## What runs where
 
-- **Quantized layers keep the checkpoint format.**
-  - Routed experts (W4A16 NVFP4, group 16) run the vLLM Humming MoE kernel
+- **Quantized layers keep the checkpoint format.** As in the DeepSeek-V4
+  aligned actor, the serving kernels are called directly with tensors
+  (`kernels.py`); no vLLM layer, config or process group is created. Weights
+  pass once through vLLM's own preparation helpers (Humming repack,
+  FlashInfer swizzle, scale inversion), in the order serving applies them.
+  - Routed experts (W4A16 NVFP4, group 16) run the Humming indexed MoE kernel
     on packed FP4 weights with the serving EP4 one-sided reduction order.
-  - NVFP4 and FP8 linears run vLLM's ModelOpt linear methods.
+  - NVFP4 linears run Humming dense GEMMs (shared expert: the FlashInfer
+    CuTe-DSL GEMM); FP8 linears run the static FP8 quant plus `bmm_fp8`.
   - Attention runs the fixed-schedule FA4 kernel over an FP8 KV cache,
     replaying `vllm.model_executor.models.nemotron_h_fa4`.
 - **Unquantized layers** (Mamba2, norms, embeddings, router) are BF16 and use

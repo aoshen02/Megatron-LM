@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import torch
 
+from .kernels import scaled_fp8_quant
+
 
 class _Fp8AttentionVJP(torch.autograd.Function):
     @staticmethod
@@ -60,11 +62,6 @@ class Fp8KVAttention(torch.nn.Module):
         backend="triton",
     ):
         super().__init__()
-        from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            GroupShape,
-        )
-
         for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
             if (
                 value.dtype != torch.float32
@@ -81,7 +78,6 @@ class Fp8KVAttention(torch.nn.Module):
         self.scale = head_dim**-0.5
         self.block_size = block_size
         self.heads = (num_heads, num_kv_heads, head_dim)
-        self.query_quant = QuantFP8(static=True, group_shape=GroupShape.PER_TENSOR)
         if backend == "triton":
             from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
@@ -130,7 +126,7 @@ class Fp8KVAttention(torch.nn.Module):
             _v_scale=v_scale,
             _q_scale=torch.ones_like(self.k_scale),
         )
-        quantized_q, _ = self.query_quant(q.flatten(1), layer._q_scale)
+        quantized_q, _ = scaled_fp8_quant(q.flatten(1), layer._q_scale)
         quantized_q = quantized_q.view(q.shape)
         self.impl.do_kv_cache_update(layer, k, v, cache, slots)
         meta = TritonAttentionMetadata(
@@ -236,7 +232,7 @@ class Fa4Fp8KVAttention(Fp8KVAttention):
         ks = self.k_scale.to(torch.bfloat16).float()
         vs = self.v_scale.to(torch.bfloat16).float()
         qs = torch.ones_like(ks)
-        quantized_q, _ = self.query_quant.forward_cuda(q.flatten(1), qs)
+        quantized_q, _ = scaled_fp8_quant(q.flatten(1), qs)
         quantized_q = quantized_q.view(q.shape)
         key_cache, value_cache = cache.transpose(1, 2).split(128, dim=-1)
         reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "fp8_e4m3", ks, vs)

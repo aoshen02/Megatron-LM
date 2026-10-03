@@ -19,16 +19,14 @@ class CheckpointProjectionFactory:
 
     Plain BF16 tensors are validated here and loaded by the normal HF loader.
     Quantized adapters load their own checkpoint-domain tensors at construction.
-    The caller owns vLLM configuration/parallel initialization for deployment.
     """
 
-    def __init__(self, root, quantized_layers, quant_config):
+    def __init__(self, root, quantized_layers):
         import json
         from pathlib import Path
 
         self.root = Path(root)
         self.recipes = dict(quantized_layers)
-        self.quant_config = quant_config
         self.index = json.loads(
             (self.root / "model.safetensors.index.json").read_text()
         )["weight_map"]
@@ -108,9 +106,7 @@ class CheckpointProjectionFactory:
                 f"Quantized projection geometry/dtype disagrees for {prefix}"
             )
         checkpoint = load_quantized_weight(self.root, prefix, recipe)
-        return build_quantized_projection(
-            checkpoint, prefix, self.quant_config, device=device
-        )
+        return build_quantized_projection(checkpoint, prefix, device=device)
 
 
 def requantize(algorithm, weight):
@@ -257,12 +253,7 @@ class Nvfp4TrainingLinear(torch.nn.Module):
         }
 
     def _install(self):
-        # Clone loader inputs: runtime transforms must not mutate export bytes.
-        deployment = self._factory(
-            {k: v.detach().clone() for k, v in self._tensors().items()}
-        )
-        deployment.requires_grad_(False)
-        self._inference = deployment
+        self._inference = self._factory(**self._tensors())
         self._deployed_version = self.weight._version
 
     def _check_fresh(self):
@@ -338,65 +329,22 @@ def load_quantized_weight(root, prefix, recipe):
     return QuantizedWeight(algorithm, tensors)
 
 
-def build_quantized_projection(checkpoint, prefix, quant_config, *, device):
+def build_quantized_projection(checkpoint, prefix, *, device):
     """Construct a training projection before binding optimizer parameters.
 
-    vLLM config/parallel initialization belongs to the caller's runtime. NVFP4
-    deployments use the same ModelOpt loader and selected kernel as inference.
+    NVFP4 deployments use the serving kernels: the shared expert's FlashInfer
+    CuTe-DSL GEMM, Humming everywhere else.
     """
     from .fp8_training import Fp8TrainingLinear
+    from .kernels import CuteDslNvfp4Linear, HummingNvfp4Linear
 
     if checkpoint.algorithm == "FP8":
         return Fp8TrainingLinear(checkpoint, device=device)
     if checkpoint.algorithm != "W4A16_NVFP4":
         raise ValueError(f"Unsupported projection recipe: {checkpoint.algorithm}")
-
-    def deployment_factory(tensors):
-        import vllm.envs as envs
-        from vllm.model_executor.layers.linear import ReplicatedLinear
-
-        if not envs.VLLM_BATCH_INVARIANT:
-            raise RuntimeError("Aligned NVFP4 projection requires batch invariance")
-        n, packed_k = tensors["weight"].shape
-        with torch.device(device):
-            layer = ReplicatedLinear(
-                packed_k * 2,
-                n,
-                bias=False,
-                params_dtype=torch.bfloat16,
-                quant_config=quant_config,
-                prefix=prefix,
-                return_bias=False,
-                disable_tp=True,
-            )
-        shared_projection = prefix.rsplit(".", 2)[-2:]
-        if shared_projection in (
-            ["shared_experts", "up_proj"],
-            ["shared_experts", "down_proj"],
-        ):
-            from vllm.distributed import get_tensor_model_parallel_world_size
-            from vllm.model_executor.kernels.linear.nvfp4.base import (
-                NvFp4LinearLayerConfig,
-            )
-            from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
-                NemotronSharedNvFp4LinearKernel,
-            )
-
-            if get_tensor_model_parallel_world_size() != 1:
-                raise ValueError("Aligned Nemotron shared W4A16 requires TP=1")
-            supported, reason = NemotronSharedNvFp4LinearKernel.is_supported()
-            if not supported:
-                raise ValueError(reason)
-            layer.quant_method.kernel = NemotronSharedNvFp4LinearKernel(
-                NvFp4LinearLayerConfig()
-            )
-        elif type(layer.quant_method.kernel).__name__ != "HummingNvFp4LinearKernel":
-            raise RuntimeError("Expected the validated BI Humming W4A16 kernel")
-        with torch.no_grad():
-            for name, tensor in tensors.items():
-                parameter = getattr(layer, name)
-                parameter.weight_loader(parameter, tensor.to(device))
-            layer.quant_method.process_weights_after_loading(layer)
-        return layer
-
-    return Nvfp4TrainingLinear(checkpoint, deployment_factory, device=device)
+    shared = prefix.rsplit(".", 2)[-2:] in (
+        ["shared_experts", "up_proj"],
+        ["shared_experts", "down_proj"],
+    )
+    factory = CuteDslNvfp4Linear if shared else HummingNvfp4Linear
+    return Nvfp4TrainingLinear(checkpoint, factory, device=device)

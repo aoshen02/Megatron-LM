@@ -46,69 +46,27 @@ def reduce_ep4_parts(parts, ids, recipe):
     return total.to(torch.bfloat16)
 
 
-def ep4_routed_experts(layer, x, topk_weights, topk_ids, recipe, *, return_fc1=False):
-    """Run unsharded Humming indexed experts with an EP4 serving combine.
+def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1=False):
+    """Run all 128 Humming experts locally with an EP4 serving combine.
 
-    Calls the experts' own stages in the order ``HummingIndexedExperts.apply``
-    does (no prepare quantization applies to W4A16), then replaces only its
-    final ``moe_fused_mul_sum`` with the four rank partials an EP4 deployment
-    computes and combines them in the selected serving order. ``return_fc1``
-    also returns the visible FC1 output per route (token-major, slot-minor).
+    Forms the four BF16 rank partials an EP4 deployment computes (each rank's
+    ``moe_fused_mul_sum`` over its 32 experts) and combines them in the
+    selected serving order. ``return_fc1`` also returns the visible FC1 output
+    per route (token-major, slot-minor).
     """
     validate_reduction(recipe)
     if recipe is None:
         raise ValueError("An explicit EP4 reduction recipe is required")
-    from vllm import envs
-    from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
-
-    experts = layer.quant_method.moe_kernel.fused_experts
-    if (
-        type(experts).__name__ != "HummingIndexedExperts"
-        or experts.num_experts != 128
-        or experts.global_num_experts != 128
-        or not envs.VLLM_BATCH_INVARIANT
-    ):
-        raise RuntimeError("EP4 reduction requires BI1 full128 indexed experts")
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("EP4 reduction is eager only")
+    if experts.num_experts != 128 or experts.global_num_experts != 128:
+        raise RuntimeError("EP4 reduction requires full128 indexed experts")
     rows, topk = topk_ids.shape
     if x.dtype != torch.bfloat16 or x.shape != (rows, 2688) or topk != 6:
         raise ValueError("Expected BF16 Lightning top6 geometry")
-    activation = layer.activation
-    metas, required = experts.get_buffer_metas(rows, topk, activation)
-    buffers = {
-        name: torch.empty(metas[name]["shape"], dtype=metas[name]["dtype"], device=x.device)
-        for name in required
-        if name != "output"
-    }
-    w13_kwargs, w2_kwargs, scatter_idx = experts.prepare_humming_moe_kwargs(
-        topk_ids=topk_ids, expert_map=None, expert_tokens_meta=None
-    )
-    inputs, scale, scale_2 = experts.process_input(
-        "w13", inputs=x, input_scale=None,
-        quanted_input=buffers["quanted_gate_up_input"],
-    )
-    experts.humming_forward(
-        "w13", inputs=inputs, weight=layer.w13_weight, input_scale=scale,
-        input_scale_2=scale_2, outputs=buffers["gate_up_output"], **w13_kwargs,
-    )
-    inputs, scale, scale_2 = experts.process_input(
-        "w2", inputs=buffers["gate_up_output"],
-        quanted_input=buffers["quanted_down_input"], activation=activation,
-        scatter_idx=scatter_idx,
-    )
-    experts.humming_forward(
-        "w2", inputs=inputs, weight=layer.w2_weight, input_scale=scale,
-        input_scale_2=scale_2, outputs=buffers["down_output"].view(-1, x.shape[1]),
-        **w2_kwargs,
-    )
-    per_route = buffers["down_output"].view(rows, topk, x.shape[1])
+    fc1, per_route = experts.routes(x, topk_ids)
     parts = []
     for rank in range(4):
         mapping = torch.full((128,), -1, dtype=torch.int32, device=x.device)
         mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=x.device)
-        parts.append(
-            moe_fused_mul_sum(per_route, topk_weights, topk_ids=topk_ids, expert_map=mapping)
-        )
+        parts.append(experts.rank_partial(per_route, topk_weights, topk_ids, mapping))
     out = reduce_ep4_parts(parts, topk_ids, recipe)
-    return (out, buffers["gate_up_output"]) if return_fc1 else out
+    return (out, fc1) if return_fc1 else out

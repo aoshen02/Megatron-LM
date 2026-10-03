@@ -3,8 +3,6 @@
 from dataclasses import dataclass, field
 from functools import partial
 
-import torch
-
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
@@ -22,7 +20,6 @@ from .checkpoint import load_hf_weights as _load_weights
 from .checkpoint import refresh_quantized_projections
 from .config import NemotronHConfig
 from .mamba import SSMMeta
-from .vllm_runtime import vllm_context
 
 
 # Tokens per LM-head/log-probability chunk (DS4 default).
@@ -81,14 +78,14 @@ def _token_mean_loss(log_probs, local_mask, full_mask, cp_size):
     return -(log_probs * local_mask).sum() * cp_size / full_mask.sum().clamp_min(1)
 
 
+def _base(module):
+    while hasattr(module, "module"):
+        module = module.module
+    return module
+
+
 def forward_step(model, batch):
-    with vllm_context(model):
-        return _forward_step(model, batch)
-
-
-def _forward_step(model, batch):
     from .logprob import aligned_selected_log_probs
-    from .vllm_runtime import _base
 
     ps = parallel_state_from_model(model)
     loss_mask = batch.loss_mask
@@ -160,34 +157,9 @@ def build_model(model_cfg, *, impl_cfg):
             "Nemotron impl=vllm requires a ModelOpt MIXED_PRECISION checkpoint "
             "(NVFP4 experts/linears, FP8 Mamba projections and KV cache)"
         )
-    from vllm.config import set_current_vllm_config
-
-    from .quantized_proxy import validate_proxy_config
-    from .vllm_runtime import ensure_vllm_runtime
+    from .quantized_proxy import build_quantized_proxy, validate_proxy_config
 
     validate_proxy_config(model_cfg, impl_cfg)
-    with set_current_vllm_config(ensure_vllm_runtime(impl_cfg.parallel.pp)):
-        return _build_model(model_cfg, impl_cfg)
-
-
-def _refresh_quantized(chunks):
-    # Post-optimizer hook: the checkpoint bytes are only valid for the initial
-    # weights (DeepSeek-V4 invalidates its bound scales after an update too).
-    with vllm_context(chunks[0]):
-        refresh_quantized_projections(chunks, recompute_scales=True)
-
-
-def _refresh_after_model_load(chunks):
-    # The runtime's HF loader may rebind the masters after build_model;
-    # reinstall the deployments before the first forward.
-    with vllm_context(chunks[0]):
-        refresh_quantized_projections(chunks)
-
-
-def _build_model(model_cfg, impl_cfg):
-    from .quantized_proxy import build_quantized_proxy, caller_runtime
-
-    caller_runtime(pipeline_size=impl_cfg.parallel.pp)
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
@@ -249,6 +221,18 @@ def _build_model(model_cfg, impl_cfg):
         forward_step=forward_step,
         extras=extras,
     )
+
+
+def _refresh_quantized(chunks):
+    # Post-optimizer hook: the checkpoint bytes are only valid for the initial
+    # weights (DeepSeek-V4 invalidates its bound scales after an update too).
+    refresh_quantized_projections(chunks, recompute_scales=True)
+
+
+def _refresh_after_model_load(chunks):
+    # The runtime's HF loader may rebind the masters after build_model;
+    # reinstall the deployments before the first forward.
+    refresh_quantized_projections(chunks)
 
 
 def load_hf_weights(chunk, hf_path, model_cfg, ps):

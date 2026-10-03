@@ -1,7 +1,7 @@
 """Construction of the quantized Lightning model (full depth or 4/5-layer proxy).
 
-Torch distributed must be initialized. The vLLM config, groups and workspace
-are either caller-owned or created by vllm_runtime.ensure_vllm_runtime().
+Torch distributed must be initialized. The serving kernels are called directly;
+no vLLM config or process group is created.
 """
 
 import json
@@ -106,48 +106,16 @@ def validate_proxy_config(config, impl):
         _validate_full_depth(config, source)
 
 
-def caller_runtime(*, pipeline_size=1):
+def _check_runtime(ps):
     import vllm.envs as envs
-    from vllm.config import get_current_vllm_config_or_none
-    from vllm.distributed.parallel_state import (
-        get_ep_group,
-        get_pp_group,
-        get_tp_group,
-        get_world_group,
-    )
-    from vllm.v1.worker.workspace import current_workspace_manager
 
-    if pipeline_size not in (1, 4):
-        raise ValueError("Quantized runtime supports pipeline size 1 or 4")
     if not envs.VLLM_BATCH_INVARIANT:
         raise RuntimeError("Quantized proxy requires BI=1 before startup")
     if (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != pipeline_size
+        or torch.distributed.get_world_size() != ps.pp_size
     ):
-        raise RuntimeError("Caller torch world must match the pipeline size")
-    cfg = get_current_vllm_config_or_none()
-    if cfg is None or cfg.kernel_config.moe_backend != "humming":
-        raise RuntimeError("Caller must provide current Humming VllmConfig")
-    if cfg.parallel_config.pipeline_parallel_size != pipeline_size:
-        raise RuntimeError("Caller VllmConfig must match the pipeline size")
-    try:
-        groups = (get_world_group(), get_tp_group(), get_ep_group(), get_pp_group())
-        workspace = current_workspace_manager()
-    except AssertionError as error:
-        raise RuntimeError(
-            "Caller must initialize vLLM groups and workspace"
-        ) from error
-    if tuple(group.world_size for group in groups) != (
-        pipeline_size,
-        1,
-        1,
-        pipeline_size,
-    ):
-        raise RuntimeError("Quantized runtime requires matching world/PP and TP1/EP1")
-    if workspace._device != torch.device("cuda", torch.cuda.current_device()):
-        raise RuntimeError("Caller workspace must use the current CUDA device")
-    return cfg
+        raise RuntimeError("Torch world must match the pipeline size")
 
 
 def stage_quantization_contract(config, layer_range):
@@ -179,9 +147,6 @@ def stage_quantization_contract(config, layer_range):
 
 
 def build_quantized_proxy(config, impl, ps, *, layer_range):
-    from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptMixedPrecisionConfig,
-    )
     from vllm.utils.torch_utils import set_default_torch_dtype
 
     from .fp8_training import Fp8TrainingLinear
@@ -190,12 +155,9 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
     from .nvfp4_moe import Nvfp4RoutedDeployment
     from .quantization import CheckpointProjectionFactory, Nvfp4TrainingLinear
 
-    cfg = caller_runtime(pipeline_size=ps.pp_size)
+    _check_runtime(ps)
     recipe = config.quantization_config
-    quant = ModelOptMixedPrecisionConfig.from_config(recipe)
-    factory = CheckpointProjectionFactory(
-        impl.hf_path, recipe["quantized_layers"], quant
-    )
+    factory = CheckpointProjectionFactory(impl.hf_path, recipe["quantized_layers"])
 
     def routed_factory(prefix, model_cfg, parallel, *, device, dtype):
         if dtype != torch.bfloat16 or parallel is not ps or model_cfg is not config:
@@ -212,11 +174,7 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             device=device,
         )
         return Nvfp4RoutedDeployment(
-            weights,
-            config,
-            cfg,
-            quant,
-            routed_forward_reduction=impl.routed_forward_reduction,
+            weights, config, routed_forward_reduction=impl.routed_forward_reduction
         )
 
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)
@@ -248,5 +206,4 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             "Quantized proxy construction did not cover every stage recipe prefix"
         )
     model._quantized_proxy_root = str(Path(impl.hf_path).resolve())
-    model._vllm_config = cfg
     return model
