@@ -159,6 +159,14 @@ def fp8_encode(weight, scale):
     return quotient.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
 
+def nvfp4_decode_values(packed):
+    """Signed FP4 values of packed NVFP4 codes (low nibble first)."""
+    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2)
+    levels = torch.tensor(FP4_LEVELS, device=packed.device)
+    values = levels[(codes & 7).long()]
+    return torch.where((codes & 8) != 0, -values, values)
+
+
 def nvfp4_encode_values(weight, scale, global_scale):
     """FP4 values (round to nearest even) of a master on given NVFP4 scales."""
     levels = torch.tensor(FP4_LEVELS, device=weight.device)
@@ -175,13 +183,14 @@ def nvfp4_encode_values(weight, scale, global_scale):
 
 
 def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
-    """Fail unless the checkpoint is the BF16 master encoded on its own scales.
+    """Compatibility: fail unless the checkpoint is the master encoded on its scales.
 
     Not an identity check (a master moved within its cells passes). FP8:
     E4M3(BF16(master / scale)) must give the checkpoint codes. NVFP4: FP4
     rounding of master / (block scale * global scale) must give the checkpoint
-    values; with ``exact_global`` (the master is the original BF16 source) the
-    global scale must also be amax / 1536. Both hold exactly for the Lightning
+    FP4 values wherever that unit is positive (no product is compared); with
+    ``exact_global`` (the master is the original BF16 source) the global scale
+    must also be amax / 1536. Both hold exactly for the Lightning
     checkpoint and its BF16 release, and for a master dequantized from the
     checkpoint. Returns the number of changed values (always 0).
     """
@@ -192,12 +201,13 @@ def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
         expected = tensors["weight"].view(torch.uint8)
         changed = int((codes != expected).sum())
     elif algorithm == "W4A16_NVFP4":
-        reference = QuantizedWeight(algorithm, tensors).initial_master()
+        QuantizedWeight(algorithm, tensors).initial_master()  # validates the layout
         global_scale = tensors["weight_scale_2"].float()
         scale = tensors["weight_scale"]
         values = nvfp4_encode_values(master, scale, global_scale)
         unit = (scale.float() * global_scale.reshape(())).repeat_interleave(16, -1)
-        changed = int((values * unit != reference).sum())
+        stored = nvfp4_decode_values(tensors["weight"])
+        changed = int(((values != stored) & (unit > 0)).sum())
         if exact_global:
             amax = master.float().abs().amax()
             derived = amax / torch.tensor(1536.0, device=master.device)
@@ -241,12 +251,7 @@ class QuantizedWeight:
             global_scale = self.tensors["weight_scale_2"]
             if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
                 raise ValueError("Expected one FP32 checkpoint global scale")
-            codes = torch.stack((weight & 15, weight >> 4), -1).flatten(-2)
-            levels = weight.new_tensor(
-                [0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=torch.float32
-            )
-            values = levels[(codes & 7).long()]
-            values = torch.where((codes & 8) != 0, -values, values)
+            values = nvfp4_decode_values(weight)
             factors = scale.float().repeat_interleave(16, -1) * global_scale
         else:
             raise ValueError(f"Unsupported quantization: {self.algorithm}")
