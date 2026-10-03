@@ -292,3 +292,26 @@ def test_local_lr_scheduler_honors_group_lr_bounds_and_rejects_lr_mult() -> None
     optimizer.param_groups[2]["lr_mult"] = 0.5
     with pytest.raises(ValueError, match="lr_mult"):
         scheduler.step(1)
+
+
+def test_checkpoint_load_runs_the_restore_hook_not_the_update_hook(monkeypatch, tmp_path) -> None:
+    """A restore reinstalls the saved deployment; requantizing it (the
+    post-optimizer hook) would change the policy without an update."""
+    from verl_mlite.engine import mlite_engine
+
+    calls = []
+    monkeypatch.setattr(mlite_engine, "load_training_checkpoint", lambda *a, **k: calls.append("load"))
+    engine = _engine(engine_config=_engine_config())
+    engine.runtime = object()
+    engine.handle = SimpleNamespace(
+        _extras={
+            "post_optimizer_step_hook": lambda: calls.append("update"),
+            "post_checkpoint_load_hook": lambda: calls.append("restore"),
+        },
+        _optimizer=None,
+        _config=SimpleNamespace(parallel=None),
+        _parallel_state=None,
+        _lr_scheduler=None,
+    )
+    engine.load_checkpoint(str(tmp_path))
+    assert calls == ["load", "restore"]
