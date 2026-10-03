@@ -253,3 +253,42 @@ def test_local_lr_scheduler_keeps_no_decay_groups_undecayed() -> None:
     opt.total_training_steps = 0
     assert _build_lr_scheduler(optimizer, opt) is None
     assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0, 0.1]
+
+
+def test_local_lr_scheduler_honors_group_lr_bounds_and_rejects_lr_mult() -> None:
+    """As Megatron Core: per-group max_lr/min_lr, through steps and a restore."""
+    from verl_mlite.engine.mlite_engine import _build_lr_scheduler
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"lr": 0.0, "weight_decay": 0.0, "max_lr": 1.0, "min_lr": 0.0},
+            {"lr": 0.0, "weight_decay": 0.0, "max_lr": 0.5, "min_lr": 0.1},
+            {"lr": 0.0, "weight_decay": 0.0},
+        ]
+    )
+    opt = SimpleNamespace(
+        total_training_steps=4,
+        lr_warmup_steps=0,
+        lr_warmup_steps_ratio=0.0,
+        lr_warmup_init=0.0,
+        lr=1.0,
+        min_lr=0.0,
+        lr_decay_steps=4,
+        lr_decay_style="linear",
+        weight_decay=0.0,
+        weight_decay_incr_style="constant",
+        lr_wsd_decay_steps=None,
+        lr_wsd_decay_style="exponential",
+    )
+    scheduler = _build_lr_scheduler(optimizer, opt)
+    scheduler.step(2)
+    expected = [0.5, 0.3, 0.5]
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(expected)
+    state = scheduler.state_dict()
+    scheduler.step(2)
+    scheduler.load_state_dict(state)
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(expected)
+
+    optimizer.param_groups[2]["lr_mult"] = 0.5
+    with pytest.raises(ValueError, match="lr_mult"):
+        scheduler.step(1)

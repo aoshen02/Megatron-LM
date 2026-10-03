@@ -131,40 +131,46 @@ class _MegatronLiteLRScheduler:
         return [group["lr"] for group in self.optimizer.param_groups]
 
     def _apply(self) -> None:
-        lr = self._get_lr()
         wd = self._get_wd()
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            # As Megatron Core: per-group max_lr/min_lr overrides; lr_mult is a
+            # legacy field Megatron Core no longer applies.
+            if param_group.get("lr_mult", 1.0) != 1.0:
+                raise ValueError("lr_mult is not supported; override max_lr/min_lr")
+            param_group["lr"] = self._get_lr(
+                param_group.get("max_lr", self.max_lr),
+                param_group.get("min_lr", self.min_lr),
+            )
             if param_group.get("weight_decay", None) is not None:
                 param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
-    def _get_lr(self) -> float:
+    def _get_lr(self, max_lr: float, min_lr: float) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
             ratio = self.num_steps / self.lr_warmup_steps
-            return self.init_lr + (self.max_lr - self.init_lr) * ratio
+            return self.init_lr + (max_lr - self.init_lr) * ratio
 
         if self.lr_decay_style == "constant":
-            return self.max_lr
+            return max_lr
 
         if self.lr_decay_style == "inverse-square-root":
             warmup = max(self.lr_warmup_steps, 1)
             step = max(self.num_steps, 1)
-            return max(self.min_lr, self.max_lr * math.sqrt(warmup) / math.sqrt(step))
+            return max(min_lr, max_lr * math.sqrt(warmup) / math.sqrt(step))
 
         if self.lr_decay_style == "wsd":
-            return self._get_wsd_lr()
+            return self._get_wsd_lr(max_lr, min_lr)
 
         decay_span = max(self.lr_decay_steps - self.lr_warmup_steps, 1)
         ratio = min(max((self.num_steps - self.lr_warmup_steps) / decay_span, 0.0), 1.0)
-        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_decay_style)
+        return self._decay(max_lr, min_lr, ratio, self.lr_decay_style)
 
-    def _get_wsd_lr(self) -> float:
+    def _get_wsd_lr(self, max_lr: float, min_lr: float) -> float:
         decay_steps = self.wsd_decay_steps or 0
         decay_start = max(self.lr_decay_steps - decay_steps, self.lr_warmup_steps)
         if decay_steps <= 0 or self.num_steps <= decay_start:
-            return self.max_lr
+            return max_lr
         ratio = min((self.num_steps - decay_start) / max(decay_steps, 1), 1.0)
-        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_wsd_decay_style)
+        return self._decay(max_lr, min_lr, ratio, self.lr_wsd_decay_style)
 
     def _get_wd(self) -> float:
         if self.wd_incr_style == "constant":
