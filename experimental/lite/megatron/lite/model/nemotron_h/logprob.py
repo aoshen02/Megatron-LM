@@ -13,7 +13,8 @@ def aligned_selected_log_probs(
     Follows the DeepSeek-V4 actor's ``aligned_selected_log_probs``: the LM head
     and the selected log-probability run one bounded chunk at a time, and the
     differentiable path is derived from the very logits the visible value saw.
-    Logits are divided by ``temperature`` in their own dtype, as before.
+    With ``temperature != 1`` the logits are cast to FP32 and then divided, as
+    DeepSeek-V4 does and as vLLM's sampler forms its processed logits.
 
     Args:
         hidden: Final normalized hidden states, ``[T, H]``.
@@ -38,7 +39,8 @@ def aligned_selected_log_probs(
         ids = labels[start : start + chunk_size, None]
         logits = projection(hidden[start : start + chunk_size], lm_head)
         if temperature != 1.0:
-            logits = logits / temperature
+            # As DS4 and vLLM's sampler: FP32 logits, then the temperature.
+            logits = logits.float() / temperature
         with torch.no_grad():
             visible = compute_token_logprobs(logits, ids)
         if torch.is_grad_enabled():

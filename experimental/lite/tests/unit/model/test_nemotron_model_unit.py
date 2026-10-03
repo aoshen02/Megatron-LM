@@ -316,7 +316,9 @@ def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
     with torch.no_grad():
         logits = linear_batch_invariant(inputs[0], lm_head.weight)
         if temperature != 1.0:
-            logits = logits / temperature
+            # vLLM's sampler: FP32 copy of the logits, then the temperature
+            # (its processed_logprobs; the recipe's raw_logprobs uses T=1).
+            logits = logits.float() / temperature
         assert torch.equal(
             log_probs, compute_token_logprobs(logits, labels[:, None])[:, 0]
         )

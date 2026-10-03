@@ -466,3 +466,42 @@ def test_cute_dsl_linear_builds_on_its_weight_device(monkeypatch):
     assert {t.device for t in (linear.weight, linear.weight_scale, linear.alpha)} == {
         torch.device("cuda", 1)
     }
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_ep4_rank_humming_schedule_matches_the_full_deployment_bitwise():
+    """The serving EP4 rank (32 local experts, configure_nemotron_humming,
+    valid_shape_m from the global token count, expert_map, only the tokens
+    routed to it) gives the routes and rank partial the trainer's 128-expert
+    deployment computes, bit for bit."""
+    from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
+
+    g = torch.Generator(device="cuda").manual_seed(8)
+    stacks = _lightning_stacks(g)
+    full = HummingRoutedExperts(
+        stacks["w13"], stacks["w2"], num_experts=128, offset=0, layer_name="experts"
+    )
+    ranks = [
+        HummingRoutedExperts(
+            *(tuple(t[r * 32 : (r + 1) * 32] for t in stacks[s]) for s in ("w13", "w2")),
+            num_experts=128, offset=r * 32, layer_name="experts",
+        )
+        for r in range(4)
+    ]
+    for rows in ORACLE_ROWS:
+        x = torch.randn(rows, 2688, generator=g, device="cuda").to(torch.bfloat16)
+        ids = _route_ids(rows, g)
+        weights = torch.rand(rows, 6, generator=g, device="cuda")
+        _, down = full.routes(x, ids)
+        for r, rank in enumerate(ranks):
+            owned = ids // 32 == r
+            tokens = owned.any(1).nonzero()[:, 0]
+            if tokens.numel() == 0:
+                continue
+            _, local = rank.routes(x[tokens], ids[tokens], global_tokens=4 * rows)
+            assert torch.equal(local[owned[tokens]], down[tokens][owned[tokens]]), (rows, r)
+            assert torch.equal(
+                rank.rank_partial(local, weights[tokens], ids[tokens], rank.expert_map),
+                full.rank_partial(down, weights, ids, rank.expert_map)[tokens],
+            ), (rows, r)

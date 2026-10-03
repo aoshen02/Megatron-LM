@@ -72,6 +72,11 @@ def validate_proxy_config(config, impl):
         raise ValueError("Quantized proxy requires TP/ETP/EP/CP/VPP1")
     if p.pp not in (1, 4):
         raise ValueError("Quantized Nemotron supports PP1 or PP4")
+    if impl.routed_forward_reduction is None:
+        raise ValueError(
+            "Quantized Nemotron requires routed_forward_reduction (the rollout's "
+            "EP4 combine); without it the six routes would be summed directly"
+        )
     if not full_depth and (
         config.num_hidden_layers not in (4, 5)
         or not {
