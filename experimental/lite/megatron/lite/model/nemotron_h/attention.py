@@ -23,9 +23,7 @@ class Attention(nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        import vllm.envs as envs
-
-        from .fp8_attention import Fa4Fp8KVAttention, Fp8KVAttention
+        from .fp8_attention import Fa4Fp8KVAttention
 
         if ps.tp_size != 1:
             raise ValueError("Nemotron attention currently requires TP1")
@@ -35,10 +33,7 @@ class Attention(nn.Module):
             raise ValueError("FP8 KV training attention currently requires CP1")
         self.head_dim = config.head_dim
         k_scale, v_scale = fp8_kv_scales
-        attention_class = (
-            Fa4Fp8KVAttention if envs.VLLM_BATCH_INVARIANT else Fp8KVAttention
-        )
-        self.kv_attention = attention_class(
+        self.kv_attention = Fa4Fp8KVAttention(
             config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,

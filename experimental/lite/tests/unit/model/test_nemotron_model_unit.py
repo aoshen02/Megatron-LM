@@ -39,10 +39,13 @@ def test_unquantized_checkpoint_is_rejected():
 
 @pytest.mark.gpus(1)
 @pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
-@pytest.mark.parametrize("attention", ["Fa4Fp8KVAttention", "Fp8KVAttention"])
-def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch):
-    """Lightning Q32/KV2/D128 vs per-request SDPA on the dequantized Q/K/V."""
-    from megatron.lite.model.nemotron_h import fp8_attention
+def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
+    """Lightning Q32/KV2/D128 vs per-request SDPA on the dequantized Q/K/V.
+
+    The VJP uses the visible output and LSE (DS4 semantics); the visible P@V
+    is FP8, which puts dQ/dK about 3x the BF16 noise floor of a BF16 forward.
+    """
+    from megatron.lite.model.nemotron_h.fp8_attention import Fa4Fp8KVAttention
     from megatron.lite.model.nemotron_h.mamba import SSMMeta
     from test_nemotron_mamba_unit import (
         LENGTHS,
@@ -52,19 +55,12 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch)
     )
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    from vllm.config import VllmConfig, set_current_vllm_config
-
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(42)
     meta = SSMMeta((0, *torch.tensor(LENGTHS).cumsum(0).tolist()))
-    with set_current_vllm_config(VllmConfig()):
-        module = getattr(fp8_attention, attention)(
-            32,
-            2,
-            128,
-            torch.tensor(0.02, device="cuda"),
-            torch.tensor(0.01, device="cuda"),
-        )
+    module = Fa4Fp8KVAttention(
+        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
+    )
     q, k, v = (
         torch.randn(
             meta.boundaries[-1], heads, 128, device="cuda", dtype=torch.bfloat16
@@ -73,8 +69,7 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch)
     )
     output = module(q, k, v, meta)
     with torch.no_grad():
-        serving = module._visible(q, k, v, meta.boundaries)[0]
-        _, *references = module._visible(q, k, v, meta.boundaries, return_query=True)
+        serving, _, *references = module._visible(q, k, v, meta.boundaries)
     assert torch.equal(output, serving)
     upstream = upstream_gradient(kind, output)
     actual = torch.autograd.grad(output, (q, k, v), upstream)
@@ -95,7 +90,7 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch)
     old = sdpa_vjp(torch.bfloat16)
     with sdpa_kernel(SDPBackend.MATH):
         reference = sdpa_vjp(torch.float64)
-    assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind)
+    assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind, ratio=4.0)
 
 
 @pytest.mark.gpus(1)
