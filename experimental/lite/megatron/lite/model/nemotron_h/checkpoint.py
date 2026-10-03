@@ -157,12 +157,12 @@ def hf_tensor_views(model):
         yield (name if name.startswith("lm_head.") else f"backbone.{name}"), tensor
 
 
-def _read_tensors(root, index, names):
+def _read_tensors(root, index, names, device="cpu"):
     from safetensors import safe_open
 
     result = {}
     for filename in sorted({index[name] for name in names}):
-        with safe_open(root / filename, framework="pt", device="cpu") as handle:
+        with safe_open(root / filename, framework="pt", device=str(device)) as handle:
             for name in names:
                 if index[name] == filename:
                     result[name] = handle.get_tensor(name)
@@ -228,12 +228,15 @@ def _load_bf16_masters(model, root, master_root):
         missing = [name for name in names if name not in source]
         if missing:
             raise ValueError(f"BF16 master source lacks {missing[:4]}")
-        values = _read_tensors(master_root, source, names)
+        # Read straight to the masters' device: host RAM is the optimizer's.
+        device = group[0][2].device
+        values = _read_tensors(master_root, source, names, device)
         stored = (
             _read_tensors(
                 root,
                 index,
                 [f"{p}.{s}" for p, a, *_ in group for s in suffixes[a]],
+                device,
             )
             if verify
             else {}
@@ -327,11 +330,8 @@ def _check_theta0_agreement(masters, root, index):
 
     for prefix, algorithm, master, deployed_fn in masters:
         names = [f"{prefix}.{suffix}" for suffix in suffixes[algorithm]]
-        stored = _read_tensors(root, index, names)
-        stored = {
-            suffix: stored[f"{prefix}.{suffix}"].to(master.device)
-            for suffix in suffixes[algorithm]
-        }
+        stored = _read_tensors(root, index, names, master.device)
+        stored = {s: stored[f"{prefix}.{s}"] for s in suffixes[algorithm]}
         deployed = {k: deployed_fn()[k] for k in suffixes[algorithm]}
         kind = re.sub(r"\.\d+\.", ".N.", prefix)
         kind = f"{'fp8' if algorithm == 'FP8' else 'nvfp4'}:{kind}"
