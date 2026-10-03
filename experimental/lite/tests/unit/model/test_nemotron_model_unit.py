@@ -263,3 +263,21 @@ def test_router_vjp_within_bf16_noise_floor(kind):
     old = old_vjp(torch.bfloat16, torch.float32)
     reference = old_vjp(torch.float64, torch.float64)
     assert_within_noise_floor(("dx", "dweight"), actual, old, reference, kind)
+
+
+def test_moe_combine_vjp_matches_autograd_bitwise():
+    from megatron.lite.model.nemotron_h.experts import _CombineVJP
+
+    def combine(shared, routed):
+        return shared + routed * 2.5
+
+    torch.manual_seed(0)
+    inputs = [
+        torch.randn(37, 64, dtype=torch.bfloat16, requires_grad=True) for _ in range(2)
+    ]
+    upstream = torch.randn(37, 64, dtype=torch.bfloat16)
+    actual = torch.autograd.grad(
+        _CombineVJP.apply(combine, *inputs, 2.5), inputs, upstream
+    )
+    expected = torch.autograd.grad(combine(*inputs), inputs, upstream)
+    assert all(map(torch.equal, actual, expected))

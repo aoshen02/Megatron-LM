@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from .functional import projection, visible_forward, visible_linear
+from .functional import projection, visible_linear
 
 
 class _FixedRouteVJP(torch.autograd.Function):
@@ -27,6 +27,19 @@ class _FixedRouteVJP(torch.autograd.Function):
                 selected = selected / selected.sum(-1, keepdim=True)
             (grad_logits,) = torch.autograd.grad(selected, replay, grad_weights.float())
         return grad_logits.to(logits.dtype), None, None
+
+
+class _CombineVJP(torch.autograd.Function):
+    """Visible compiled ``shared + routed * scale``; closed-form VJP."""
+
+    @staticmethod
+    def forward(ctx, visible, shared, routed, scale):
+        ctx.scale = scale
+        return visible(shared, routed)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return None, grad, grad * ctx.scale, None
 
 
 class Router(nn.Module):
@@ -154,12 +167,11 @@ class MoE(nn.Module):
             projection_factory=projection_factory,
             hf_prefix=f"{hf_prefix}.shared_experts",
         )
-        scale = config.routed_scaling_factor
+        self.routed_scaling_factor = scale = config.routed_scaling_factor
 
         def combine(shared, routed):
             return shared + routed * scale
 
-        self._native_combine = combine
         self._visible_combine = torch.compile(combine, fullgraph=True, dynamic=True)
 
     def forward(self, x):
@@ -168,6 +180,8 @@ class MoE(nn.Module):
         ids, weights = self.gate(x)
         routed = self.experts(x, ids, weights)
         shared = self.shared_experts(x)
-        return visible_forward(
-            self._visible_combine, self._native_combine, shared, routed
+        if not torch.is_grad_enabled():
+            return self._visible_combine(shared, routed).view(shape)
+        return _CombineVJP.apply(
+            self._visible_combine, shared, routed, self.routed_scaling_factor
         ).view(shape)
