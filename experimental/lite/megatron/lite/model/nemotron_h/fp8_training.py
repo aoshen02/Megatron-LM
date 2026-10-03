@@ -8,8 +8,9 @@ from .quantization import requantize
 class Fp8TrainingLinear(torch.nn.Module):
     """Static FP8 W/A forward over a BF16 master weight.
 
-    The deployment starts from the checkpoint bytes; after an optimizer update
-    the weight is requantized per tensor (scale = amax / 448) and the calibrated
+    The deployment starts from the checkpoint bytes (or, with a BF16 master
+    source, from the master's requantization); after an optimizer update the
+    weight is requantized per tensor (scale = amax / 448) and the calibrated
     input scale is kept. Backward is the BF16 master-weight VJP on the BF16
     input. Refresh outside Graph capture.
     """

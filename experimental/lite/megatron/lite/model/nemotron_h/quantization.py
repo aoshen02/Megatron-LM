@@ -109,26 +109,36 @@ class CheckpointProjectionFactory:
         return build_quantized_projection(checkpoint, prefix, device=device)
 
 
-def requantize(algorithm, weight):
-    """Quantize a BF16 master with the rule that produced the checkpoint.
+FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
-    NVFP4 uses Transformer Engine's 4over6 quantizer with the 256 E4M3 bound,
-    which reproduces the Lightning checkpoint from its dequantized weights. FP8
-    uses vLLM's dynamic per-tensor quantization (scale = amax / 448).
+
+def requantize(algorithm, weight):
+    """Quantize a BF16 master with the rule that produced the Lightning checkpoint.
+
+    NVFP4: Transformer Engine 4over6 with the 256 E4M3 bound, choosing map4/map6
+    by squared error (ModelOpt's static-MSE 4over6), global = amax / 1536. FP8:
+    per-tensor scale = amax / 448, codes = E4M3(BF16(w / scale)) as ModelOpt
+    rounds the quotient. From the public BF16 release this reproduces 100% of
+    the NVFP4 global scales and FP8 codes (given their scales) and 99.8% of the
+    NVFP4 bytes (agent_run/results/bf16src).
     """
     if weight.dtype != torch.bfloat16 or weight.ndim != 2:
         raise ValueError("Expected a BF16 master matrix")
     if algorithm == "FP8":
-        from vllm import _custom_ops as ops
-
-        packed, scale = ops.scaled_fp8_quant(weight.contiguous())
-        return {"weight": packed, "weight_scale": scale.reshape(())}
+        values = weight.float()
+        scale = values.abs().amax() / torch.tensor(448.0, device=values.device)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        return {"weight": fp8_encode(weight, scale), "weight_scale": scale}
     if algorithm != "W4A16_NVFP4" or weight.shape[-1] % 16:
         raise ValueError(f"Unsupported requantization: {algorithm}")
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 
     quantizer = NVFP4Quantizer(
-        rowwise=True, columnwise=False, nvfp4_use_4over6=True, nvfp4_e4m3_max=256
+        rowwise=True,
+        columnwise=False,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=256,
+        nvfp4_4over6_err_mode="MSE",
     )
     quantized = quantizer(weight.contiguous())
     rows, cols = weight.shape
@@ -139,34 +149,65 @@ def requantize(algorithm, weight):
         "weight_scale": quantized._rowwise_scale_inv.view(torch.float8_e4m3fn)[
             :rows, : cols // 16
         ].contiguous(),
-        "weight_scale_2": amax / (6.0 * 256.0),
+        "weight_scale_2": amax / torch.tensor(1536.0, device=amax.device),
     }
 
 
-def check_reversible(algorithm, master, tensors, name, *, tolerance=1e-3):
-    """Fail unless the BF16 master still determines the checkpoint values.
+def fp8_encode(weight, scale):
+    """E4M3 codes of ``weight / scale`` with the quotient rounded to BF16 first."""
+    quotient = (weight.float() / scale.float().reshape(())).to(torch.bfloat16)
+    return quotient.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
-    FP8: the checkpoint scale must re-encode the master to the same bytes, as
-    the DeepSeek-V4 loader asserts for its FP8 weights. NVFP4: requantizing
-    with the checkpoint rule must give the checkpoint values; BF16 rounding can
-    flip a 4over6 candidate whose two errors nearly tie (about 1e-8 of the
-    Lightning values), so up to ``tolerance`` of a tensor may change. Returns
-    the number of changed values.
+
+def nvfp4_encode_values(weight, scale, global_scale):
+    """FP4 values (round to nearest even) of a master on given NVFP4 scales."""
+    levels = torch.tensor(FP4_LEVELS, device=weight.device)
+    midpoints = (levels[1:] + levels[:-1]) / 2
+    rows, cols = weight.shape
+    blocks = weight.float().reshape(rows, cols // 16, 16)
+    unit = (scale.float() * global_scale.float().reshape(()))[..., None]
+    y = torch.where(unit > 0, blocks / unit, torch.zeros_like(blocks))
+    magnitude = y.abs().clamp(max=6.0)
+    index = torch.bucketize(magnitude, midpoints)
+    tie = (index < 7) & (magnitude == midpoints[index.clamp(max=6)])
+    index = torch.where(tie & (index % 2 == 1), index + 1, index)
+    return torch.where(y < 0, -levels[index], levels[index]).reshape(rows, cols)
+
+
+def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
+    """Fail unless the checkpoint is the BF16 master encoded on its own scales.
+
+    FP8: E4M3(BF16(master / scale)) must give the checkpoint codes. NVFP4: FP4
+    rounding of master / (block scale * global scale) must give the checkpoint
+    values; with ``exact_global`` (the master is the original BF16 source) the
+    global scale must also be amax / 1536. Both hold exactly for the Lightning
+    checkpoint and its BF16 release, and for a master dequantized from the
+    checkpoint. Returns the number of changed values (always 0).
     """
-    reference = QuantizedWeight(algorithm, tensors).initial_master()
+    master = master.detach()
+    tensors = {key: value.to(master.device) for key, value in tensors.items()}
     if algorithm == "FP8":
-        codes = (master.float() / tensors["weight_scale"].float()).to(
-            torch.float8_e4m3fn
-        )
-        changed = int((codes.view(torch.uint8) != tensors["weight"].view(torch.uint8)).sum())
-        allowed = 0
+        codes = fp8_encode(master, tensors["weight_scale"]).view(torch.uint8)
+        expected = tensors["weight"].view(torch.uint8)
+        changed = int((codes != expected).sum())
+    elif algorithm == "W4A16_NVFP4":
+        reference = QuantizedWeight(algorithm, tensors).initial_master()
+        global_scale = tensors["weight_scale_2"].float()
+        scale = tensors["weight_scale"]
+        values = nvfp4_encode_values(master, scale, global_scale)
+        unit = (scale.float() * global_scale.reshape(())).repeat_interleave(16, -1)
+        changed = int((values * unit != reference).sum())
+        if exact_global:
+            amax = master.float().abs().amax()
+            derived = amax / torch.tensor(1536.0, device=master.device)
+            if not torch.equal(derived.reshape(()), global_scale.reshape(())):
+                raise RuntimeError(f"{name}: checkpoint global scale is not amax/1536")
     else:
-        values = QuantizedWeight(algorithm, requantize(algorithm, master)).initial_master()
-        changed = int(((values - reference).abs() > reference.abs() * 2**-20).sum())
-        allowed = int(tolerance * reference.numel())
-    if changed > allowed:
+        raise ValueError(f"Unsupported quantization: {algorithm}")
+    if changed:
         raise RuntimeError(
-            f"{name} is not reversible through its BF16 master: {changed} values changed"
+            f"{name} is not its BF16 master on the checkpoint scales: "
+            f"{changed} values changed"
         )
     return changed
 

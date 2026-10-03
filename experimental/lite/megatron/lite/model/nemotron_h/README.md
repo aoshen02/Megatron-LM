@@ -32,8 +32,23 @@ rejects checkpoints without a `quantization_config`.
     reads it; it reads the FP4/FP8 deployment bytes.
   - The deployment starts from the checkpoint bytes. After every optimizer
     step the `post_optimizer_step_hook` gathers dist_opt's parameters and
-    requantizes the masters with the checkpoint's own rule: Transformer
-    Engine NVFP4 4over6 (E4M3 bound 256) and FP8 per-tensor amax/448.
+    requantizes the masters with the
+    checkpoint's own rule: Transformer Engine NVFP4 4over6 (E4M3 bound 256,
+    squared-error choice, global amax/1536 per HF tensor) and FP8 per-tensor
+    amax/448 with the quotient rounded through BF16 (ModelOpt's arithmetic).
+  - With `impl_cfg.bf16_master_path` (the BF16 release the checkpoint was
+    quantized from: `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16@a9904d2` for
+    `-NVFP4@bee7596`), the masters are loaded from that release instead of
+    dequantized from the checkpoint, and the θ0 deployment is their
+    requantization. Loading fails unless the release is the checkpoint's
+    source: non-quantized tensors bitwise equal, every NVFP4/FP8 code the
+    BF16 weight encoded on the checkpoint's scales, every NVFP4 global scale
+    amax/1536. The checkpoint still provides the config and the static FP8
+    activation and KV scales. θ0 differs from the checkpoint where ModelOpt's
+    choices are not derivable from the weights: 0.22% of the NVFP4 bytes
+    (4over6 near-ties) and the 24 of 46 FP8 projections whose calibrated
+    scale is not amax/448. Those use amax/448 from θ0 on, so the first update
+    has no scale jump.
   - The actor forward and the rollout export read the same bytes, so the
     rollout serves exactly the weights the actor computes with.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on

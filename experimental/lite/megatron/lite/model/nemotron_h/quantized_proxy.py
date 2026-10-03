@@ -109,6 +109,13 @@ def validate_proxy_config(config, impl):
         raise ValueError("Proxy checkpoint metadata disagrees with requested recipe")
     if full_depth:
         _validate_full_depth(config, source)
+    if impl.bf16_master_path:
+        master = json.loads((Path(impl.bf16_master_path) / "config.json").read_text())
+        if "quantization_config" in master or any(
+            master.get(key) != source.get(key)
+            for key in ("num_hidden_layers", "layers_block_type", "hidden_size")
+        ):
+            raise ValueError("BF16 master source must be the unquantized same model")
 
 
 def _check_runtime(ps):
@@ -214,4 +221,6 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             "Quantized proxy construction did not cover every stage recipe prefix"
         )
     model._quantized_proxy_root = str(Path(impl.hf_path).resolve())
+    if impl.bf16_master_path:
+        model._bf16_master_root = str(Path(impl.bf16_master_path).resolve())
     return model

@@ -35,6 +35,9 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
     hf_path: str | None = None
+    # BF16 release the hf_path checkpoint was quantized from; when set, the
+    # masters start from it and theta0 deploys their requantization.
+    bf16_master_path: str | None = None
     routed_forward_reduction: str | None = None
 
     def __post_init__(self):

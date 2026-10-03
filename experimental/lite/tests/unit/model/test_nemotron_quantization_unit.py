@@ -4,9 +4,15 @@ The actor forward and the rollout export read the same encoding, so these tests
 pin the encoding itself and the gradients the actor feeds the optimizer.
 """
 
+import os
+
 import pytest
 import torch
-from megatron.lite.model.nemotron_h.quantization import QuantizedWeight, requantize
+from megatron.lite.model.nemotron_h.quantization import (
+    QuantizedWeight,
+    check_reversible,
+    requantize,
+)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -51,6 +57,160 @@ def test_fp8_requantization_uses_the_tensor_amax():
     out = requantize("FP8", weight)
     assert torch.isclose(out["weight_scale"].cpu(), torch.tensor(3.0 / 448))
     assert out["weight"].float().abs().max() == 448
+
+
+REQUANT_SHAPES = [(16, 64), (128, 1024), (1856, 2688), (2688, 1856)]
+
+
+def _requant_input(kind, shape):
+    rows, columns = shape
+    if kind == "random":
+        g = torch.Generator(device="cuda").manual_seed(rows * 7919 + columns)
+        return torch.randn(shape, generator=g, device="cuda").to(torch.bfloat16)
+    if kind == "boundary":
+        # Pairs straddling block and FP4 decision boundaries.
+        base = torch.linspace(-12.0, 12.0, columns // 2, device="cuda")
+        row = torch.empty(columns, device="cuda")
+        row[0::2], row[1::2] = base - 1e-3, base + 1e-3
+        return row.expand(rows, columns).to(torch.bfloat16).contiguous()
+    if kind == "zeros":
+        return torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    if kind == "maxes":
+        return torch.full(shape, torch.finfo(torch.bfloat16).max, device="cuda").to(
+            torch.bfloat16
+        )
+    raise ValueError(kind)
+
+
+@cuda
+@pytest.mark.parametrize("shape", REQUANT_SHAPES)
+@pytest.mark.parametrize("kind", ["random", "boundary", "zeros", "maxes"])
+def test_nvfp4_requantize_is_te_4over6_mse_bytewise(kind, shape):
+    """requantize == TE's reference 4over6 (E4M3 bound 256, MSE choice), and the
+    global scale is amax / 1536 per HF tensor, byte for byte."""
+    from transformer_engine.pytorch.custom_recipes.quantization_ref_nvfp4 import (
+        NVFP4QuantizerRef,
+    )
+
+    weight = _requant_input(kind, shape)
+    out = requantize("W4A16_NVFP4", weight)
+    amax = weight.float().abs().amax().reshape(1)
+    packed, scale = NVFP4QuantizerRef._quantize_blockwise_reference(
+        weight, amax, 16, 1, pow_2_scales=False, nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=256, nvfp4_4over6_err_mode="MSE", eps=0.0,
+    )
+    rows, columns = shape
+    assert torch.equal(out["weight"], packed.view(torch.uint8)[:rows, : columns // 2])
+    assert torch.equal(
+        out["weight_scale"].view(torch.uint8),
+        scale.view(torch.uint8)[:rows, : columns // 16],
+    )
+    expected = amax.reshape(()) / torch.tensor(1536.0, device="cuda")
+    assert out["weight_scale_2"].dtype == torch.float32
+    global_scale = out["weight_scale_2"].view(torch.int32)
+    assert torch.equal(global_scale, expected.view(torch.int32))
+
+
+@cuda
+@pytest.mark.parametrize("kind", ["random", "boundary", "maxes"])
+def test_fp8_requantize_rounds_the_quotient_through_bf16(kind):
+    """ModelOpt encodes E4M3(BF16(w / scale)) with scale = amax / 448."""
+    weight = _requant_input(kind, (64, 256))
+    out = requantize("FP8", weight)
+    scale = weight.float().abs().amax() / torch.tensor(448.0, device="cuda")
+    assert torch.equal(out["weight_scale"], scale)
+    quotient = (weight.float() / scale).to(torch.bfloat16).float()
+    expected = quotient.clamp(-448, 448).to(torch.float8_e4m3fn)
+    assert torch.equal(out["weight"].view(torch.uint8), expected.view(torch.uint8))
+    assert out["weight"].float().abs().max() == 448
+
+
+@cuda
+@pytest.mark.parametrize("algorithm", ["W4A16_NVFP4", "FP8"])
+def test_check_reversible_accepts_the_source_and_rejects_a_changed_master(algorithm):
+    weight = _requant_input("random", (128, 1024))
+    tensors = requantize(algorithm, weight)
+    check_reversible(algorithm, weight, tensors, "w", exact_global=True)
+    dequantized = QuantizedWeight(algorithm, tensors).initial_master()
+    check_reversible(algorithm, dequantized.to(torch.bfloat16), tensors, "w")
+    changed = weight.clone()
+    changed[0, :16] *= 1.5
+    with pytest.raises(RuntimeError):
+        check_reversible(algorithm, changed, tensors, "w", exact_global=True)
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_requantized_bytes_are_what_the_vllm_loaders_hold(vllm_oracle_runtime):
+    """Loading requantize's tensors through vLLM's ModelOpt weight loaders keeps
+    them byte for byte: per-tensor global scales, one per routed expert and
+    projection (relu2, no gate/up fusion), as the checkpoint stores them."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    up = requantize("W4A16_NVFP4", _requant_input("random", (1856, 2688)))
+    down = requantize("W4A16_NVFP4", _requant_input("random", (2688, 1856)))
+    with set_current_vllm_config(vllm_oracle_runtime), torch.device("cuda"):
+        linear = ReplicatedLinear(
+            2688, 1856, bias=False, params_dtype=torch.bfloat16,
+            quant_config=_oracle_quant_config(["model.proj"]), prefix="model.proj",
+            return_bias=False, disable_tp=True,
+        )
+    with torch.no_grad():
+        for name, tensor in up.items():
+            parameter = getattr(linear, name)
+            parameter.weight_loader(parameter, tensor.clone())
+            assert torch.equal(
+                parameter.data.reshape(-1).view(torch.uint8),
+                tensor.reshape(-1).view(torch.uint8),
+            ), name
+
+    experts, local = _empty_oracle_experts(vllm_oracle_runtime)
+    expert = 5
+    with set_current_vllm_config(local), torch.no_grad():
+        for shard, stem, tensors in (("w1", "w13", up), ("w2", "w2", down)):
+            for suffix, tensor in tensors.items():
+                parameter = getattr(experts, f"{stem}_{suffix}")
+                experts.weight_loader(
+                    parameter, tensor.clone(), f"experts.{expert}.{suffix}",
+                    shard_id=shard, expert_id=expert,
+                )
+                loaded = parameter.data[expert].reshape(-1)[: tensor.numel()]
+                assert torch.equal(
+                    loaded.view(torch.uint8), tensor.reshape(-1).view(torch.uint8)
+                ), (stem, suffix)
+
+
+_LIGHTNING_BF16 = os.environ.get("MLITE_LIGHTNING_BF16")
+_LIGHTNING_NVFP4 = os.environ.get("MLITE_LIGHTNING_NVFP4")
+
+
+@cuda
+@pytest.mark.skipif(
+    not (_LIGHTNING_BF16 and _LIGHTNING_NVFP4),
+    reason="set MLITE_LIGHTNING_BF16/MLITE_LIGHTNING_NVFP4 to the a9904d2/bee7596 dirs",
+)
+def test_requantize_reproduces_a_lightning_checkpoint_tensor():
+    """Experts 10 down_proj of layer 1 is one of the 1317 checkpoint tensors the
+    rule reproduces byte for byte from the BF16 release."""
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    def read(root, key):
+        root = Path(root)
+        index = json.loads((root / "model.safetensors.index.json").read_text())
+        with safe_open(root / index["weight_map"][key], "pt", device="cuda") as f:
+            return f.get_tensor(key)
+
+    name = "backbone.layers.1.mixer.experts.10.down_proj"
+    out = requantize("W4A16_NVFP4", read(_LIGHTNING_BF16, f"{name}.weight"))
+    for suffix, tensor in out.items():
+        stored = read(_LIGHTNING_NVFP4, f"{name}.{suffix}")
+        assert torch.equal(
+            stored.reshape(-1).view(torch.uint8), tensor.reshape(-1).view(torch.uint8)
+        ), suffix
 
 
 @cuda
@@ -244,7 +404,7 @@ def test_direct_nvfp4_linear_matches_vllm_layer_bitwise(vllm_oracle_runtime, sha
         assert torch.equal(direct(x), expected), rows
 
 
-def _oracle_experts(stacks, config):
+def _empty_oracle_experts(config):
     from copy import copy
 
     from vllm.config import set_current_vllm_config
@@ -260,7 +420,7 @@ def _oracle_experts(stacks, config):
     local.compilation_config.static_forward_context = {}
     local.compilation_config.static_all_moe_layers = []
     with set_current_vllm_config(local), torch.device("cuda"):
-        layer = FusedMoEFactory(
+        return FusedMoEFactory(
             num_experts=e, top_k=LIGHTNING_MOE["topk"], hidden_size=h,
             intermediate_size=i, params_dtype=torch.bfloat16, quant_config=quant,
             prefix=prefix, ckpt_names=("up_proj", "down_proj", ""),
@@ -271,16 +431,22 @@ def _oracle_experts(stacks, config):
             e_score_correction_bias=torch.zeros(e, dtype=torch.float32),
             routed_scaling_factor=1.0, apply_routed_scale_to_output=True,
             router_logits_dtype=torch.float32, skip_padding=True,
-        ).routed_experts
-        with torch.no_grad():
-            for stem, (packed, scale, global_scale) in stacks.items():
-                getattr(layer, f"{stem}_weight").copy_(packed)
-                getattr(layer, f"{stem}_weight_scale").copy_(scale)
-                target = getattr(layer, f"{stem}_weight_scale_2")
-                target.copy_(global_scale.reshape(target.shape))
-            layer.w13_input_scale.fill_(float("nan"))
-            layer.w2_input_scale.fill_(float("nan"))
-            layer.quant_method.process_weights_after_loading(layer)
+        ).routed_experts, local
+
+
+def _oracle_experts(stacks, config):
+    from vllm.config import set_current_vllm_config
+
+    layer, local = _empty_oracle_experts(config)
+    with set_current_vllm_config(local), torch.device("cuda"), torch.no_grad():
+        for stem, (packed, scale, global_scale) in stacks.items():
+            getattr(layer, f"{stem}_weight").copy_(packed)
+            getattr(layer, f"{stem}_weight_scale").copy_(scale)
+            target = getattr(layer, f"{stem}_weight_scale_2")
+            target.copy_(global_scale.reshape(target.shape))
+        layer.w13_input_scale.fill_(float("nan"))
+        layer.w2_input_scale.fill_(float("nan"))
+        layer.quant_method.process_weights_after_loading(layer)
     return layer, local
 
 
