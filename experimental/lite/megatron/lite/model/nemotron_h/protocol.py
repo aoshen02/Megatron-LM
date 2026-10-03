@@ -178,6 +178,7 @@ def build_model(model_cfg, *, impl_cfg):
 
         set_deterministic_mode(True)
     ps = init_parallel(impl_cfg.parallel)
+    _check_router_gemm_rows_invariant()
     count = model_cfg.num_hidden_layers
     start, end = (
         count * ps.pp_rank // ps.pp_size,
@@ -236,6 +237,25 @@ def build_model(model_cfg, *, impl_cfg):
         forward_step=forward_step,
         extras=extras,
     )
+
+
+@torch.no_grad()
+def _check_router_gemm_rows_invariant():
+    """The router's torch.mm(out_dtype=fp32) must not depend on the row count.
+
+    That holds only if init_batch_invariance ran before this process's first
+    cuBLAS call (the workspace is fixed then); check it in this process.
+    """
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(8192, 2688, generator=g, device="cuda").to(torch.bfloat16)
+    w = torch.randn(128, 2688, generator=g, device="cuda").to(torch.bfloat16)
+    full = torch.mm(x, w.T, out_dtype=torch.float32)
+    for rows in (1, 7, 64, 513):
+        if not torch.equal(torch.mm(x[:rows], w.T, out_dtype=torch.float32), full[:rows]):
+            raise RuntimeError(
+                "Router GEMM depends on the row count: run init_batch_invariance "
+                "before the process's first cuBLAS call"
+            )
 
 
 def _refresh_quantized(chunks):

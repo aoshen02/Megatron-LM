@@ -385,3 +385,31 @@ def test_fp8_attention_vjp_is_run_to_run_bitwise(monkeypatch):
     )
     for a, b in zip(first, second, strict=True):
         assert torch.equal(a, b)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("init_first", [True, False])
+def test_router_gemm_row_check_detects_a_missing_batch_invariance_init(init_first):
+    """build_model's probe passes when init_batch_invariance precedes the first
+    cuBLAS call and fails in a process that never ran it."""
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "import torch\n"
+        "from vllm.model_executor.determinism.batch_invariant import init_batch_invariance\n"
+        "from megatron.lite.model.nemotron_h.protocol import "
+        "_check_router_gemm_rows_invariant as check\n"
+        f"{'init_batch_invariance()' if init_first else ''}\n"
+        "torch.cuda.set_device(0)\n"
+        "check()\n"
+    )
+    env = dict(os.environ, VLLM_BATCH_INVARIANT="1" if init_first else "0")
+    result = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True
+    )
+    if init_first:
+        assert result.returncode == 0, result.stderr[-2000:]
+    else:
+        assert "depends on the row count" in result.stderr, result.stderr[-2000:]
