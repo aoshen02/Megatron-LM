@@ -1,4 +1,4 @@
-"""Packed serving-visible FP8 Q/KV attention with an SDPA surrogate VJP."""
+"""Packed serving-visible FP8 Q/KV attention with an SDPA VJP."""
 
 from types import SimpleNamespace
 
@@ -36,15 +36,15 @@ class _Fp8AttentionVJP(torch.autograd.Function):
         q_ref, k_ref, v_ref, *_ = ctx.saved_tensors
         with torch.enable_grad():
             inputs = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
-            proxy = _native_attention(*inputs, ctx.boundaries, ctx.scale)
-            gradients = torch.autograd.grad(proxy, inputs, grad)
+            native = _native_attention(*inputs, ctx.boundaries, ctx.scale)
+            gradients = torch.autograd.grad(native, inputs, grad)
         return *gradients, None, None, None, None
 
 
 class Fp8KVAttention(torch.nn.Module):
     """Reuse serving query/cache quantization, with fixed-scale identity STE.
 
-    The surrogate uses BF16 dequantized Q/K/V from the visible forward and
+    The VJP uses BF16 dequantized Q/K/V from the visible forward and
     native SDPA backward. No claim of identical internal softmax arithmetic or
     training quality is implied. This initial adapter supports TP1, causal packed
     sequences starting at zero, without prefix sharing or sliding windows.
@@ -200,7 +200,7 @@ class Fp8KVAttention(torch.nn.Module):
 
 
 class Fa4Fp8KVAttention(Fp8KVAttention):
-    """Serving-visible FA4 forward with the fixed-scale SDPA surrogate VJP."""
+    """Serving-visible FA4 forward with the fixed-scale SDPA VJP."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, backend="fa4", **kwargs)

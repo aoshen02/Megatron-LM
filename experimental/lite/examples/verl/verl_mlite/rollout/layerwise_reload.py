@@ -207,7 +207,7 @@ class LayerwiseReloadWorkerExtension(vLLMColocateWorkerExtension):
     ):
         """Receive and apply one full update.
 
-        ``strict=False`` is a diagnostic: it records every deficit, including
+        ``strict=False`` records every deficit, including
         allowlisted ones, in ``last_reload_audit`` and finalizes anyway.
         """
         from vllm.config import set_current_vllm_config

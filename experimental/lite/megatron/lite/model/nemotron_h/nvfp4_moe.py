@@ -204,7 +204,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         self._validate_runtime()
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "Diagnostic routed forward has no Graph capture contract"
+                "Routed forward does not support Graph capture"
             )
         c, device = self.config, self.weights.up_proj.device
         if (
@@ -237,7 +237,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
 
         if is_forward_context_available():
             raise RuntimeError(
-                "Diagnostic adapter must own an unnested forward context"
+                "Routed forward must own an unnested forward context"
             )
         if x.shape[0] == 0:
             if return_fc1:

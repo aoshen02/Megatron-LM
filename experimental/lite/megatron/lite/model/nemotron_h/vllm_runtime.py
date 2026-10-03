@@ -17,7 +17,7 @@ _owned_config = None
 def ensure_vllm_runtime(pipeline_size):
     """Return the process vLLM config, initializing groups/workspace once.
 
-    A config that is already current (caller-owned, e.g. a diagnostic script)
+    A config that is already current (caller-owned, e.g. a test)
     is reused as-is; caller_runtime() validates either source.
     """
     global _owned_config

@@ -12,11 +12,6 @@ import torch
 from .checkpoint import load_fp8_kv_scales
 
 
-def _reject_grad_enabled_forward(module, args):
-    if torch.is_grad_enabled():
-        raise RuntimeError("Full-depth diagnostic requires torch.no_grad()")
-
-
 def _validate_full_depth(config, source):
     from .config import NemotronHConfig
 
@@ -69,11 +64,9 @@ def validate_proxy_config(config, impl):
     p = impl.parallel
     if not impl.hf_path:
         raise ValueError("Quantized Nemotron requires an explicit hf_path")
-    forward_only = impl.diagnostic_forward_only
-    # Training covers the full model or the 4/5-layer proxy; forward-only
-    # diagnostics always cover full depth.
-    full_depth = forward_only or config.num_hidden_layers not in (4, 5)
-    if not forward_only and impl.optimizer_config is None:
+    # The full model, or a 4/5-layer proxy covering every operator.
+    full_depth = config.num_hidden_layers not in (4, 5)
+    if impl.optimizer_config is None:
         raise ValueError("Quantized proxy requires explicit optimizer_config")
     if any(value != 1 for value in (p.tp, p.etp or 1, p.ep, p.cp, p.vpp)):
         raise ValueError("Quantized proxy requires TP/ETP/EP/CP/VPP1")
@@ -256,6 +249,4 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
         )
     model._quantized_proxy_root = str(Path(impl.hf_path).resolve())
     model._vllm_config = cfg
-    if impl.diagnostic_forward_only:
-        model.register_forward_pre_hook(_reject_grad_enabled_forward)
     return model

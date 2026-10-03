@@ -1,6 +1,6 @@
 """Pinned EP4 BI reductions for the unsharded Lightning trainer.
 
-Explicit measured AG/RS and FlashInfer one-sided recipes, not arbitrary
+EP4 serving reduction orders (AG/RS and FlashInfer one-sided), not arbitrary
 collective-version parity. Reuses existing expert and ATen primitives.
 """
 

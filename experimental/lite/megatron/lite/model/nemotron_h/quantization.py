@@ -149,6 +149,29 @@ def requantize(algorithm, weight):
     }
 
 
+def check_reversible(algorithm, master, tensors, name):
+    """Fail unless the BF16 master still determines the checkpoint values.
+
+    NVFP4: requantizing with the checkpoint rule must give the checkpoint values
+    (the global scale may differ in the last FP32 bit: TE derives it from the
+    BF16 amax). FP8: the checkpoint scale must re-encode the master to the same
+    bytes. The DeepSeek-V4 loader asserts the same for its FP8 weights.
+    """
+    reference = QuantizedWeight(algorithm, tensors).initial_master()
+    if algorithm == "FP8":
+        codes = (master.float() / tensors["weight_scale"].float()).to(
+            torch.float8_e4m3fn
+        )
+        changed = int((codes.view(torch.uint8) != tensors["weight"].view(torch.uint8)).sum())
+    else:
+        values = QuantizedWeight(algorithm, requantize(algorithm, master)).initial_master()
+        changed = int(((values - reference).abs() > reference.abs() * 2**-20).sum())
+    if changed:
+        raise RuntimeError(
+            f"{name} is not reversible through its BF16 master: {changed} values changed"
+        )
+
+
 @dataclass(frozen=True)
 class QuantizedWeight:
     """Keep serialized scales separate from runtime-specific packed layouts."""

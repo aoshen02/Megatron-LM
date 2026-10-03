@@ -219,6 +219,21 @@ def load_hf_weights(model, path):
             name.removeprefix(weights.prefix + "."): value
             for name, value in weights.export_quantized().items()
         }
+    from .quantization import check_reversible
+
+    for name, module in model.named_modules():
+        if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
+            algorithm = "FP8" if isinstance(module, Fp8TrainingLinear) else "W4A16_NVFP4"
+            check_reversible(algorithm, module.weight, module._tensors(), name)
+    for weights in _routed_checkpoint_owners(model).values():
+        for projection in ("up_proj", "down_proj"):
+            for expert in range(weights.num_experts):
+                check_reversible(
+                    "W4A16_NVFP4",
+                    getattr(weights, projection)[expert],
+                    weights._checkpoint(projection, expert).tensors,
+                    f"{weights.prefix}.{expert}.{projection}",
+                )
     for prefix, tensors in quantized.items():
         for suffix, deployed in tensors.items():
             name = f"{prefix}.{suffix}"

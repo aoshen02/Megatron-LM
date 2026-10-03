@@ -35,16 +35,11 @@ class ImplConfig:
     deterministic: bool = True
     hf_path: str | None = None
     routed_forward_reduction: str | None = None
-    diagnostic_forward_only: bool = False
 
     def __post_init__(self):
         from .nvfp4_ep4 import validate_reduction
 
         validate_reduction(self.routed_forward_reduction)
-        if type(self.diagnostic_forward_only) is not bool:
-            raise ValueError("diagnostic_forward_only must be boolean")
-        if self.diagnostic_forward_only and self.optimizer is not None:
-            raise ValueError("Full-depth forward-only requires no optimizer")
 
 
 def build_model_config(source, **overrides):
@@ -185,8 +180,6 @@ def _refresh_after_model_load(chunks):
 
 
 def _build_model(model_cfg, impl_cfg):
-    if impl_cfg.diagnostic_forward_only and model_cfg.quantization_config is None:
-        raise ValueError("Full-depth forward-only requires a quantized checkpoint")
     if model_cfg.quantization_config is not None and not impl_cfg.hf_path:
         raise ValueError("Quantized Nemotron construction requires an explicit hf_path")
     quantized = model_cfg.quantization_config is not None
@@ -293,4 +286,8 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
 
     from .checkpoint import NemotronExport
 
+    if kwargs.get("export_dtype") is not None:
+        # The deployment bytes (FP4/FP8 weights, FP32 scales) are exported
+        # as stored; any cast would change what the rollout serves.
+        raise ValueError("Nemotron exports deployment bytes; set export_dtype=None")
     yield from export(chunks, NemotronExport(model_cfg), ps, **kwargs)
