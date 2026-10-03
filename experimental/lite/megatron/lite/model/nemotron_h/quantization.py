@@ -279,9 +279,7 @@ class Nvfp4TrainingLinear(torch.nn.Module):
         )
         for name in ("weight_scale", "weight_scale_2"):
             self.register_buffer(name, checkpoint.tensors[name].to(device))
-        self.register_buffer(
-            "_packed", checkpoint.tensors["weight"].to(device), persistent=False
-        )
+        self.register_buffer("_packed", checkpoint.tensors["weight"].to(device))
         self._factory = deployment_factory
         self._requantized = False
         self._install()
@@ -302,10 +300,13 @@ class Nvfp4TrainingLinear(torch.nn.Module):
             raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
-    def refresh_deployment(self, recompute_scales=False):
-        """Reinstall; once the master has been updated, requantize it first."""
+    def refresh_deployment(self, recompute_scales=False, restore=False):
+        """Reinstall; once the master has been updated, requantize it first.
+
+        ``restore`` reinstalls the bytes a training checkpoint restored.
+        """
         self._requantized |= recompute_scales
-        if self._requantized:
+        if self._requantized and not restore:
             tensors = requantize("W4A16_NVFP4", self.weight)
             self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"])

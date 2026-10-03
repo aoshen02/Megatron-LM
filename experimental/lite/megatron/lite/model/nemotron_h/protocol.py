@@ -222,6 +222,7 @@ def build_model(model_cfg, *, impl_cfg):
         "model_cfg": model_cfg,
         "optimizer_backend": impl_cfg.optimizer or "none",
         "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
+        "post_checkpoint_load_hook": partial(_restore_quantized, chunks),
     }
     if optimizer is not None:
         extras["post_model_load_hook"] = partial(_refresh_after_model_load, chunks)
@@ -247,6 +248,13 @@ def _refresh_quantized(chunks):
             with torch.no_grad():
                 start_param_sync(force_sync=True)
     refresh_quantized_projections(chunks, recompute_scales=True)
+
+
+def _restore_quantized(chunks):
+    # A training checkpoint restores the masters with the deployment bytes
+    # that were serving when it was saved; requantizing would replace them
+    # (checkpoint bytes before the first update) without any update.
+    refresh_quantized_projections(chunks, restore=True)
 
 
 def _refresh_after_model_load(chunks):

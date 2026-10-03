@@ -757,3 +757,71 @@ def test_bf16_source_check_rejects_another_release():
     other = (source.float() + torch.randn(256, 512, generator=g, device="cuda") * 2e-3)
     with pytest.raises((RuntimeError, ValueError)):
         check_reversible("W4A16_NVFP4", other.bfloat16(), checkpoint, "m", exact_global=True)
+
+
+def _deployment_chunk(nvfp4, fp8):
+    from megatron.lite.model.nemotron_h.fp8_training import Fp8TrainingLinear
+    from megatron.lite.model.nemotron_h.quantization import Nvfp4TrainingLinear
+
+    return torch.nn.ModuleDict(
+        {
+            "lin": Nvfp4TrainingLinear(nvfp4, lambda **_: None, device="cuda"),
+            "fp8": Fp8TrainingLinear(fp8, device="cuda"),
+        }
+    )
+
+
+def _exported_bytes(chunk):
+    from megatron.lite.model.nemotron_h.checkpoint import NemotronExport
+
+    return {
+        name: tensor.contiguous().reshape(-1).view(torch.uint8).cpu()
+        for name, tensor in NemotronExport.iter_export_tensors(None, chunk)
+    }
+
+
+@cuda
+def test_checkpoint_restore_reinstalls_the_last_deployed_bytes():
+    """A training-checkpoint restore serves the bytes deployed when it was saved:
+    the checkpoint bytes at step 0 (requant(master) differs there) and
+    requant(master) after an update."""
+    from megatron.lite.model.nemotron_h.protocol import (
+        _refresh_quantized,
+        _restore_quantized,
+    )
+    from megatron.lite.model.nemotron_h.quantization import fp8_encode
+
+    g = torch.Generator(device="cuda").manual_seed(13)
+    nvfp4 = _nvfp4(*_random_nvfp4(128, 256, g))
+    master = (torch.randn(64, 128, generator=g, device="cuda") * 0.02).bfloat16()
+    calibrated = master.float().abs().amax() / 448 * 1.5
+    fp8 = QuantizedWeight(
+        "FP8",
+        {
+            "weight": fp8_encode(master, calibrated),
+            "weight_scale": calibrated,
+            "input_scale": torch.tensor(0.01, device="cuda"),
+        },
+    )
+    trained = _deployment_chunk(nvfp4, fp8)
+    for name, module in trained.items():
+        algorithm = "W4A16_NVFP4" if name == "lin" else "FP8"
+        weight = requantize(algorithm, module.weight)["weight"]
+        assert not torch.equal(weight.view(torch.uint8), module._packed.view(torch.uint8))
+    for step in range(2):
+        if step:
+            with torch.no_grad():
+                for parameter in trained.parameters():
+                    noise = torch.randn(parameter.shape, generator=g, device="cuda")
+                    parameter.add_((noise * 1e-3).to(parameter.dtype))
+            _refresh_quantized([trained])
+        saved, deployed = trained.state_dict(), _exported_bytes(trained)
+        restored = _deployment_chunk(nvfp4, fp8)
+        restored.load_state_dict(saved, strict=False)
+        _restore_quantized([restored])
+        exported = _exported_bytes(restored)
+        assert exported.keys() == deployed.keys()
+        for name, value in deployed.items():
+            assert torch.equal(exported[name], value), (step, name)
+
+

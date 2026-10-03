@@ -40,9 +40,7 @@ class Fp8TrainingLinear(torch.nn.Module):
             self.register_buffer(
                 name, checkpoint.tensors[name].to(device).reshape(1).clone()
             )
-        self.register_buffer(
-            "_packed", checkpoint.tensors["weight"].to(device).clone(), persistent=False
-        )
+        self.register_buffer("_packed", checkpoint.tensors["weight"].to(device).clone())
         self._requantized = False
         self._deployed_version = self.weight._version
 
@@ -58,12 +56,15 @@ class Fp8TrainingLinear(torch.nn.Module):
             raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
-    def refresh_deployment(self, recompute_scales=False):
-        """Once the master has been updated, requantize it."""
+    def refresh_deployment(self, recompute_scales=False, restore=False):
+        """Once the master has been updated, requantize it.
+
+        ``restore`` reinstalls the bytes a training checkpoint restored.
+        """
         if self.weight.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Refresh deployment outside CUDA Graph capture")
         self._requantized |= recompute_scales
-        if self._requantized:
+        if self._requantized and not restore:
             tensors = requantize("FP8", self.weight)
             self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"].reshape(1))

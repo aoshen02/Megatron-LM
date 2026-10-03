@@ -413,9 +413,12 @@ class MegatronLiteRuntime(RuntimeBase):
             **kwargs,
         )
         if load_model:
-            post_update_hook = handle._extras.get("post_optimizer_step_hook")
-            if callable(post_update_hook):
-                post_update_hook()
+            post_load_hook = handle._extras.get(
+                "post_checkpoint_load_hook",
+                handle._extras.get("post_optimizer_step_hook"),
+            )
+            if callable(post_load_hook):
+                post_load_hook()
         return step
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:

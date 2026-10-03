@@ -59,6 +59,10 @@ rejects checkpoints without a `quantization_config`.
       jump; the per-tensor ratios are in the FP8 table below.
   - The actor forward and the rollout export read the same bytes, so the
     rollout serves exactly the weights the actor computes with.
+  - A training-checkpoint restore (`post_checkpoint_load_hook`) reinstalls
+    the deployment bytes saved with the masters, the bytes last deployed:
+    the θ0 deployment before the first update, requant(master) after it. It
+    never requantizes.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
   the BF16 masters and the BF16 inputs (`functional.native_linear_vjp`), and
   grouped BF16 GEMMs for the routed experts from the visible FC1 output

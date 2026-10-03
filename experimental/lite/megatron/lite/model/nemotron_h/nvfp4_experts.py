@@ -197,12 +197,15 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         self._dirty = True
 
     @torch.no_grad()
-    def refresh_quantized(self, recompute_scales=False):
-        """Once the masters have been updated, requantize them in place."""
+    def refresh_quantized(self, recompute_scales=False, restore=False):
+        """Once the masters have been updated, requantize them in place.
+
+        ``restore`` keeps the bytes a training checkpoint restored.
+        """
         self._dirty = True
         self._validate_storage()
         self._requantized = getattr(self, "_requantized", False) | recompute_scales
-        if self._requantized:
+        if self._requantized and not restore:
             for projection in ("up_proj", "down_proj"):
                 parameter = getattr(self, projection)
                 for expert in range(self.num_experts):
