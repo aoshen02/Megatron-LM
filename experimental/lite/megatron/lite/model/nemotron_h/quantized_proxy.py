@@ -199,6 +199,7 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             config,
             routed_forward_reduction=impl.routed_forward_reduction,
             ep_group=ps.ep_group if ps.ep_size > 1 else None,
+            routed_expert_backend=impl.routed_expert_backend,
         )
 
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)

@@ -17,8 +17,14 @@ rejects checkpoints without a `quantization_config`.
   (`kernels.py`); no vLLM layer, config or process group is created. Weights
   pass once through vLLM's own preparation helpers (Humming repack,
   FlashInfer swizzle, scale inversion), in the order serving applies them.
-  - Routed experts (W4A16 NVFP4, group 16) run the Humming indexed MoE kernel
-    on packed FP4 weights with the serving EP4 one-sided reduction order.
+  - Routed experts (W4A16 NVFP4, group 16) run the rollout's `moe_backend`
+    on packed FP4 weights with the serving EP4 one-sided reduction order
+    (`impl_cfg.routed_expert_backend`):
+    - `flashinfer_cutedsl`: FlashInfer CuTe-DSL `launch_w4a16_moe` stages
+      with vLLM's batch-invariant tactic, GEMM1 with the fused ReLU2
+      epilogue as serving runs it; each EP4 rank's partial is the kernel's
+      own top-k combine over that rank's slots (`kernels.CuteDslRoutedExperts`);
+    - `humming`: the Humming indexed MoE kernel.
   - NVFP4 linears run Humming dense GEMMs (shared expert: the FlashInfer
     CuTe-DSL GEMM); FP8 linears run the static FP8 input quant and vLLM's
     `flashinfer_scaled_fp8_mm` (FlashInfer `bmm_fp8`, CUTLASS under BI).
@@ -75,11 +81,20 @@ rejects checkpoints without a `quantization_config`.
   grouped BF16 GEMMs for the routed experts from the visible FC1 output
   (`nvfp4_moe_vjp.routed_vjp`). Frozen per-input contract of the routed
   experts, as DeepSeek-V4's grouped MoE:
-  - routing weights: `<dy, visible per-route expert output>` (exact);
-  - token input, up and down weights: BF16-master VJP through the visible
-    FC1 output (identity straight-through for the quantization); a token's
-    route input gradients are summed in slot order and rounded to BF16 after
-    each add, as DS4's deterministic scatter backward.
+  - FC1: the BF16-rounded visible pre-activation `u`, saved from forward,
+    never recomputed. Humming writes it before its separate ReLU2. The
+    CuTe-DSL forward fuses ReLU2 into GEMM1's FP32 epilogue, so the actor
+    also runs GEMM1 with the identity epilogue (same kernel, tactic, tiles
+    and K order): `u = bf16(alpha * acc)` of the accumulator the fused
+    epilogue activates;
+  - token input, up and down weights: Transformer Engine `high_precision`
+    BF16 GEMMs on the BF16 masters through `u` (identity straight-through
+    for the quantization; the down-weight gradient uses `bf16(relu(u)^2)`,
+    which for CuTe-DSL can differ from the fused activation by one BF16 ulp);
+    a token's route input gradients are summed in slot order and rounded to
+    BF16 after each add, as DS4's deterministic scatter backward;
+  - routing weights: `<dy, visible per-route expert output>` (exact; the
+    BF16 GEMM2 output before the top-k combine).
 
   Every other visible op has its own autograd Function, as in the
   DeepSeek-V4 actor: closed-form compiled FP32 VJPs for the RMSNorms, the

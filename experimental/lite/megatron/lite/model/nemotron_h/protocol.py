@@ -47,11 +47,18 @@ class ImplConfig:
     # recomputed visible tensors (and the replayed EP dispatch) are the
     # forward's, bit for bit.
     recompute: str | list[str] | None = None
+    # The rollout's --moe-backend for the routed experts.
+    routed_expert_backend: str = "humming"
 
     def __post_init__(self):
         from .nvfp4_ep4 import validate_reduction
+        from .nvfp4_moe import ROUTED_EXPERT_BACKENDS
 
         validate_reduction(self.routed_forward_reduction)
+        if self.routed_expert_backend not in ROUTED_EXPERT_BACKENDS:
+            raise ValueError(
+                f"Unknown routed expert backend {self.routed_expert_backend!r}"
+            )
 
 
 def build_model_config(source, **overrides):

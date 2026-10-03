@@ -51,7 +51,7 @@ def reduce_ep4_parts(parts, ids, recipe):
 
 
 def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1=False):
-    """Run all 128 Humming experts locally with an EP4 serving combine.
+    """Run all 128 experts locally (Humming or CuTe-DSL) with an EP4 serving combine.
 
     Forms the four BF16 rank partials an EP4 deployment computes (each rank's
     ``moe_fused_mul_sum`` over its 32 experts) and combines them in the
@@ -66,6 +66,13 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1
     rows, topk = topk_ids.shape
     if x.dtype != torch.bfloat16 or x.shape != (rows, 2688) or topk != 6:
         raise ValueError("Expected BF16 Lightning top6 geometry")
+    if hasattr(experts, "ep_partials"):
+        # CuTe-DSL: the rank partials come from the serving kernel's own
+        # per-rank top-k combine (moe_unpermute).
+        result = experts.ep_partials(x, topk_weights, topk_ids, return_fc1=return_fc1)
+        parts, fc1, per_route = result if return_fc1 else (result, None, None)
+        out = reduce_ep4_parts(parts, topk_ids, recipe)
+        return (out, fc1, per_route) if return_fc1 else out
     fc1, per_route = experts.routes(x, topk_ids)
     parts = []
     for rank in range(4):

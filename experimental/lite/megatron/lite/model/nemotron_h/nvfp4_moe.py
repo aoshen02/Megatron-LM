@@ -1,9 +1,12 @@
-"""Humming routed forward with the BF16 master-weight routed VJP."""
+"""Routed W4A16 forward (Humming or FlashInfer CuTe-DSL, as the rollout's
+``moe_backend``) with the BF16 master-weight routed VJP."""
 
 import torch
 
 from .nvfp4_experts import Nvfp4ExpertWeights
 from .nvfp4_moe_vjp import RoutedExpertsVJP
+
+ROUTED_EXPERT_BACKENDS = ("humming", "flashinfer_cutedsl")
 
 
 class Nvfp4RoutedDeployment(torch.nn.Module):
@@ -16,13 +19,19 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     keep its visible FC1 output for ``nvfp4_moe_vjp.routed_vjp``.
     """
 
-    def __init__(self, weights, model_config, *, routed_forward_reduction, ep_group=None):
+    def __init__(
+        self, weights, model_config, *, routed_forward_reduction, ep_group=None,
+        routed_expert_backend="humming",
+    ):
         super().__init__()
         from .nvfp4_ep4 import validate_reduction
 
         if routed_forward_reduction is None:
             raise ValueError("Name the rollout's EP4 reduction (routed_forward_reduction)")
         validate_reduction(routed_forward_reduction)
+        if routed_expert_backend not in ROUTED_EXPERT_BACKENDS:
+            raise ValueError(f"Unknown routed expert backend {routed_expert_backend!r}")
+        self.routed_expert_backend = routed_expert_backend
         self.routed_forward_reduction = routed_forward_reduction
         if not isinstance(weights, Nvfp4ExpertWeights):
             raise TypeError("Expected Nvfp4ExpertWeights")
@@ -68,7 +77,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
 
     @torch.no_grad()
     def _install(self):
-        from .kernels import HummingRoutedExperts
+        from .kernels import CuteDslRoutedExperts, HummingRoutedExperts
 
         self._ready = False
         self._validate_checkpoint()
@@ -77,15 +86,21 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
                 "Deployment construction cannot run during Graph capture"
             )
         w = self.weights
-        self._experts = HummingRoutedExperts(
-            *(
-                tuple(getattr(w, f"_{projection}_{s}") for s in ("packed", "scale", "global"))
-                for projection in ("up_proj", "down_proj")
-            ),
-            num_experts=self.config.n_routed_experts,
-            offset=w.offset,
-            layer_name=w.prefix,
+        stacks = tuple(
+            tuple(getattr(w, f"_{projection}_{s}") for s in ("packed", "scale", "global"))
+            for projection in ("up_proj", "down_proj")
         )
+        if self.routed_expert_backend == "flashinfer_cutedsl":
+            self._experts = CuteDslRoutedExperts(
+                *stacks, num_experts=self.config.n_routed_experts
+            )
+        else:
+            self._experts = HummingRoutedExperts(
+                *stacks,
+                num_experts=self.config.n_routed_experts,
+                offset=w.offset,
+                layer_name=w.prefix,
+            )
         self._deployed_versions = w._versions()
         self._ready = True
 

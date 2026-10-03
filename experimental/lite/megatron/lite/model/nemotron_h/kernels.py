@@ -434,6 +434,175 @@ class HummingRoutedExperts:
         return moe_fused_mul_sum(down, weights, topk_ids=ids, expert_map=expert_map)
 
 
+class CuteDslRoutedExperts:
+    """FlashInfer CuTe-DSL W4A16 ReLU2 experts (vLLM ``flashinfer_cutedsl``, BI).
+
+    Serving runs ``launch_w4a16_moe`` (``CuteDslFusedMoEW4A16Runner``) with
+    the batch-invariant tactic on each EP rank's 32 experts. This class runs
+    the same stages in the same order, once over all 128 experts:
+    ``moe_sort`` -> ``moe_permute`` -> GEMM1 with the fused ReLU2 epilogue ->
+    GEMM2 -> per-rank ``moe_unpermute`` (slots of other ranks masked, which is
+    what a rank's sort produces for them). Every routed row is one expert
+    tile's full-K FP32 accumulation, so its output does not depend on which
+    other rows or experts share the launch.
+
+    With ``return_fc1`` GEMM1 also runs with the identity epilogue (the
+    variant GEMM2 uses): same kernel, tactic, tiles and K order, writing
+    ``bf16(alpha * acc)``, the visible FC1 pre-activation for the VJP.
+
+    Uses FlashInfer's ``_get_workspace`` and ``_run_grouped_gemm``
+    (``flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py``), pinned by
+    ``tests/unit/model/test_nemotron_cutedsl_unit.py``.
+    """
+
+    TOP_K = 6
+
+    def __init__(self, up, down, *, num_experts):
+        """``up``/``down`` are ``(packed, scale, global)`` checkpoint stacks."""
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_w4a16_moe import (  # noqa: E501
+            BATCH_INVARIANT_TACTIC,
+            prepare_w4a16_scales,
+        )
+
+        require_batch_invariance()
+        tensors = {}
+        for stem, (packed, scale, global_scale) in (("w1", up), ("w2", down)):
+            if torch.isnan(scale.float()).any():
+                raise RuntimeError(f"NVFP4 {stem} weight_scale was never loaded (NaN)")
+            if global_scale.dtype != torch.float32 or global_scale.numel() != len(packed):
+                raise ValueError("Expected one FP32 NVFP4 global scale per expert")
+            tensors[stem] = packed.detach().clone()
+            with torch.cuda.device(packed.device):
+                tensors[f"{stem}_sf"] = prepare_w4a16_scales(scale.detach())
+            # Serving passes weight_scale_2 as the GEMM alpha.
+            tensors[f"{stem}_alpha"] = global_scale.detach().reshape(-1).clone()
+        self.tensors = tensors
+        self.num_experts = self.global_num_experts = num_experts
+        if len(up[0]) != num_experts:
+            raise ValueError("CuTe-DSL routed experts hold every expert")
+        self.intermediate = up[0].shape[1]
+        self.hidden = down[0].shape[1]
+        self.tactic = BATCH_INVARIANT_TACTIC
+
+    def _gemm(self, stem, activations, output, meta, activation_type):
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _run_grouped_gemm
+        from flashinfer.tllm_enums import (
+            DEFAULT_SWIGLU_ALPHA,
+            DEFAULT_SWIGLU_BETA,
+            DEFAULT_SWIGLU_LIMIT,
+        )
+
+        t = self.tensors
+        _run_grouped_gemm(
+            weight=t[stem],
+            weight_sf=t[f"{stem}_sf"],
+            activations=activations,
+            tile_idx_to_expert_idx=meta["tile_idx_to_expert_idx"],
+            tile_idx_to_mn_limit=meta["tile_idx_to_mn_limit"],
+            num_non_exiting_tiles=meta["num_non_exiting_tiles"],
+            alpha=t[f"{stem}_alpha"],
+            output=output,
+            num_local_experts=self.num_experts,
+            activation_type=activation_type,
+            swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
+            swiglu_beta=DEFAULT_SWIGLU_BETA,
+            swiglu_limit=DEFAULT_SWIGLU_LIMIT,
+            situ_beta=None,
+            situ_linear_beta=None,
+            use_fused_finalize=False,
+            permuted_idx_to_expanded_idx=None,
+            token_final_scales=None,
+            enable_pdl=True,
+            tactic=self.tactic,
+        )
+
+    def ep_partials(self, x, routes, ids, *, ranks=4, return_fc1=False):
+        """BF16 EP-rank partials; with ``return_fc1`` also the per-route
+        visible FC1 ``[M*topk, I]`` and expert output ``[M*topk, H]``
+        (token-major, slot-minor)."""
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _get_workspace
+        from flashinfer.fused_moe.cute_dsl.moe_utils import (
+            get_max_num_permuted_tokens,
+            moe_permute,
+            moe_sort,
+            moe_unpermute,
+            normalize_cute_dsl_moe_activation_type,
+        )
+        from flashinfer.tllm_enums import ActivationType
+
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Routed experts are eager only")
+        rows, topk = ids.shape
+        if (
+            topk != self.TOP_K
+            or x.dtype != torch.bfloat16
+            or x.shape != (rows, self.hidden)
+            or ids.dtype != torch.int32
+            or routes.dtype != torch.float32
+            or self.num_experts % ranks
+        ):
+            raise ValueError("Expected BF16 tokens, int32 ids, FP32 routes, top-6")
+        relu2, _ = normalize_cute_dsl_moe_activation_type(ActivationType.Relu2)
+        tile = self.tactic[0][1]
+        experts = self.num_experts
+        workspace = _get_workspace(x, topk, experts, experts, self.intermediate, tile)
+        (t2e, t2lim, e2p, p2e, _, live) = moe_sort(
+            token_selected_experts=ids,
+            token_final_scales=routes,
+            num_experts=experts,
+            top_k=topk,
+            local_expert_offset=0,
+            num_local_experts=experts,
+            tile_tokens_dim=tile,
+            enable_pdl=True,
+            **workspace.moe_sort_buffers,
+        )
+        slots = get_max_num_permuted_tokens(rows, topk, experts, tile)
+        meta = {
+            "tile_idx_to_expert_idx": t2e[: slots // tile],
+            "tile_idx_to_mn_limit": t2lim[: slots // tile],
+            "num_non_exiting_tiles": live,
+        }
+        e2p = e2p[:rows]
+        hidden = workspace.hidden_workspace[:slots]
+        moe_permute(
+            input=x,
+            permuted_output=hidden,
+            tile_idx_to_mn_limit=meta["tile_idx_to_mn_limit"],
+            permuted_idx_to_expanded_idx=p2e[:slots],
+            num_non_exiting_tiles=live,
+            max_num_permuted_tokens=slots,
+            top_k=topk,
+            tile_size=tile,
+            enable_pdl=True,
+        )
+        activated = workspace.intermediate[:slots]
+        fc1 = None
+        if return_fc1:
+            fc1 = torch.empty_like(activated)
+            self._gemm("w1", hidden, fc1, meta, None)
+        self._gemm("w1", hidden, activated, meta, relu2)
+        self._gemm("w2", activated, hidden, meta, None)
+        owner = ids // (experts // ranks)
+        parts = []
+        for rank in range(ranks):
+            part = torch.empty_like(x)
+            moe_unpermute(
+                permuted_input=hidden,
+                output=part,
+                expanded_idx_to_permuted_idx=torch.where(owner == rank, e2p, -1),
+                topk_scales=routes,
+                num_tokens=rows,
+                top_k=topk,
+                enable_pdl=True,
+            )
+            parts.append(part)
+        if not return_fc1:
+            return parts
+        index = e2p.reshape(-1).long()
+        return parts, fc1.index_select(0, index), hidden.index_select(0, index)
+
+
 def scaled_fp8_quant(x, scale):
     """Static per-tensor FP8 quantization (vLLM ``QuantFP8`` on CUDA)."""
     from vllm import _custom_ops as ops
