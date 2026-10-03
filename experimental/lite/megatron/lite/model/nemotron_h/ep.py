@@ -130,7 +130,7 @@ def _expert_ids(experts, recv_idx):
     return torch.where(recv_idx >= 0, recv_idx + experts.offset, absent).to(torch.int32)
 
 
-def _forward(experts, group, x, ids, weights, recipe):
+def _forward(experts, group, x, ids, weights, recipe, *, save=True):
     plan = _Plan(ids, dist.get_world_size(group), experts.num_experts)
     # The backward returns one row of topk per-route input gradients.
     width = ids.shape[1] * x.shape[1]
@@ -153,7 +153,14 @@ def _forward(experts, group, x, ids, weights, recipe):
     for r, rows, token in plan.per_rank():
         parts[r].index_copy_(0, token, returned.index_select(0, rows))
     out = reduce_ep4_parts(list(parts.unbind(0)), ids, recipe)
-    return out, (plan, buffer, handle, recv_x, recv_idx, recv_w, fc1, down)
+    if not save:
+        return out, None
+    # Keep the visible FC1 and expert outputs of this rank's routes only; a
+    # received row carries all topk slots, most of them other ranks'.
+    owned = (recv_idx.reshape(-1) >= 0).nonzero().squeeze(1)
+    fc1 = fc1.index_select(0, owned)
+    visible = down.reshape(-1, x.shape[1]).index_select(0, owned)
+    return out, (plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible)
 
 
 class EPRoutedExpertsVJP(torch.autograd.Function):
@@ -174,14 +181,17 @@ class EPRoutedExpertsVJP(torch.autograd.Function):
             raise RuntimeError("Expert masters changed before backward")
         up, down = ctx.saved_tensors
         # Kept (not cleared) so a retained graph can run backward again.
-        plan, buffer, handle, recv_x, recv_idx, recv_w, fc1, visible = ctx.state
+        plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible = ctx.state
         m, k = ctx.x_shape
         topk = plan.ids.shape[1]
+        slots = recv_x.shape[0] * topk
+        fc1 = fc1.new_zeros(slots, fc1.shape[1]).index_copy_(0, owned, fc1)
+        visible = visible.new_zeros(slots, k).index_copy_(0, owned, visible)
         rows_dy = dy.to(torch.bfloat16).index_select(0, plan.token).contiguous()
         with _deepep_memory():
             recv_dy, *_ = buffer.dispatch(rows_dy, handle=handle)
             dx_routes, d_up, d_down, dw_rows = routed_vjp(
-                recv_x, fc1, visible.view(-1, k), up, down, recv_w, recv_idx, recv_dy,
+                recv_x, fc1, visible, up, down, recv_w, recv_idx, recv_dy,
                 per_route=True,
             )
             returned_dx, returned_dw = _combine(
@@ -211,5 +221,6 @@ def ep_routed_experts(owner, x, ids, routes, *, grad):
         )
     with torch.no_grad():
         return _forward(
-            owner._experts, owner.ep_group, x, ids, routes, owner.routed_forward_reduction
+            owner._experts, owner.ep_group, x, ids, routes,
+            owner.routed_forward_reduction, save=False,
         )[0]
