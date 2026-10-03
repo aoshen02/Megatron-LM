@@ -301,6 +301,7 @@ def test_checkpoint_load_runs_the_restore_hook_not_the_update_hook(monkeypatch, 
 
     calls = []
     monkeypatch.setattr(mlite_engine, "load_training_checkpoint", lambda *a, **k: calls.append("load"))
+    monkeypatch.setattr(mlite_engine.dist, "is_initialized", lambda: False)
     engine = _engine(engine_config=_engine_config())
     engine.runtime = object()
     engine.handle = SimpleNamespace(

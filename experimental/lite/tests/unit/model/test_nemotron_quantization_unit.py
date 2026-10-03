@@ -828,15 +828,19 @@ def _exported_bytes(chunk):
 
 
 @cuda
-def test_checkpoint_restore_reinstalls_the_last_deployed_bytes():
-    """A training-checkpoint restore serves the bytes deployed when it was saved:
-    the checkpoint bytes at step 0 (requant(master) differs there) and
-    requant(master) after an update."""
+def test_checkpoint_restore_reinstalls_the_last_deployed_bytes(monkeypatch, tmp_path):
+    """A training-checkpoint restore through the verl engine serves the bytes
+    deployed when it was saved: the checkpoint bytes at step 0 (requant(master)
+    differs there) and requant(master) after an update."""
+    from functools import partial
+    from types import SimpleNamespace
+
     from megatron.lite.model.nemotron_h.protocol import (
         _refresh_quantized,
         _restore_quantized,
     )
     from megatron.lite.model.nemotron_h.quantization import fp8_encode
+    from verl_mlite.engine import mlite_engine
 
     g = torch.Generator(device="cuda").manual_seed(13)
     nvfp4 = _nvfp4(*_random_nvfp4(128, 256, g))
@@ -864,8 +868,29 @@ def test_checkpoint_restore_reinstalls_the_last_deployed_bytes():
             _refresh_quantized([trained])
         saved, deployed = trained.state_dict(), _exported_bytes(trained)
         restored = _deployment_chunk(nvfp4, fp8)
-        restored.load_state_dict(saved, strict=False)
-        _restore_quantized([restored])
+        # The engine's load path with the checkpoint I/O reduced to the
+        # module state it restores.
+        monkeypatch.setattr(
+            mlite_engine,
+            "load_training_checkpoint",
+            lambda *a, **k: restored.load_state_dict(saved, strict=False),
+        )
+        # Single process; other tests in this module may own a process group.
+        monkeypatch.setattr(mlite_engine.dist, "is_initialized", lambda: False)
+        engine = mlite_engine.MegatronLiteEngine.__new__(mlite_engine.MegatronLiteEngine)
+        engine.runtime, engine.module = object(), restored
+        engine.engine_config = SimpleNamespace(param_offload=False)
+        engine.handle = SimpleNamespace(
+            _extras={
+                "post_optimizer_step_hook": partial(_refresh_quantized, [restored]),
+                "post_checkpoint_load_hook": partial(_restore_quantized, [restored]),
+            },
+            _optimizer=None,
+            _config=SimpleNamespace(parallel=None),
+            _parallel_state=None,
+            _lr_scheduler=None,
+        )
+        engine.load_checkpoint(str(tmp_path))
         exported = _exported_bytes(restored)
         assert exported.keys() == deployed.keys()
         for name, value in deployed.items():
