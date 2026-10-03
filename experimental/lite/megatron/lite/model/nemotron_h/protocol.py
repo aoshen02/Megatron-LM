@@ -7,6 +7,7 @@ import torch
 
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
@@ -41,6 +42,11 @@ class ImplConfig:
     # Release layer of each layer of a proxy BF16 master (None: the release).
     bf16_master_layers: tuple[int, ...] | None = None
     routed_forward_reduction: str | None = None
+    # Activation recompute (DS4's ``impl_cfg.recompute``): "full" re-runs each
+    # block's forward in backward. The kernels are deterministic, so the
+    # recomputed visible tensors (and the replayed EP dispatch) are the
+    # forward's, bit for bit.
+    recompute: str | list[str] | None = None
 
     def __post_init__(self):
         from .nvfp4_ep4 import validate_reduction
@@ -185,6 +191,11 @@ def build_model(model_cfg, *, impl_cfg):
         count * (ps.pp_rank + 1) // ps.pp_size,
     )
     chunks = [build_quantized_proxy(model_cfg, impl_cfg, ps, layer_range=(start, end))]
+    recompute = parse_recompute_spec(impl_cfg.recompute)
+    if recompute:
+        if recompute != ["full"]:
+            raise ValueError("Nemotron supports recompute='full' only")
+        apply_recompute(list(chunks[0].layers.values()), recompute, {})
     # Verify the checkpoint before an optimizer can bind these parameters.
     _load_weights(chunks[0], impl_cfg.hf_path)
     parameter_ids = {id(p) for chunk in chunks for p in chunk.parameters()}
