@@ -144,6 +144,30 @@ def offload_model_to_cpu(model_list: list) -> None:
             model_chunk.to("cpu")
 
 
+def release_grad_buffers(model_list: list) -> None:
+    """Free DDP gradient buffers while the parameters stay on the GPU."""
+    for model_chunk in model_list:
+        if not _is_megatron_ddp(model_chunk):
+            continue
+        for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                if buffer.grad_data.storage().size() > 0:
+                    buffer.grad_data_size = buffer.grad_data.storage().size()
+                    buffer.grad_data.storage().resize_(0)
+
+
+def restore_grad_buffers(model_list: list) -> None:
+    """Reallocate and zero gradient buffers freed by release_grad_buffers."""
+    for model_chunk in model_list:
+        if not _is_megatron_ddp(model_chunk):
+            continue
+        for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+            for buffer in buffers:
+                if hasattr(buffer, "grad_data_size") and buffer.grad_data.storage().size() == 0:
+                    buffer.grad_data.storage().resize_(buffer.grad_data_size)
+                    buffer.grad_data.zero_()
+
+
 def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
     """Load DDP model back to GPU from pinned CPU copy."""
     for model_chunk in model_list:

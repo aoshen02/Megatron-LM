@@ -36,6 +36,9 @@ class MegatronLiteEngineConfig(EngineConfig):
     resync_config: dict[str, Any] = field(default_factory=dict)
     router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
+    # Release the gradient buffers outside training even when the parameters
+    # stay resident (param_offload=False); they are re-zeroed on reload.
+    grad_offload: bool = False
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
