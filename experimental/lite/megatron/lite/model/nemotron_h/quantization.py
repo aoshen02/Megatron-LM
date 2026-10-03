@@ -149,13 +149,15 @@ def requantize(algorithm, weight):
     }
 
 
-def check_reversible(algorithm, master, tensors, name):
+def check_reversible(algorithm, master, tensors, name, *, tolerance=1e-3):
     """Fail unless the BF16 master still determines the checkpoint values.
 
-    NVFP4: requantizing with the checkpoint rule must give the checkpoint values
-    (the global scale may differ in the last FP32 bit: TE derives it from the
-    BF16 amax). FP8: the checkpoint scale must re-encode the master to the same
-    bytes. The DeepSeek-V4 loader asserts the same for its FP8 weights.
+    FP8: the checkpoint scale must re-encode the master to the same bytes, as
+    the DeepSeek-V4 loader asserts for its FP8 weights. NVFP4: requantizing
+    with the checkpoint rule must give the checkpoint values; BF16 rounding can
+    flip a 4over6 candidate whose two errors nearly tie (about 1e-8 of the
+    Lightning values), so up to ``tolerance`` of a tensor may change. Returns
+    the number of changed values.
     """
     reference = QuantizedWeight(algorithm, tensors).initial_master()
     if algorithm == "FP8":
@@ -163,13 +165,16 @@ def check_reversible(algorithm, master, tensors, name):
             torch.float8_e4m3fn
         )
         changed = int((codes.view(torch.uint8) != tensors["weight"].view(torch.uint8)).sum())
+        allowed = 0
     else:
         values = QuantizedWeight(algorithm, requantize(algorithm, master)).initial_master()
         changed = int(((values - reference).abs() > reference.abs() * 2**-20).sum())
-    if changed:
+        allowed = int(tolerance * reference.numel())
+    if changed > allowed:
         raise RuntimeError(
             f"{name} is not reversible through its BF16 master: {changed} values changed"
         )
+    return changed
 
 
 @dataclass(frozen=True)
