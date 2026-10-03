@@ -54,19 +54,27 @@ def native_linear_vjp(grad_output, value, weight):
     return grad_value.reshape(value.shape), grad_weight
 
 
+def parameter_versions(parameters):
+    return tuple(parameter._version for parameter in parameters)
+
+
+def check_parameter_versions(parameters, expected):
+    if parameter_versions(parameters) != expected:
+        raise RuntimeError("Master weight changed between forward and backward")
+
+
 class _VisibleLinear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, visible, value, weight):
-        ctx.save_for_backward(value)
-        ctx.weight, ctx.version = weight, weight._version
+        ctx.save_for_backward(value, weight)
+        ctx.versions = parameter_versions((weight,))
         return visible(value)
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.weight._version != ctx.version:
-            raise RuntimeError("Master weight changed between forward and backward")
-        (value,) = ctx.saved_tensors
-        return None, *native_linear_vjp(grad_output, value, ctx.weight)
+        value, weight = ctx.saved_tensors
+        check_parameter_versions((weight,), ctx.versions)
+        return None, *native_linear_vjp(grad_output, value, weight)
 
 
 def visible_linear(visible, value, weight):
@@ -79,8 +87,9 @@ def visible_linear(visible, value, weight):
 def linear(x, weight, bias=None):
     from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 
-    inputs = (x, weight) if bias is None else (x, weight, bias)
-    return visible_forward(linear_batch_invariant, torch.nn.functional.linear, *inputs)
+    if bias is not None:
+        raise NotImplementedError("Nemotron BF16 projections are bias-free")
+    return visible_linear(lambda x: linear_batch_invariant(x, weight), x, weight)
 
 
 def projection(x, module):

@@ -96,3 +96,43 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch)
     with sdpa_kernel(SDPBackend.MATH):
         reference = sdpa_vjp(torch.float64)
     assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+def test_bf16_linear_vjp_within_bf16_noise_floor(kind):
+    """lm_head-like BF16 projection: batch-invariant forward, TE GEMM VJP."""
+    from megatron.lite.model.nemotron_h.functional import linear
+    from test_nemotron_mamba_unit import upstream_gradient, assert_within_noise_floor
+
+    from vllm.model_executor.determinism.batch_invariant import (
+        init_batch_invariance,
+        linear_batch_invariant,
+    )
+
+    init_batch_invariance()
+    torch.manual_seed(0)
+    leaves = (
+        torch.randn(1506, 2688, device="cuda"),
+        torch.randn(8192, 2688, device="cuda") * 0.02,
+    )
+
+    def cast(dtype):
+        return [t.to(dtype).requires_grad_() for t in leaves]
+
+    inputs = cast(torch.bfloat16)
+    output = linear(*inputs)
+    with torch.no_grad():
+        assert torch.equal(output, linear_batch_invariant(*inputs))
+    upstream = upstream_gradient(kind, output)
+    actual = torch.autograd.grad(output, inputs, upstream)
+    old_inputs, reference_inputs = cast(torch.bfloat16), cast(torch.float64)
+    old = torch.autograd.grad(
+        torch.nn.functional.linear(*old_inputs), old_inputs, upstream
+    )
+    reference = torch.autograd.grad(
+        torch.nn.functional.linear(*reference_inputs),
+        reference_inputs,
+        upstream.double(),
+    )
+    assert_within_noise_floor(("dx", "dweight"), actual, old, reference, kind)
