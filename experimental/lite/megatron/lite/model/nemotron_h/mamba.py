@@ -1,12 +1,10 @@
-"""Packed Mamba primitives with explicit boundaries and mlite CP collectives."""
+"""Packed Mamba primitives with explicit request boundaries."""
 
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 from megatron.lite.model.nemotron_h.functional import visible_forward
 from megatron.lite.model.nemotron_h.ssd_reference import chunk_scan as native_scan
-from megatron.lite.primitive.parallel.cp import all_to_all_hidden_shards
 
 
 @dataclass(frozen=True)
@@ -39,18 +37,6 @@ class SSMMeta:
     def validate_tokens(self, tokens):
         if tokens != self.boundaries[-1]:
             raise ValueError("Packed SSM token count disagrees with request boundaries")
-
-
-def exchange_sequence_channels(x, group, *, reverse=False):
-    """[local T, all H, ...] <-> [global T, local H, ...], with native autograd."""
-    size = dist.get_world_size(group) if group is not None else 1
-    if size == 1:
-        return x
-    scatter, gather = (0, 1) if reverse else (1, 0)
-    if x.shape[scatter] % size:
-        raise ValueError("Mamba CP exchange requires a divisible scatter dimension")
-    parts = list(x.chunk(size, dim=scatter))
-    return torch.cat(all_to_all_hidden_shards(parts, group), dim=gather)
 
 
 def packed_conv(x, weight, bias, meta: SSMMeta):
@@ -165,8 +151,8 @@ class MambaMixer(torch.nn.Module):
         *,
         device=None,
         dtype=torch.bfloat16,
-        projection_factory=None,
-        hf_prefix=None,
+        projection_factory,
+        hf_prefix,
     ):
         super().__init__()
         from megatron.lite.model.nemotron_h.functional import GatedRMSNorm
@@ -177,13 +163,13 @@ class MambaMixer(torch.nn.Module):
             raise NotImplementedError("Nemotron alignment currently targets TP1")
         if config.mamba_hidden_act != "silu":
             raise ValueError("Mamba visible convolution requires SiLU")
-        if config.n_groups % parallel_state.cp_size:
-            raise NotImplementedError("Mamba CP requires whole SSM groups per rank")
-        self.config, self.ps = config, parallel_state
+        if parallel_state.cp_size != 1:
+            raise NotImplementedError("Nemotron Mamba currently requires CP1")
+        self.config = config
         factory = dict(device=device, dtype=dtype)
         self.in_proj = projection_layer(
             projection_factory,
-            f"{hf_prefix}.in_proj" if hf_prefix else None,
+            f"{hf_prefix}.in_proj",
             config.hidden_size,
             config.mamba_in_proj_size,
             bias=config.use_bias,
@@ -210,7 +196,7 @@ class MambaMixer(torch.nn.Module):
         )
         self.out_proj = projection_layer(
             projection_factory,
-            f"{hf_prefix}.out_proj" if hf_prefix else None,
+            f"{hf_prefix}.out_proj",
             config.mamba_inner_size,
             config.hidden_size,
             bias=config.use_bias,
@@ -219,10 +205,9 @@ class MambaMixer(torch.nn.Module):
 
     def forward(self, hidden, meta: SSMMeta):
         from megatron.lite.model.nemotron_h.functional import projection
-        from megatron.lite.primitive.parallel.cp import get_parameter_local_cp_headwise
 
-        c, ps = self.config, self.ps
-        meta.validate_tokens(hidden.shape[0] * ps.cp_size)
+        c = self.config
+        meta.validate_tokens(hidden.shape[0])
         if meta.chunk_size != c.chunk_size:
             raise ValueError("SSM metadata chunk size differs from model config")
         projected = projection(hidden, self.in_proj)
@@ -234,45 +219,21 @@ class MambaMixer(torch.nn.Module):
             c.n_groups * c.ssm_state_size,
             c.n_groups * c.ssm_state_size,
         ]
-        xbc = torch.cat(
-            [
-                exchange_sequence_channels(t, ps.cp_group)
-                for t in xbc.split(sections, dim=-1)
-            ],
-            dim=-1,
-        )
-
-        def local_parameter(p, split_sections=None):
-            if p is None:
-                return None
-            return get_parameter_local_cp_headwise(
-                p, 0, ps.cp_size, ps.cp_rank, split_sections=split_sections
-            )
-
         conv = packed_conv(
-            xbc,
-            local_parameter(self.conv1d.weight[:, 0], sections),
-            local_parameter(self.conv1d.bias, sections),
-            meta,
+            xbc.contiguous(), self.conv1d.weight[:, 0], self.conv1d.bias, meta
         )
-        x, B, C = conv.split([size // ps.cp_size for size in sections], dim=-1)
+        x, B, C = conv.split(sections, dim=-1)
         tokens = conv.shape[0]
-        local_heads, local_groups = (
-            c.mamba_num_heads // ps.cp_size,
-            c.n_groups // ps.cp_size,
-        )
-        dt = exchange_sequence_channels(dt, ps.cp_group)
         scanned = packed_scan(
-            x.reshape(tokens, local_heads, c.mamba_head_dim),
+            x.reshape(tokens, c.mamba_num_heads, c.mamba_head_dim),
             dt,
-            -torch.exp(local_parameter(self.A_log).float()),
-            B.reshape(tokens, local_groups, c.ssm_state_size),
-            C.reshape(tokens, local_groups, c.ssm_state_size),
-            local_parameter(self.D),
-            local_parameter(self.dt_bias),
+            -torch.exp(self.A_log.float()),
+            B.reshape(tokens, c.n_groups, c.ssm_state_size),
+            C.reshape(tokens, c.n_groups, c.ssm_state_size),
+            self.D,
+            self.dt_bias,
             meta,
         )
-        scanned = exchange_sequence_channels(scanned, ps.cp_group, reverse=True)
         normalized = self.norm(
             scanned.reshape(hidden.shape[0], c.mamba_inner_size), gate
         )

@@ -6,6 +6,10 @@ aligned implementation is; there is no `lite` implementation. Every compute
 module calls vLLM kernels, so this package always requires the companion vLLM
 build. With verl, select it with `actor_rollout_ref.actor.engine.impl=vllm`.
 
+Only the ModelOpt `MIXED_PRECISION` Lightning checkpoint (NVFP4 experts and
+linears, FP8 Mamba projections, static FP8 KV) is supported; `build_model`
+rejects checkpoints without a `quantization_config`.
+
 ## What runs where
 
 - **Quantized layers keep the checkpoint format.**
@@ -30,13 +34,14 @@ build. With verl, select it with `actor_rollout_ref.actor.engine.impl=vllm`.
   the BF16 masters and the BF16 inputs (`functional.native_linear_vjp`), and
   grouped BF16 GEMMs for the routed experts from the visible FC1 output
   (`nvfp4_moe_vjp.routed_vjp`).
-- **Parallelism.** The validated topology is PP4 with `dist_opt`.
+- **Parallelism.** TP/EP/CP 1 with PP1 or PP4; the validated topology is PP4
+  with `dist_opt`.
 
 ## Limits
 
 Validated on GB200 with the companion vLLM build. Quality, throughput and
 full-depth distributed checkpoint resume are not covered here.
 
-CPU suites live in `tests/unit/model/test_nemotron_*_unit.py`. CUDA and
-real-weight cases need the companion environment and `NEMOTRON_TEST_MODEL`;
-skipped CUDA cases are not evidence of GPU correctness.
+CPU suites live in `tests/unit/model/test_nemotron_*_unit.py`. CUDA cases
+need the companion environment; skipped CUDA cases are not evidence of GPU
+correctness.

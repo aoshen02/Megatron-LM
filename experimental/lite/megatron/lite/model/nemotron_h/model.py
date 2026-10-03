@@ -19,9 +19,9 @@ class Block(nn.Module):
         *,
         device=None,
         dtype=torch.bfloat16,
-        fp8_kv_scales=None,
-        projection_factory=None,
-        routed_factory=None,
+        fp8_kv_scales,
+        projection_factory,
+        routed_factory,
     ):
         super().__init__()
         self.norm = RMSNorm(
@@ -35,8 +35,10 @@ class Block(nn.Module):
         }
         if self.kind not in types:
             raise ValueError(f"Unsupported Nemotron block: {self.kind}")
-        kwargs = {} if fp8_kv_scales is None else {"fp8_kv_scales": fp8_kv_scales}
-        if self.kind == "moe":
+        kwargs = {}
+        if self.kind == "full_attention":
+            kwargs["fp8_kv_scales"] = fp8_kv_scales
+        elif self.kind == "moe":
             kwargs["routed_factory"] = routed_factory
         self.mixer = types[self.kind](
             config,
@@ -73,9 +75,9 @@ class NemotronModel(nn.Module):
         layer_range=None,
         device=None,
         dtype=torch.bfloat16,
-        fp8_kv_scales=None,
-        projection_factory=None,
-        routed_factory=None,
+        fp8_kv_scales,
+        projection_factory,
+        routed_factory,
     ):
         super().__init__()
         self.config, self.ps = config, ps
@@ -84,16 +86,15 @@ class NemotronModel(nn.Module):
             raise ValueError("Invalid contiguous layer range")
         if ps.pp_size > 1 and layer_range is None:
             raise ValueError("PP requires an explicit layer assignment from runtime")
-        if fp8_kv_scales is not None:
-            attention_layers = {
-                i
-                for i in range(start, end)
-                if config.layers_block_type[i] == "full_attention"
-            }
-            if set(fp8_kv_scales) != attention_layers:
-                raise ValueError(
-                    "FP8 KV scales must cover exactly the local attention layers"
-                )
+        attention_layers = {
+            i
+            for i in range(start, end)
+            if config.layers_block_type[i] == "full_attention"
+        }
+        if set(fp8_kv_scales) != attention_layers:
+            raise ValueError(
+                "FP8 KV scales must cover exactly the local attention layers"
+            )
         self.pre_process = start == 0
         self.post_process = end == config.num_hidden_layers
         if config.tie_word_embeddings:
@@ -116,9 +117,7 @@ class NemotronModel(nn.Module):
                     dtype=dtype,
                     projection_factory=projection_factory,
                     routed_factory=routed_factory,
-                    fp8_kv_scales=None
-                    if fp8_kv_scales is None
-                    else fp8_kv_scales.get(i),
+                    fp8_kv_scales=fp8_kv_scales.get(i),
                 )
                 for i in range(start, end)
             }

@@ -23,7 +23,6 @@ from .checkpoint import refresh_quantized_projections
 from .config import NemotronHConfig
 from .functional import visible_forward
 from .mamba import SSMMeta
-from .model import NemotronModel
 from .vllm_runtime import vllm_context
 
 
@@ -153,8 +152,11 @@ def unpack_forward_output(model, batch, output):
 
 
 def build_model(model_cfg, *, impl_cfg):
-    if model_cfg.quantization_config is None or not impl_cfg.hf_path:
-        return _build_model(model_cfg, impl_cfg)
+    if model_cfg.quantization_config is None:
+        raise ValueError(
+            "Nemotron impl=vllm requires a ModelOpt MIXED_PRECISION checkpoint "
+            "(NVFP4 experts/linears, FP8 Mamba projections and KV cache)"
+        )
     from vllm.config import set_current_vllm_config
 
     from .quantized_proxy import validate_proxy_config
@@ -180,39 +182,22 @@ def _refresh_after_model_load(chunks):
 
 
 def _build_model(model_cfg, impl_cfg):
-    if model_cfg.quantization_config is not None and not impl_cfg.hf_path:
-        raise ValueError("Quantized Nemotron construction requires an explicit hf_path")
-    quantized = model_cfg.quantization_config is not None
-    if quantized:
-        from .quantized_proxy import (
-            build_quantized_proxy,
-            caller_runtime,
-        )
+    from .quantized_proxy import build_quantized_proxy, caller_runtime
 
-        caller_runtime(pipeline_size=impl_cfg.parallel.pp)
-    elif impl_cfg.routed_forward_reduction is not None:
-        raise ValueError("EP4 forward reduction requires a quantized checkpoint")
-    p = impl_cfg.parallel
-    if p.tp != 1 or (p.etp or 1) != 1 or p.vpp != 1:
-        raise ValueError("Native Nemotron currently requires TP1/ETP1/VPP1")
+    caller_runtime(pipeline_size=impl_cfg.parallel.pp)
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
-    ps = init_parallel(p)
+    ps = init_parallel(impl_cfg.parallel)
     count = model_cfg.num_hidden_layers
     start, end = (
         count * ps.pp_rank // ps.pp_size,
         count * (ps.pp_rank + 1) // ps.pp_size,
     )
-    if quantized:
-        chunks = [
-            build_quantized_proxy(model_cfg, impl_cfg, ps, layer_range=(start, end))
-        ]
-        # Verify the checkpoint before an optimizer can bind these parameters.
-        _load_weights(chunks[0], impl_cfg.hf_path)
-        parameter_ids = {id(p) for chunk in chunks for p in chunk.parameters()}
-    else:
-        chunks = [NemotronModel(model_cfg, ps, layer_range=(start, end), device="cuda")]
+    chunks = [build_quantized_proxy(model_cfg, impl_cfg, ps, layer_range=(start, end))]
+    # Verify the checkpoint before an optimizer can bind these parameters.
+    _load_weights(chunks[0], impl_cfg.hf_path)
+    parameter_ids = {id(p) for chunk in chunks for p in chunk.parameters()}
     optimizer = finalize_grads = None
     if impl_cfg.optimizer == "dist_opt":
         from megatron.lite.primitive.optimizers.megatron_wrap import (
@@ -233,16 +218,15 @@ def _build_model(model_cfg, impl_cfg):
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert
         )
-        if quantized:
-            if parameter_ids != {id(p) for chunk in chunks for p in chunk.parameters()}:
-                raise RuntimeError("Optimizer replaced quantized Parameter identities")
-            # DDP may rebind storage; never replace the Parameter objects.
-            refresh_quantized_projections(chunks)
-            for chunk in chunks:
-                current = chunk
-                while hasattr(current, "module"):
-                    current = current.module
-                _load_weights(current, impl_cfg.hf_path)
+        if parameter_ids != {id(p) for chunk in chunks for p in chunk.parameters()}:
+            raise RuntimeError("Optimizer replaced quantized Parameter identities")
+        # DDP may rebind storage; never replace the Parameter objects.
+        refresh_quantized_projections(chunks)
+        for chunk in chunks:
+            current = chunk
+            while hasattr(current, "module"):
+                current = current.module
+            _load_weights(current, impl_cfg.hf_path)
     elif impl_cfg.optimizer is not None:
         raise ValueError(
             "Native Nemotron uses dist_opt, not the historical FSDP adapter"
@@ -252,7 +236,7 @@ def _build_model(model_cfg, impl_cfg):
         "optimizer_backend": impl_cfg.optimizer or "none",
         "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
     }
-    if quantized and optimizer is not None:
+    if optimizer is not None:
         extras["post_model_load_hook"] = partial(_refresh_after_model_load, chunks)
     return ModelBundle(
         chunks=chunks,
@@ -267,13 +251,10 @@ def _build_model(model_cfg, impl_cfg):
 def load_hf_weights(chunk, hf_path, model_cfg, ps):
     while hasattr(chunk, "module"):
         chunk = chunk.module
-    if hasattr(chunk, "_quantized_proxy_root"):
-        from pathlib import Path
+    from pathlib import Path
 
-        if str(Path(hf_path).resolve()) != chunk._quantized_proxy_root:
-            raise ValueError(
-                "Quantized proxy loader must use its construction checkpoint"
-            )
+    if str(Path(hf_path).resolve()) != chunk._quantized_proxy_root:
+        raise ValueError("Quantized proxy loader must use its construction checkpoint")
     _load_weights(chunk, hf_path)
 
 

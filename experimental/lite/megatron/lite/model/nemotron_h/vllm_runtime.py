@@ -6,8 +6,6 @@ groups and a workspace manager. The protocol creates them once per process so
 generic mlite runtimes and engines can drive the model unchanged.
 """
 
-from contextlib import nullcontext
-
 import torch
 import torch.distributed as dist
 
@@ -72,10 +70,7 @@ def _base(module):
 
 
 def vllm_context(module):
-    """Make the model's vLLM config current; no-op for unquantized models."""
-    config = getattr(_base(module), "_vllm_config", None)
-    if config is None:
-        return nullcontext()
+    """Make the model's vLLM config current."""
     from vllm.config import set_current_vllm_config
 
-    return set_current_vllm_config(config)
+    return set_current_vllm_config(_base(module)._vllm_config)

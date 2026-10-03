@@ -1,113 +1,9 @@
-"""ReLU² experts using mlite token dispatch and inference-visible arithmetic."""
+"""Nemotron-H MoE: grouped sigmoid router, shared expert and routed deployment."""
 
 import torch
 from torch import nn
 
 from .functional import projection, visible_forward
-
-
-def routed_experts(x, up, down, weights, ids):
-    """Evaluate local expert routes; IDs index the locally owned weight tensors."""
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-
-    def visible(x, up, down, weights):
-        if x.shape[0] == 0:
-            return x.new_empty((0, down.shape[1]))
-        return fused_experts(
-            x, up, down, weights, ids, activation=MoEActivation.RELU2_NO_MUL
-        )
-
-    def native(x, up, down, weights):
-        slots = x.new_zeros(x.shape[0] * ids.shape[1], down.shape[1])
-        for expert in range(up.shape[0]):
-            token, slot = torch.where(ids == expert)
-            hidden = torch.nn.functional.linear(x[token], up[expert])
-            hidden = torch.nn.functional.relu(hidden).square()
-            hidden = torch.nn.functional.linear(hidden, down[expert])
-            hidden = (hidden * weights[token, slot, None]).to(x.dtype)
-            slots = slots.index_copy(0, token * ids.shape[1] + slot, hidden)
-        return slots.view(x.shape[0], ids.shape[1], down.shape[1]).sum(1)
-
-    return visible_forward(visible, native, x, up, down, weights)
-
-
-class RoutedExperts(nn.Module):
-    """TP1/ETP1 owned experts with native all-to-all and ordered top-k combine.
-
-    Each slot is dispatched separately to avoid expert-order reduction changing
-    inference rounding. This correctness-first transport is not a performance
-    claim; replacing it requires the same route-order and backward gates.
-    """
-
-    def __init__(self, config, ps, *, device=None, dtype=torch.bfloat16):
-        super().__init__()
-        from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
-
-        if ps.tp_size != 1 or ps.etp_size != 1:
-            raise ValueError("Nemotron experts currently require TP1/ETP1")
-        if config.n_routed_experts % ps.ep_size:
-            raise ValueError("Expert count must divide EP size")
-        if config.mlp_bias or config.mlp_hidden_act != "relu2":
-            raise ValueError("Expected bias-free ReLU2 experts")
-        local = config.n_routed_experts // ps.ep_size
-        self.up_proj = nn.Parameter(
-            torch.empty(
-                local,
-                config.moe_intermediate_size,
-                config.hidden_size,
-                device=device,
-                dtype=dtype,
-            )
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(
-                local,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                device=device,
-                dtype=dtype,
-            )
-        )
-        self.dispatcher = TokenDispatcher(
-            config.n_routed_experts,
-            config.hidden_size,
-            ps,
-            use_deepep=False,
-            moe_permute_fusion=False,
-        )
-
-    def forward(self, x, ids, weights):
-        from vllm import _custom_ops as ops
-
-        if ids.shape != weights.shape or ids.ndim != 2 or ids.shape[1] == 0:
-            raise ValueError("Expected matching nonempty [tokens, topk] routes")
-        slots = []
-        for slot in range(ids.shape[1]):
-            rows, counts, probs = self.dispatcher.dispatch(
-                x, weights[:, slot : slot + 1], ids[:, slot : slot + 1].long()
-            )
-            local_ids = torch.repeat_interleave(
-                torch.arange(self.up_proj.shape[0], device=x.device),
-                counts.to(device=x.device),
-                output_size=rows.shape[0],
-            )[:, None].int()
-            output = routed_experts(
-                rows,
-                self.up_proj,
-                self.down_proj,
-                probs[:, None].contiguous(),
-                local_ids,
-            )
-            slots.append(self.dispatcher.combine(output))
-        routes = torch.stack(slots, dim=1)
-
-        def combine(routes):
-            output = torch.empty_like(x)
-            ops.moe_sum(routes, output)
-            return output
-
-        return visible_forward(combine, lambda routes: routes.sum(1), routes)
 
 
 class Router(nn.Module):
@@ -165,15 +61,15 @@ class SharedExperts(nn.Module):
         *,
         device=None,
         dtype=torch.bfloat16,
-        projection_factory=None,
-        hf_prefix=None,
+        projection_factory,
+        hf_prefix,
     ):
         super().__init__()
         from .quantization import projection_layer
 
         self.up_proj = projection_layer(
             projection_factory,
-            f"{hf_prefix}.up_proj" if hf_prefix else None,
+            f"{hf_prefix}.up_proj",
             config.hidden_size,
             config.moe_shared_expert_intermediate_size,
             bias=False,
@@ -182,7 +78,7 @@ class SharedExperts(nn.Module):
         )
         self.down_proj = projection_layer(
             projection_factory,
-            f"{hf_prefix}.down_proj" if hf_prefix else None,
+            f"{hf_prefix}.down_proj",
             config.moe_shared_expert_intermediate_size,
             config.hidden_size,
             bias=False,
@@ -198,9 +94,9 @@ class SharedExperts(nn.Module):
 class MoE(nn.Module):
     """Compose routing, unscaled routed output, and the shared expert.
 
-    An optional routed_factory(prefix, config, ps, *, device, dtype) returns
-    the final nn.Module accepting (x, ids, routing_weights). Its output must
-    exclude routed_scaling_factor and shared output, which are combined here.
+    routed_factory(prefix, config, ps, *, device, dtype) returns the routed
+    nn.Module accepting (x, ids, routing_weights). Its output must exclude
+    routed_scaling_factor and shared output, which are combined here.
     """
 
     def __init__(
@@ -210,14 +106,14 @@ class MoE(nn.Module):
         *,
         device=None,
         dtype=torch.bfloat16,
-        projection_factory=None,
-        hf_prefix=None,
-        routed_factory=None,
+        projection_factory,
+        hf_prefix,
+        routed_factory,
     ):
         super().__init__()
         if config.n_shared_experts != 1:
             raise ValueError("Nemotron MoE requires the single shared expert contract")
-        if routed_factory is not None and (
+        if (
             not callable(routed_factory)
             or not isinstance(hf_prefix, str)
             or not hf_prefix
@@ -225,12 +121,8 @@ class MoE(nn.Module):
         ):
             raise ValueError("Routed factory requires an explicit HF mixer prefix")
         self.gate = Router(config, device=device, dtype=dtype)
-        self.experts = (
-            RoutedExperts(config, ps, device=device, dtype=dtype)
-            if routed_factory is None
-            else routed_factory(
-                f"{hf_prefix}.experts", config, ps, device=device, dtype=dtype
-            )
+        self.experts = routed_factory(
+            f"{hf_prefix}.experts", config, ps, device=device, dtype=dtype
         )
         if not isinstance(self.experts, nn.Module):
             raise TypeError("Routed factory must return an nn.Module")
@@ -239,7 +131,7 @@ class MoE(nn.Module):
             device=device,
             dtype=dtype,
             projection_factory=projection_factory,
-            hf_prefix=f"{hf_prefix}.shared_experts" if hf_prefix else None,
+            hf_prefix=f"{hf_prefix}.shared_experts",
         )
         scale = config.routed_scaling_factor
 

@@ -67,7 +67,7 @@ def load_fp8_kv_scales(path, layer_ids, *, device):
 
 
 class NemotronExport:
-    """Expose stacked expert views to the framework's EP/PP exporter."""
+    """Expose the deployment tensors to the framework's PP exporter."""
 
     def __init__(self, config):
         self.num_experts = config.n_routed_experts
@@ -75,15 +75,6 @@ class NemotronExport:
     @staticmethod
     def is_expert(name):
         return ".mixer.experts." in name
-
-    @staticmethod
-    def export_expert_local_id(name):
-        return int(name.split(".experts.", 1)[1].split(".", 1)[0])
-
-    @staticmethod
-    def export_expert_name(name, index):
-        prefix, suffix = name.split(".experts.", 1)
-        return f"{prefix}.experts.{index}.{suffix.split('.', 1)[1]}"
 
     @staticmethod
     def tp_spec(name):
@@ -102,25 +93,17 @@ class NemotronExport:
             if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
                 prefix = name if name.startswith("lm_head") else f"backbone.{name}"
                 quantized[prefix] = module.export_quantized()
-        first = model.ps.ep_rank * (self.num_experts // model.ps.ep_size)
         for name, tensor in hf_tensor_views(model):
             if any(name.startswith(prefix + ".") for prefix in quantized) and not (
                 name.endswith(".k_proj.k_scale") or name.endswith(".v_proj.v_scale")
             ):
                 continue
-            if self.is_expert(name):
-                name = self.export_expert_name(
-                    name, self.export_expert_local_id(name) - first
-                )
             yield name, tensor.detach()
         for prefix, tensors in quantized.items():
             for suffix, tensor in tensors.items():
                 yield f"{prefix}.{suffix}", tensor
         for weights in _routed_checkpoint_owners(model).values():
-            for name, tensor in weights.export_quantized().items():
-                yield self.export_expert_name(
-                    name, self.export_expert_local_id(name) - first
-                ), tensor
+            yield from weights.export_quantized().items()
 
 
 @torch.no_grad()
@@ -161,9 +144,7 @@ def refresh_quantized_projections(chunks, *, recompute_scales=False):
 
 
 def hf_tensor_views(model):
-    """Yield HF names and destination views, without gathering remote experts."""
-    local_experts = model.config.n_routed_experts // model.ps.ep_size
-    first_expert = model.ps.ep_rank * local_experts
+    """Yield HF names and destination views of the non-routed tensors."""
     routed = _routed_checkpoint_owners(model)
     for name, tensor in model.state_dict(keep_vars=True).items():
         if any(name.startswith(prefix + ".") for prefix in routed):
@@ -173,19 +154,7 @@ def hf_tensor_views(model):
             if name.endswith(suffix):
                 name = name.removesuffix(suffix) + f".mixer.{scale}_proj.{scale}_scale"
                 break
-        if ".mixer.experts." in name:
-            prefix, projection = name.rsplit(".", 1)
-            if projection not in ("up_proj", "down_proj"):
-                raise ValueError(f"Unrecognized expert weight: {name}")
-            if tensor.shape[0] != local_experts:
-                raise ValueError(f"Incorrect local expert ownership: {name}")
-            for local in range(local_experts):
-                yield (
-                    f"backbone.{prefix}.{first_expert + local}.{projection}.weight",
-                    tensor[local],
-                )
-        else:
-            yield (name if name.startswith("lm_head.") else f"backbone.{name}"), tensor
+        yield (name if name.startswith("lm_head.") else f"backbone.{name}"), tensor
 
 
 @torch.no_grad()

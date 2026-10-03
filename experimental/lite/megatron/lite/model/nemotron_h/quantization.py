@@ -6,9 +6,7 @@ import torch
 
 
 def projection_layer(factory, prefix, in_features, out_features, **kwargs):
-    """Construct before optimizer binding, preserving the ordinary BF16 API."""
-    if factory is None:
-        return torch.nn.Linear(in_features, out_features, **kwargs)
+    """Construct from the checkpoint before optimizer binding."""
     if not callable(factory) or not prefix:
         raise ValueError(
             "A callable projection factory and explicit HF prefix are required"
