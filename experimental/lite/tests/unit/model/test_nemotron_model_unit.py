@@ -220,3 +220,46 @@ def test_parameter_mutation_before_backward_is_rejected():
         norm.weight.add_(1)
     with pytest.raises(RuntimeError, match="modified by an inplace operation"):
         output.sum().backward()
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+def test_router_vjp_within_bf16_noise_floor(kind):
+    """Lightning router: 128 experts, top-6 sigmoid, renormalized, fixed ids."""
+    from types import SimpleNamespace
+
+    from megatron.lite.model.nemotron_h.experts import Router
+    from test_nemotron_mamba_unit import assert_within_noise_floor, upstream_gradient
+
+    torch.manual_seed(0)
+    config = SimpleNamespace(
+        n_routed_experts=128,
+        hidden_size=2688,
+        num_experts_per_tok=6,
+        norm_topk_prob=True,
+        n_group=1,
+        topk_group=1,
+    )
+    router = Router(config, device="cuda")
+    with torch.no_grad():
+        router.weight.normal_(std=0.02)
+        router.e_score_correction_bias.normal_(std=0.01)
+    leaves = (torch.randn(1506, 2688, device="cuda"), router.weight.float())
+    inputs = [leaves[0].to(torch.bfloat16).requires_grad_(), router.weight]
+    with torch.no_grad():
+        visible_ids, visible = router(inputs[0])
+    ids, weights = router(inputs[0])
+    assert torch.equal(ids, visible_ids) and torch.equal(weights, visible)
+    upstream = upstream_gradient(kind, weights)
+    actual = torch.autograd.grad(weights, inputs, upstream)
+
+    def old_vjp(dtype, logits_dtype):
+        inputs = [t.detach().to(dtype).requires_grad_() for t in leaves]
+        logits = torch.nn.functional.linear(*(t.to(logits_dtype) for t in inputs))
+        selected = logits.sigmoid().gather(1, ids.long())
+        selected = selected / selected.sum(-1, keepdim=True)
+        return torch.autograd.grad(selected, inputs, upstream.to(logits_dtype))
+
+    old = old_vjp(torch.bfloat16, torch.float32)
+    reference = old_vjp(torch.float64, torch.float64)
+    assert_within_noise_floor(("dx", "dweight"), actual, old, reference, kind)

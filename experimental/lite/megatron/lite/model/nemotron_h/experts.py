@@ -3,7 +3,30 @@
 import torch
 from torch import nn
 
-from .functional import projection, visible_forward
+from .functional import projection, visible_forward, visible_linear
+
+
+class _FixedRouteVJP(torch.autograd.Function):
+    """Visible grouped top-k; FP32 sigmoid-gather-renorm replay on fixed ids."""
+
+    @staticmethod
+    def forward(ctx, logits, visible, renormalize):
+        weights, ids = visible(logits)
+        ctx.save_for_backward(logits, ids.clone())
+        ctx.renormalize = renormalize
+        ctx.mark_non_differentiable(ids)
+        return weights, ids
+
+    @staticmethod
+    def backward(ctx, grad_weights, _grad_ids):
+        logits, ids = ctx.saved_tensors
+        with torch.enable_grad():
+            replay = logits.detach().float().requires_grad_(True)
+            selected = replay.sigmoid().gather(-1, ids.long())
+            if ctx.renormalize:
+                selected = selected / selected.sum(-1, keepdim=True)
+            (grad_logits,) = torch.autograd.grad(selected, replay, grad_weights.float())
+        return grad_logits.to(logits.dtype), None, None
 
 
 class Router(nn.Module):
@@ -26,14 +49,14 @@ class Router(nn.Module):
         )
 
         config = self.config
-        logits = visible_forward(
-            lambda x, weight: torch.mm(x, weight.T, out_dtype=torch.float32),
-            lambda x, weight: torch.nn.functional.linear(x.float(), weight.float()),
+        logits = visible_linear(
+            lambda x: torch.mm(x, self.weight.T, out_dtype=torch.float32),
             x,
             self.weight,
         )
-        with torch.no_grad():
-            weights, ids = grouped_topk(
+
+        def visible(logits):
+            return grouped_topk(
                 x,
                 logits,
                 config.num_experts_per_tok,
@@ -45,13 +68,11 @@ class Router(nn.Module):
                 self.e_score_correction_bias.float(),
             )
 
-        def native(logits):
-            selected = logits.sigmoid().gather(1, ids.long())
-            if config.norm_topk_prob:
-                selected = selected / selected.sum(-1, keepdim=True)
-            return selected
-
-        return ids, visible_forward(lambda logits: weights, native, logits)
+        if not torch.is_grad_enabled():
+            weights, ids = visible(logits)
+        else:
+            weights, ids = _FixedRouteVJP.apply(logits, visible, config.norm_topk_prob)
+        return ids, weights
 
 
 class SharedExperts(nn.Module):
