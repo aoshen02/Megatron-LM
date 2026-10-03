@@ -217,7 +217,11 @@ def _load_bf16_masters(model, root, master_root):
         "weight_map"
     ]
     masters = list(_quantized_masters(model))
-    verify = not getattr(model, "_bf16_master_verified", False)
+    verify = getattr(model, "_bf16_master_verified", None) != str(master_root.resolve())
+    if verify and any(hasattr(master, "main_grad") for _, _, master, _ in masters):
+        # The optimizer's FP32 mains are copied from the masters when it is
+        # built; a later first load would leave them on the checkpoint grid.
+        raise RuntimeError("Load the BF16 masters before building the optimizer")
     suffixes = {
         "FP8": ("weight", "weight_scale"),
         "W4A16_NVFP4": ("weight", "weight_scale", "weight_scale_2"),
@@ -265,10 +269,11 @@ def _load_bf16_masters(model, root, master_root):
         missing = [name for name in plain if name not in source]
         if missing:
             raise ValueError(f"BF16 master source lacks {missing[:4]}")
-        ours = _read_tensors(root, index, plain)
-        theirs = _read_tensors(master_root, source, plain)
+        device = masters[0][2].device if masters else "cpu"
+        theirs = _read_tensors(master_root, source, plain, device)
+        ours = _read_tensors(root, index, plain, device)
         for name in plain:
-            a, b = ours[name], theirs[name]
+            a, b = ours.pop(name), theirs.pop(name)
             same = (
                 a.dtype == b.dtype
                 and a.shape == b.shape
@@ -288,18 +293,20 @@ def _load_bf16_masters(model, root, master_root):
     refresh_quantized_projections([model], recompute_scales=True)
     if verify:
         _check_theta0_agreement(masters, root, index)
-        model._bf16_master_verified = True
+        model._bf16_master_verified = str(master_root.resolve())
 
 
-# Fail-closed theta0 floors for requant(BF16 master) against the checkpoint,
-# per rank over all NVFP4 tensors. Effective weights (dequantized values) are
+# Fail-closed theta0 floors for requant(BF16 master) against the checkpoint:
+# per rank over all NVFP4 tensors, and per tensor. Effective weights (dequantized values) are
 # the contract; codes and block scales are compared on blocks that are not all
 # zero (ModelOpt floors an all-zero block's scale at 2^-9, TE writes 0). Full
 # Lightning model with TE 4over6 MSE: 99.93% values; proxy ranks: >= 99.94%
 # values, >= 98.0% codes/scales. Global scales and FP8 tensors whose
 # checkpoint scale is amax/448 must match exactly.
-THETA0_NVFP4_MIN_VALUES = 0.995
-THETA0_NVFP4_MIN_NONZERO_BLOCKS = 0.95
+THETA0_NVFP4_MIN_VALUES = 0.999
+THETA0_NVFP4_MIN_NONZERO_BLOCKS = 0.998
+THETA0_NVFP4_TENSOR_MIN_VALUES = 0.99
+THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS = 0.98
 
 
 @torch.no_grad()
@@ -339,6 +346,13 @@ def _check_theta0_agreement(masters, root, index):
         theirs = QuantizedWeight(algorithm, deployed).initial_master()
         values_same = ours == theirs
         add((kind, "values"), values_same)
+        if algorithm == "W4A16_NVFP4":
+            agreement = float(values_same.float().mean())
+            if agreement < THETA0_NVFP4_TENSOR_MIN_VALUES:
+                raise RuntimeError(
+                    f"theta0 {prefix} values agreement {agreement:.4%} is below "
+                    f"{THETA0_NVFP4_TENSOR_MIN_VALUES:.2%}"
+                )
         nonzero = None
         if algorithm == "W4A16_NVFP4":
             add(("nvfp4", "values"), values_same)
@@ -359,6 +373,14 @@ def _check_theta0_agreement(masters, root, index):
                 )
                 add((kind, f"{suffix}[nonzero blocks]"), same[mask])
                 add(("nvfp4", f"{suffix}[nonzero blocks]"), same[mask])
+                if same[mask].numel():
+                    agreement = float(same[mask].float().mean())
+                    if agreement < THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:
+                        raise RuntimeError(
+                            f"theta0 {prefix}.{suffix} agreement on nonzero blocks "
+                            f"{agreement:.4%} is below "
+                            f"{THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:.2%}"
+                        )
             if algorithm == "W4A16_NVFP4" and suffix == "weight_scale_2":
                 add(("nvfp4", suffix), same)
         if algorithm == "FP8":
