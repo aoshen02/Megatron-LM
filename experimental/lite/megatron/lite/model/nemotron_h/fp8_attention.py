@@ -34,8 +34,10 @@ class _Fp8AttentionVJP(torch.autograd.Function):
         output, lse, *_ = _flash_attn_fwd(
             q, k, v, softmax_scale=ctx.scale, causal=True, return_lse=True, **varlen
         )
+        # Fixed-order dQ accumulation: full_determinism needs run-to-run
+        # identical gradients.
         gradients = _flash_attn_bwd(
-            q, k, v, output, grad, lse, ctx.scale, True, **varlen
+            q, k, v, output, grad, lse, ctx.scale, True, deterministic=True, **varlen
         )
         return *gradients, None, None, None, None
 

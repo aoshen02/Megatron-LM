@@ -343,3 +343,29 @@ def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
 
     old, reference = old_vjp(torch.bfloat16), old_vjp(torch.float64)
     assert_within_noise_floor(("dhidden", "dweight"), actual, old, reference, kind)
+
+
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_fp8_attention_vjp_is_run_to_run_bitwise(monkeypatch):
+    """full_determinism: the FlashAttention backward accumulates dQ in a fixed order."""
+    from megatron.lite.model.nemotron_h.fp8_attention import Fa4Fp8KVAttention
+    from megatron.lite.model.nemotron_h.mamba import SSMMeta
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(7)
+    lengths = (8192, 3000, 1, 5000)
+    meta = SSMMeta((0, *torch.tensor(lengths).cumsum(0).tolist()))
+    module = Fa4Fp8KVAttention(
+        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
+    )
+    q, k, v = (
+        torch.randn(meta.boundaries[-1], h, 128, device="cuda", dtype=torch.bfloat16)
+        .requires_grad_()
+        for h in (32, 2, 2)
+    )
+    upstream = torch.randn(meta.boundaries[-1], 32, 128, device="cuda", dtype=torch.bfloat16)
+    first, second = (
+        torch.autograd.grad(module(q, k, v, meta), (q, k, v), upstream) for _ in range(2)
+    )
+    for a, b in zip(first, second, strict=True):
+        assert torch.equal(a, b)
