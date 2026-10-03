@@ -271,6 +271,15 @@ def test_routed_vjp_follows_the_per_input_contract():
     torch.testing.assert_close(got[3], expected[3], rtol=1e-5, atol=1e-5)
 
 
+def test_route_input_gradients_sum_as_ds4():
+    """DS4 rounds to BF16 after each slot add; an FP32 sum would keep 1/256."""
+    from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import sum_route_grads
+
+    per_route = torch.tensor([[1, 1 / 256, -1, 0, 0, 0]]).to(torch.bfloat16)[..., None]
+    assert sum_route_grads(per_route).item() == 0
+    assert per_route.float().sum().item() == 1 / 256
+
+
 # The direct kernel calls must reproduce the vLLM layer objects bit for bit.
 # The oracle builds those objects (ReplicatedLinear + ModelOpt, FusedMoE with
 # the Humming backend) on the same checkpoint bytes, as serving does.

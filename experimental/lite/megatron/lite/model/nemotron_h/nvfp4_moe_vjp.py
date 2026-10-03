@@ -79,11 +79,18 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
     _te_grouped_gemm(split(x_rows), split(du), d_up.unbind(0), layout="NT",
                      m_splits=counts)
     per_route = torch.empty_like(dx_rows).index_copy_(0, order, dx_rows).view(m, topk, k)
-    dx = per_route[:, 0].float()
-    for slot in range(1, topk):
-        dx = dx + per_route[:, slot].float()
+    dx = sum_route_grads(per_route)
     d_routes = torch.empty_like(d_weight).index_copy_(0, order, d_weight).view(m, topk)
     return dx.to(x.dtype), d_up, d_down, d_routes
+
+
+def sum_route_grads(per_route):
+    """[M, topk, K] -> [M, K] as DS4's deterministic scatter backward: slot
+    order, rounded to BF16 after each add."""
+    total = per_route[:, 0]
+    for slot in range(1, per_route.shape[1]):
+        total = (total.float() + per_route[:, slot].float()).to(torch.bfloat16)
+    return total
 
 
 class RoutedExpertsVJP(torch.autograd.Function):

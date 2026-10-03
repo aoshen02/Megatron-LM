@@ -77,7 +77,9 @@ rejects checkpoints without a `quantization_config`.
   experts, as DeepSeek-V4's grouped MoE:
   - routing weights: `<dy, visible per-route expert output>` (exact);
   - token input, up and down weights: BF16-master VJP through the visible
-    FC1 output (identity straight-through for the quantization).
+    FC1 output (identity straight-through for the quantization); a token's
+    route input gradients are summed in slot order and rounded to BF16 after
+    each add, as DS4's deterministic scatter backward.
 
   Every other visible op has its own autograd Function, as in the
   DeepSeek-V4 actor: closed-form compiled FP32 VJPs for the RMSNorms, the
