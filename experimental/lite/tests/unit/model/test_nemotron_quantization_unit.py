@@ -318,6 +318,7 @@ def vllm_oracle_runtime():
     )
 
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    os.environ["VLLM_HUMMING_MOE_GEMM_TYPE"] = "indexed"  # as the serving recipe
     for name, value in (
         ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0"),
         ("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29517"),
@@ -459,12 +460,15 @@ def _oracle_experts(stacks, config):
     return layer, local
 
 
-def _oracle_routes(layer, config, x, ids):
-    from vllm.forward_context import set_forward_context
+def _oracle_routes(layer, config, x, ids, *, dp_tokens=None):
+    from vllm.forward_context import DPMetadata, get_forward_context, set_forward_context
 
     experts = layer.quant_method.moe_kernel.fused_experts
     rows, topk = ids.shape
     with set_forward_context(None, config, num_tokens=rows):
+        if dp_tokens is not None:
+            # Serving DP metadata: the source token count of every DP rank.
+            get_forward_context().dp_metadata = DPMetadata(torch.tensor(dp_tokens))
         metas, required = experts.get_buffer_metas(rows, topk, layer.activation)
         buffers = {
             name: torch.empty(metas[name]["shape"], dtype=metas[name]["dtype"], device="cuda")
@@ -472,7 +476,7 @@ def _oracle_routes(layer, config, x, ids):
             if name != "output"
         }
         kwargs1, kwargs2, scatter_idx = experts.prepare_humming_moe_kwargs(
-            topk_ids=ids, expert_map=None, expert_tokens_meta=None
+            topk_ids=ids, expert_map=layer.expert_map, expert_tokens_meta=None
         )
         inputs, scale, scale_2 = experts.process_input(
             "w13", inputs=x, input_scale=None,
@@ -493,6 +497,42 @@ def _oracle_routes(layer, config, x, ids):
             **kwargs2,
         )
     return buffers["gate_up_output"], buffers["down_output"].view(rows, topk, -1)
+
+
+def _oracle_ep4_rank(stacks, config, rank, monkeypatch):
+    """The serving EP4 rank: vLLM FusedMoE with 32 local experts and its
+    expert_map, built under a Nemotron-H model config so ModelOpt applies
+    configure_nemotron_humming."""
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import layer as moe_layer
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+
+    ep4 = FusedMoEParallelConfig(
+        tp_size=1, pcp_size=1, dp_size=1, ep_size=4, tp_rank=0, pcp_rank=0,
+        dp_rank=0, ep_rank=rank, sp_size=1, use_ep=True,
+        all2all_backend=config.parallel_config.all2all_backend, enable_eplb=False,
+    )
+    with monkeypatch.context() as patch:
+        # No EP process groups in a single-GPU test; vLLM's placement and
+        # kernel construction then run as on the serving rank.
+        patch.setattr(moe_layer, "make_parallel_config", lambda **_: ep4)
+        layer, local = _empty_oracle_experts(config)
+    local.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="nemotron_h", hidden_size=2688)
+    )
+    part = slice(rank * 32, (rank + 1) * 32)
+    with set_current_vllm_config(local), torch.device("cuda"), torch.no_grad():
+        for stem, (packed, scale, global_scale) in stacks.items():
+            getattr(layer, f"{stem}_weight").copy_(packed[part])
+            getattr(layer, f"{stem}_weight_scale").copy_(scale[part])
+            target = getattr(layer, f"{stem}_weight_scale_2")
+            target.copy_(global_scale[part].reshape(target.shape))
+        layer.w13_input_scale.fill_(float("nan"))
+        layer.w2_input_scale.fill_(float("nan"))
+        layer.quant_method.process_weights_after_loading(layer)
+    return layer, local
 
 
 def _lightning_stacks(generator):
@@ -832,6 +872,67 @@ def test_checkpoint_restore_reinstalls_the_last_deployed_bytes():
         assert exported.keys() == deployed.keys()
         for name, value in deployed.items():
             assert torch.equal(exported[name], value), (step, name)
+
+
+def _requantized_stacks(stacks):
+    """The deployment an optimizer update produces: requant(updated master)."""
+    from megatron.lite.model.nemotron_h.quantization import QuantizedWeight
+
+    g = torch.Generator(device="cuda").manual_seed(15)
+    result = {}
+    for stem, (packed, scale, global_scale) in stacks.items():
+        parts = []
+        for e in range(packed.shape[0]):
+            master = _nvfp4(packed[e], scale[e], global_scale[e].reshape(1)).initial_master()
+            noise = torch.randn(master.shape, generator=g, device="cuda") * 1e-4
+            parts.append(requantize("W4A16_NVFP4", (master + noise).bfloat16()))
+        result[stem] = tuple(
+            torch.stack([q[name].reshape(q[name].shape if name != "weight_scale_2" else ())
+                         for q in parts])
+            for name in ("weight", "weight_scale", "weight_scale_2")
+        )
+    return result
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_direct_ep4_ranks_match_the_vllm_serving_ranks_bitwise(vllm_oracle_runtime, monkeypatch):
+    """Each trainer EP4 rank against vLLM's EP4 rank (32 local experts, its
+    expert_map, the Nemotron schedule, DP token counts): per-route FC1 and down
+    outputs of the routes it owns, for every M, on both sides of the scatter
+    threshold, at random checkpoint bytes and at an optimizer-produced
+    snapshot."""
+    from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
+    from vllm.utils.platform_utils import num_compute_units
+
+    g = torch.Generator(device="cuda").manual_seed(14)
+    threshold = 2 * num_compute_units(0) // 6
+    checkpoint = _lightning_stacks(g)
+    for stacks in (checkpoint, _requantized_stacks(checkpoint)):
+        for rank in range(4):
+            oracle, config = _oracle_ep4_rank(stacks, vllm_oracle_runtime, rank, monkeypatch)
+            experts = oracle.quant_method.moe_kernel.fused_experts
+            assert type(experts).__name__ == "HummingIndexedExperts"
+            assert experts.num_experts == 32 and experts.global_num_experts == 128
+            direct = HummingRoutedExperts(
+                *(tuple(t[rank * 32 : (rank + 1) * 32] for t in stacks[s]) for s in ("w13", "w2")),
+                num_experts=128, offset=rank * 32, layer_name="experts",
+            )
+            assert direct.w13_tuning_config == experts.w13_tuning_config
+            assert direct.w2_tuning_config == experts.w2_tuning_config
+            for rows in (*ORACLE_ROWS, threshold, threshold + 1):
+                ids = _route_ids(rows, g)
+                ids[:, 0] = rank * 32 + ids[:, 0] % 32  # every token reaches this rank
+                x = torch.randn(rows, 2688, generator=g, device="cuda").to(torch.bfloat16)
+                owned = ids // 32 == rank
+                fc1, down = direct.routes(x, ids, global_tokens=4 * rows)
+                oracle_fc1, oracle_down = _oracle_routes(
+                    oracle, config, x, ids, dp_tokens=[rows] * 4
+                )
+                assert torch.equal(down[owned], oracle_down[owned]), (rank, rows)
+                flat = owned.reshape(-1)
+                assert torch.equal(fc1[flat], oracle_fc1[flat]), (rank, rows)
+            del oracle, experts
 
 
 def _save_release(root, tensors):
