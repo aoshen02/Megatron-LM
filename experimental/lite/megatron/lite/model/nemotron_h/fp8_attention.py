@@ -1,24 +1,8 @@
-"""Packed serving-visible FP8 Q/KV attention with an SDPA VJP."""
+"""Packed serving-visible FP8 Q/KV attention with a FlashAttention VJP."""
 
 from types import SimpleNamespace
 
 import torch
-
-
-def _native_attention(q, k, v, boundaries, scale):
-    outputs = []
-    for start, end in zip(boundaries, boundaries[1:]):
-        query, key, value = (x[start:end].transpose(0, 1)[None] for x in (q, k, v))
-        output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            is_causal=True,
-            scale=scale,
-            enable_gqa=q.shape[1] != k.shape[1],
-        )
-        outputs.append(output.squeeze(0).transpose(0, 1))
-    return torch.cat(outputs)
 
 
 class _Fp8AttentionVJP(torch.autograd.Function):
@@ -33,21 +17,35 @@ class _Fp8AttentionVJP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        q_ref, k_ref, v_ref, *_ = ctx.saved_tensors
-        with torch.enable_grad():
-            inputs = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
-            native = _native_attention(*inputs, ctx.boundaries, ctx.scale)
-            gradients = torch.autograd.grad(native, inputs, grad)
+        from vllm.vllm_flash_attn.cute.interface import (
+            _flash_attn_bwd,
+            _flash_attn_fwd,
+        )
+
+        q, k, v, *_ = ctx.saved_tensors
+        longest = max(b - a for a, b in zip(ctx.boundaries, ctx.boundaries[1:]))
+        cu = torch.tensor(ctx.boundaries, dtype=torch.int32, device=q.device)
+        varlen = dict(
+            cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=longest, max_seqlen_k=longest
+        )
+        # The visible output's FP8 P@V is off the BF16 Q/K/V; recompute out/LSE.
+        output, lse, *_ = _flash_attn_fwd(
+            q, k, v, softmax_scale=ctx.scale, causal=True, return_lse=True, **varlen
+        )
+        gradients = _flash_attn_bwd(
+            q, k, v, output, grad, lse, ctx.scale, True, **varlen
+        )
         return *gradients, None, None, None, None
 
 
 class Fp8KVAttention(torch.nn.Module):
     """Reuse serving query/cache quantization, with fixed-scale identity STE.
 
-    The VJP uses BF16 dequantized Q/K/V from the visible forward and
-    native SDPA backward. No claim of identical internal softmax arithmetic or
-    training quality is implied. This initial adapter supports TP1, causal packed
-    sequences starting at zero, without prefix sharing or sliding windows.
+    The VJP is the FlashAttention varlen forward/backward recomputed on the BF16
+    dequantized Q/K/V from the visible forward. No claim of identical internal
+    softmax arithmetic or training quality is implied. This initial adapter
+    supports TP1, causal packed sequences starting at zero, without prefix
+    sharing or sliding windows.
     """
 
     def __init__(
@@ -200,7 +198,7 @@ class Fp8KVAttention(torch.nn.Module):
 
 
 class Fa4Fp8KVAttention(Fp8KVAttention):
-    """Serving-visible FA4 forward with the fixed-scale SDPA VJP."""
+    """Serving-visible FA4 forward with the fixed-scale FlashAttention VJP."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, backend="fa4", **kwargs)

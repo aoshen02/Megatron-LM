@@ -1,4 +1,4 @@
-"""Nemotron protocol loss normalization."""
+"""Nemotron protocol loss normalization and FP8 attention VJP accuracy."""
 
 import pytest
 import torch
@@ -35,3 +35,64 @@ def test_unquantized_checkpoint_is_rejected():
             SimpleNamespace(quantization_config=None),
             impl_cfg=ImplConfig(hf_path="/nonexistent"),
         )
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+@pytest.mark.parametrize("attention", ["Fa4Fp8KVAttention", "Fp8KVAttention"])
+def test_fp8_attention_vjp_within_bf16_noise_floor(attention, kind, monkeypatch):
+    """Lightning Q32/KV2/D128 vs per-request SDPA on the dequantized Q/K/V."""
+    from megatron.lite.model.nemotron_h import fp8_attention
+    from megatron.lite.model.nemotron_h.mamba import SSMMeta
+    from test_nemotron_mamba_unit import (
+        LENGTHS,
+        assert_within_noise_floor,
+        per_request,
+        upstream_gradient,
+    )
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    from vllm.config import VllmConfig, set_current_vllm_config
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(42)
+    meta = SSMMeta((0, *torch.tensor(LENGTHS).cumsum(0).tolist()))
+    with set_current_vllm_config(VllmConfig()):
+        module = getattr(fp8_attention, attention)(
+            32,
+            2,
+            128,
+            torch.tensor(0.02, device="cuda"),
+            torch.tensor(0.01, device="cuda"),
+        )
+    q, k, v = (
+        torch.randn(
+            meta.boundaries[-1], heads, 128, device="cuda", dtype=torch.bfloat16
+        ).requires_grad_()
+        for heads in (32, 2, 2)
+    )
+    output = module(q, k, v, meta)
+    with torch.no_grad():
+        serving = module._visible(q, k, v, meta.boundaries)[0]
+        _, *references = module._visible(q, k, v, meta.boundaries, return_query=True)
+    assert torch.equal(output, serving)
+    upstream = upstream_gradient(kind, output)
+    actual = torch.autograd.grad(output, (q, k, v), upstream)
+
+    def sdpa_vjp(dtype):
+        def attend(q, k, v):
+            return torch.nn.functional.scaled_dot_product_attention(
+                *(x.transpose(0, 1)[None] for x in (q, k, v)),
+                is_causal=True,
+                scale=module.scale,
+                enable_gqa=True,
+            )[0].transpose(0, 1)
+
+        inputs = [x.to(dtype).requires_grad_() for x in references]
+        output = per_request(attend, meta, *inputs)
+        return torch.autograd.grad(output, inputs, upstream.to(dtype))
+
+    old = sdpa_vjp(torch.bfloat16)
+    with sdpa_kernel(SDPBackend.MATH):
+        reference = sdpa_vjp(torch.float64)
+    assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind)
