@@ -592,9 +592,10 @@ def test_direct_query_fp8_quant_matches_vllm_quant_fp8_bitwise(vllm_oracle_runti
 
 @cuda
 @pytest.mark.gpus(1, min_architecture="blackwell")
-def test_routed_vjp_on_the_humming_deployment_at_updated_weights():
+def test_routed_vjp_on_the_humming_deployment_at_updated_weights(monkeypatch):
     """The training VJP on the real deployment, at theta0 and two updated
     snapshots whose deployment is requantized from the updated masters."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
     from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
         EP4_ONESIDED_REDUCTION,
@@ -1073,7 +1074,9 @@ def test_capability_seeding_resolves_restricted_and_reordered_device_lists():
 
 
 # EP4 tests run four ranks in subprocesses so a plain pytest invocation works.
-EP4_ROWS = ((513, 7, 64, 1), (8192, 4096, 1, 2048))
+# Per-rank source rows; a source rank with no tokens, and (last case) routes
+# that avoid rank 3's experts, so it receives no rows.
+EP4_ROWS = ((513, 7, 64, 1), (8192, 4096, 1, 2048), (0, 7, 64, 1), (33, 5, 0, 17))
 # Workers start from the NCCL environment at collection (vLLM's
 # init_batch_invariance exports more). The GB200 image's gcp NET/env plugins
 # find no NIC in a test container; the spcx plugin falls back to sockets.
@@ -1177,9 +1180,10 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
     rows = rows_per_rank[rank]
     mine = torch.Generator(device="cuda").manual_seed(100 + rank)
     x = torch.randn(rows, 2688, generator=mine, device="cuda").to(torch.bfloat16)
-    ids = _route_ids(rows, mine)
+    experts = 96 if rows_per_rank is EP4_ROWS[-1] else 128
+    ids = _route_ids(rows, mine, experts=experts)
     weights = torch.rand(rows, 6, generator=mine, device="cuda")
-    expected = ep4_routed_experts(full, x, weights, ids, recipe)
+    expected = ep4_routed_experts(full, x, weights, ids, recipe) if rows else x.clone()
     with torch.no_grad():
         actual = ep._forward(owner._experts, owner.ep_group, x, ids, weights, recipe)[0]
     assert torch.equal(actual, expected), (rank, rows)
@@ -1191,8 +1195,15 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
         out = ep.EPRoutedExpertsVJP.apply(xs, up_local, down_local, ws, ids, owner)
         assert torch.equal(out, expected)
         grads.append(torch.autograd.grad(out, (xs, up_local, down_local, ws), dy))
-    for a, b in zip(*grads, strict=True):
-        assert torch.equal(a, b), "EP4 backward is not run-to-run deterministic"
+    # A retained graph runs the backward again from the same saved state.
+    xs, ws = x.clone().requires_grad_(), weights.clone().requires_grad_()
+    out = ep.EPRoutedExpertsVJP.apply(xs, up_local, down_local, ws, ids, owner)
+    inputs = (xs, up_local, down_local, ws)
+    grads.append(torch.autograd.grad(out, inputs, dy, retain_graph=True))
+    grads.append(torch.autograd.grad(out, inputs, dy))
+    for other in grads[1:]:
+        for a, b in zip(grads[0], other, strict=True):
+            assert torch.equal(a, b), "EP4 backward is not run-to-run deterministic"
 
     # Single-rank reference on the whole EP batch.
     all_x, start = _gather_rows(x)
@@ -1205,11 +1216,15 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
     )
     mine_rows = slice(start, start + rows)
     expect = (dx[mine_rows], d_up[mine_experts], d_down[mine_experts], d_w[mine_rows])
-    # Route gradients come from the visible outputs, bitwise as EP1.
+    # Route gradients come from the visible outputs, and the input gradient
+    # adds the same per-route rows in the same order: both bitwise as EP1.
     assert torch.equal(grads[0][3], expect[3])
-    # Only rounding differs: EP sums dx per rank first, and wgrad GEMMs see
-    # other row groupings.
-    for name, a, b in zip(("dx", "d_up", "d_down"), grads[0], expect):
+    assert torch.equal(grads[0][0], expect[0]), (rank, rows_per_rank)
+    # Only rounding differs: the wgrad GEMMs see other row groupings.
+    for name, a, b in zip(("d_up", "d_down"), grads[0][1:3], expect[1:3]):
+        if b.float().norm() == 0:
+            assert a.float().norm() == 0, name
+            continue
         error = ((a.float() - b.float()).norm() / b.float().norm()).item()
         assert error < 1e-2, (name, error)
 

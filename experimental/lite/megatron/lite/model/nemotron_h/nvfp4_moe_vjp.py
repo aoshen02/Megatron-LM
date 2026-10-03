@@ -27,7 +27,7 @@ def _te_grouped_gemm(lhs, rhs, out, *, layout, m_splits, single_output=False):
     )
 
 
-def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
+def routed_vjp(x, fc1, visible, up, down, routes, ids, dy, *, per_route=False):
     """ReLU2 routed experts: ``y = sum_s routes[:, s] * down(relu(up(x))**2)``.
 
     Per-input contract (as DeepSeek-V4's grouped MoE): the route-weight
@@ -45,12 +45,17 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
         ids: Expert ids, ``[M, topk]``; ``-1`` marks a route held elsewhere
             (zero gradients for it).
         dy: BF16 output gradient, ``[M, K]``.
+        per_route: Return the input gradient of every route, ``[M, topk, K]``
+            (zero for absent routes), instead of their sum.
 
     Returns:
         ``(dx, d_up, d_down, d_routes)``.
     """
     m, k = x.shape
     topk, experts = ids.shape[1], up.shape[0]
+    if m == 0:
+        dx = x.new_zeros(0, topk, k) if per_route else torch.zeros_like(x)
+        return dx, torch.zeros_like(up), torch.zeros_like(down), routes.new_zeros(0, topk)
     flat = ids.reshape(-1).long()
     held = int((flat >= 0).sum())
     # Absent routes sort first (as -1) and are dropped.
@@ -81,9 +86,9 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
     d_up = torch.zeros_like(up)
     _te_grouped_gemm(split(x_rows), split(du), d_up.unbind(0), layout="NT",
                      m_splits=counts)
-    per_route = dx_rows.new_zeros(m * topk, k).index_copy_(0, order, dx_rows).view(m, topk, k)
-    dx = sum_route_grads(per_route)
+    routes_dx = dx_rows.new_zeros(m * topk, k).index_copy_(0, order, dx_rows).view(m, topk, k)
     d_routes = d_weight.new_zeros(m * topk).index_copy_(0, order, d_weight).view(m, topk)
+    dx = routes_dx if per_route else sum_route_grads(routes_dx)
     return dx.to(x.dtype), d_up, d_down, d_routes
 
 

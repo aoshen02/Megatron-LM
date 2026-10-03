@@ -7,21 +7,55 @@ directions. The expert rank computes its local Humming routes and its BF16
 partial (``moe_fused_mul_sum`` over its slots), the partial returns to the
 source rank, and the source rank reduces the partials in the serving order
 (``nvfp4_ep4.reduce_ep4_parts``). The backward sends the output gradient over
-the same rows, runs ``routed_vjp`` on the local experts, and sums the returned
-input/route gradients on the source rank in rank order.
+the same rows and runs ``routed_vjp`` on the local experts; the input
+gradient of every route returns unsummed, and the source rank adds a token's
+routes in slot order with BF16 rounding after each add (DS4's deterministic
+scatter backward), as the single-rank VJP does.
 """
+
+import contextlib
+import socket
 
 import torch
 import torch.distributed as dist
 
 from .nvfp4_ep4 import reduce_ep4_parts
-from .nvfp4_moe_vjp import routed_vjp
+from .nvfp4_moe_vjp import routed_vjp, sum_route_grads
 
 _buffer = None
 # Normal-mode intranode combine needs the row width (16-byte units) to be a
 # multiple of the 32 warp lanes: 256 BF16. Lightning's 2688 is not; combine
 # rows are zero-padded and sliced back, which is exact.
 _COMBINE_ALIGN = 256
+# The DeepEP build (DEEPEP_NUM_MAX_NVL_PEERS) and the buffer below are NVLink
+# only: no RDMA buffer is allocated.
+_MAX_NVL_PEERS = 4
+
+
+@contextlib.contextmanager
+def _deepep_memory():
+    """Turn off PyTorch's deterministic fill of new allocations for DeepEP calls.
+
+    The fill writes NaN into buffers DeepEP's kernels are concurrently filling;
+    restored on exit, so other code keeps the caller's setting.
+    """
+    fill = torch.utils.deterministic.fill_uninitialized_memory
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    try:
+        yield
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = fill
+
+
+def _check_intranode(group):
+    size = dist.get_world_size(group)
+    hosts = [None] * size
+    dist.all_gather_object(hosts, socket.gethostname(), group=group)
+    if size > _MAX_NVL_PEERS or len(set(hosts)) != 1:
+        raise RuntimeError(
+            f"DeepEP EP group must be one NVLink node of at most {_MAX_NVL_PEERS} "
+            f"ranks (no RDMA buffer); got {size} ranks on {sorted(set(hosts))}"
+        )
 
 
 def _deepep_buffer(group, hidden_bytes):
@@ -29,12 +63,6 @@ def _deepep_buffer(group, hidden_bytes):
     import deep_ep
 
     global _buffer
-    if (
-        torch.are_deterministic_algorithms_enabled()
-        and torch.utils.deterministic.fill_uninitialized_memory
-    ):
-        # Deterministic debug fill races DeepEP's own writes.
-        torch.utils.deterministic.fill_uninitialized_memory = False
     size = dist.get_world_size(group)
     nvl_bytes = max(
         config.get_nvl_buffer_size_hint(hidden_bytes, size)
@@ -44,6 +72,8 @@ def _deepep_buffer(group, hidden_bytes):
         )
     )
     if _buffer is None or _buffer.group != group or _buffer.num_nvl_bytes < nvl_bytes:
+        if _buffer is None or _buffer.group != group:
+            _check_intranode(group)
         deep_ep.Buffer.set_num_sms(20)
         _buffer = deep_ep.Buffer(
             group=group, num_nvl_bytes=nvl_bytes, num_rdma_bytes=0,
@@ -102,20 +132,26 @@ def _expert_ids(experts, recv_idx):
 
 def _forward(experts, group, x, ids, weights, recipe):
     plan = _Plan(ids, dist.get_world_size(group), experts.num_experts)
-    width = x.shape[1] + (-x.shape[1] % _COMBINE_ALIGN)
-    buffer = _deepep_buffer(group, width * x.element_size())
-    recv_x, recv_idx, recv_w, handle = _dispatch(
-        buffer, plan, x, weights, experts.global_num_experts
-    )
-    tokens = torch.tensor([x.shape[0]], device=x.device)
-    dist.all_reduce(tokens, group=group)
-    global_ids = _expert_ids(experts, recv_idx)
-    fc1, down = experts.routes(recv_x, global_ids, global_tokens=int(tokens.item()))
-    partial = experts.rank_partial(down, recv_w, global_ids, experts.expert_map)
-    returned, _ = _combine(buffer, partial, handle)
+    # The backward returns one row of topk per-route input gradients.
+    width = ids.shape[1] * x.shape[1]
+    width += -width % _COMBINE_ALIGN
+    with _deepep_memory():
+        buffer = _deepep_buffer(group, width * x.element_size())
+        recv_x, recv_idx, recv_w, handle = _dispatch(
+            buffer, plan, x, weights, experts.global_num_experts
+        )
+        tokens = torch.tensor([x.shape[0]], device=x.device)
+        dist.all_reduce(tokens, group=group)
+        global_ids = _expert_ids(experts, recv_idx)
+        fc1, down = experts.routes(recv_x, global_ids, global_tokens=int(tokens.item()))
+        if recv_x.shape[0]:
+            partial = experts.rank_partial(down, recv_w, global_ids, experts.expert_map)
+        else:
+            partial = recv_x.new_empty(0, recv_x.shape[1])
+        returned, _ = _combine(buffer, partial, handle)
     parts = x.new_zeros(plan.ep_size, x.shape[0], x.shape[1])
-    for r, rows, tokens in plan.per_rank():
-        parts[r].index_copy_(0, tokens, returned.index_select(0, rows))
+    for r, rows, token in plan.per_rank():
+        parts[r].index_copy_(0, token, returned.index_select(0, rows))
     out = reduce_ep4_parts(list(parts.unbind(0)), ids, recipe)
     return out, (plan, buffer, handle, recv_x, recv_idx, recv_w, fc1, down)
 
@@ -137,24 +173,35 @@ class EPRoutedExpertsVJP(torch.autograd.Function):
         if ctx.owner.weights._versions() != ctx.versions:
             raise RuntimeError("Expert masters changed before backward")
         up, down = ctx.saved_tensors
+        # Kept (not cleared) so a retained graph can run backward again.
         plan, buffer, handle, recv_x, recv_idx, recv_w, fc1, visible = ctx.state
-        ctx.state = None
+        m, k = ctx.x_shape
+        topk = plan.ids.shape[1]
         rows_dy = dy.to(torch.bfloat16).index_select(0, plan.token).contiguous()
-        recv_dy, *_ = buffer.dispatch(rows_dy, handle=handle)
-        dx_rows, d_up, d_down, dw_rows = routed_vjp(
-            recv_x, fc1, visible.view(-1, visible.shape[-1]), up, down, recv_w,
-            recv_idx, recv_dy,
-        )
-        returned_dx, returned_dw = _combine(
-            buffer, dx_rows, handle, topk_weights=dw_rows.float()
-        )
-        dx = dy.new_zeros(ctx.x_shape, dtype=torch.float32)
-        d_routes = dy.new_zeros((plan.tokens, plan.ids.shape[1]), dtype=torch.float32)
-        returned_dw = torch.where(plan.owned, returned_dw, 0.0)
-        for _, rows, tokens in plan.per_rank():
-            dx.index_add_(0, tokens, returned_dx.index_select(0, rows).float())
-            d_routes.index_add_(0, tokens, returned_dw.index_select(0, rows))
-        return dx.to(torch.bfloat16), d_up, d_down, d_routes, None, None
+        with _deepep_memory():
+            recv_dy, *_ = buffer.dispatch(rows_dy, handle=handle)
+            dx_routes, d_up, d_down, dw_rows = routed_vjp(
+                recv_x, fc1, visible.view(-1, k), up, down, recv_w, recv_idx, recv_dy,
+                per_route=True,
+            )
+            returned_dx, returned_dw = _combine(
+                buffer, dx_routes.view(-1, topk * k), handle, topk_weights=dw_rows.float()
+            )
+        # One owner per (token, slot): place each route's gradient, then add a
+        # token's routes in slot order as DS4 does.
+        routes_dx = dy.new_zeros((m, topk, k), dtype=torch.bfloat16)
+        d_routes = dy.new_zeros((m, topk), dtype=torch.float32)
+        returned_dx = returned_dx.view(-1, topk, k)
+        for _, rows, token in plan.per_rank():
+            owned = plan.owned.index_select(0, rows)
+            current = routes_dx.index_select(0, token)
+            routes_dx.index_copy_(
+                0, token,
+                torch.where(owned[..., None], returned_dx.index_select(0, rows), current),
+            )
+            weights = torch.where(owned, returned_dw.index_select(0, rows), 0.0)
+            d_routes.index_add_(0, token, weights)
+        return sum_route_grads(routes_dx), d_up, d_down, d_routes, None, None
 
 
 def ep_routed_experts(owner, x, ids, routes, *, grad):
