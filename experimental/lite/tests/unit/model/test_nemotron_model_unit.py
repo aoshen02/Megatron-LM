@@ -136,3 +136,87 @@ def test_bf16_linear_vjp_within_bf16_noise_floor(kind):
         upstream.double(),
     )
     assert_within_noise_floor(("dx", "dweight"), actual, old, reference, kind)
+
+
+def _old_rms(x, weight, eps):
+    y = x.float()
+    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
+    return weight * y.to(x.dtype)
+
+
+def _old_residual_rms(x, residual, weight, eps):
+    y = x.float() + residual.float()
+    residual_out = y.to(weight.dtype)
+    y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + eps)
+    return y.to(weight.dtype) * weight, residual_out
+
+
+def _old_gated_rms(x, gate, weight, group_size, eps):
+    y = x.float() * torch.nn.functional.silu(gate.float())
+    groups = y.unflatten(-1, (-1, group_size))
+    groups = groups * torch.rsqrt(groups.square().mean(-1, keepdim=True) + eps)
+    return weight * groups.flatten(-2).to(x.dtype)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+@pytest.mark.parametrize("norm", ["rms", "residual_rms", "gated_rms"])
+def test_rms_norm_vjp_within_bf16_noise_floor(norm, kind):
+    """Lightning widths: hidden 2688; Mamba inner 4096 in 8 groups."""
+    from megatron.lite.model.nemotron_h.functional import GatedRMSNorm, RMSNorm
+    from test_nemotron_mamba_unit import assert_within_noise_floor, upstream_gradient
+
+    torch.manual_seed(0)
+    eps, tokens = 1e-5, 1506
+    width = 4096 if norm == "gated_rms" else 2688
+    module = (
+        GatedRMSNorm(width, 512, eps, device="cuda", dtype=torch.bfloat16)
+        if norm == "gated_rms"
+        else RMSNorm(width, eps, device="cuda")
+    )
+    with torch.no_grad():
+        module.weight.copy_(torch.empty(width).uniform_(0.5, 1.5))
+    leaves = [torch.randn(tokens, width, device="cuda") for _ in range(2)]
+    leaves = [*(leaves[:1] if norm == "rms" else leaves), module.weight.float()]
+
+    def old(*inputs):
+        if norm == "rms":
+            return _old_rms(*inputs, eps)
+        if norm == "residual_rms":
+            return torch.cat(_old_residual_rms(*inputs, eps), -1)
+        return _old_gated_rms(*inputs, 512, eps)
+
+    def cast(dtype):
+        return [t.detach().to(dtype).requires_grad_() for t in leaves]
+
+    inputs = [*cast(torch.bfloat16)[:-1], module.weight]
+    with torch.no_grad():
+        visible = module(*inputs[:-1])
+    output = module(*inputs[:-1])
+    if norm == "residual_rms":
+        assert all(map(torch.equal, output, visible))
+        output = torch.cat(output, -1)
+    else:
+        assert torch.equal(output, visible)
+    upstream = upstream_gradient(kind, output)
+    actual = torch.autograd.grad(output, inputs, upstream)
+    old_inputs, reference_inputs = cast(torch.bfloat16), cast(torch.float64)
+    expected = torch.autograd.grad(old(*old_inputs), old_inputs, upstream)
+    reference = torch.autograd.grad(
+        old(*reference_inputs), reference_inputs, upstream.double()
+    )
+    names = {"rms": ("dx",), "residual_rms": ("dx", "dresidual")}
+    names = (*names.get(norm, ("dx", "dgate")), "dweight")
+    assert_within_noise_floor(names, actual, expected, reference, kind)
+
+
+@pytest.mark.gpus(1)
+def test_parameter_mutation_before_backward_is_rejected():
+    from megatron.lite.model.nemotron_h.functional import RMSNorm
+
+    norm = RMSNorm(64, 1e-5, device="cuda")
+    output = norm(torch.randn(4, 64, device="cuda", dtype=torch.bfloat16))
+    with torch.no_grad():
+        norm.weight.add_(1)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        output.sum().backward()

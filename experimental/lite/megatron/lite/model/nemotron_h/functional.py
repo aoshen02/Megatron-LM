@@ -104,6 +104,128 @@ def projection(x, module):
     raise TypeError(f"Unsupported Nemotron projection: {type(module).__name__}")
 
 
+def compiled_vjp_or_eager(compiled, eager, *args):
+    if not any(isinstance(arg, torch.Tensor) and arg.is_cuda for arg in args):
+        return eager(*args)
+    try:
+        return compiled(*args)
+    except torch._dynamo.exc.FailOnRecompileLimitHit:
+        return eager(*args)
+
+
+def _rms_norm_vjp(grad_output, value, weight, eps):
+    x = value.float()
+    w = weight.float()
+    grad = grad_output.float()
+    rstd = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+    scaled_grad = grad * w
+    correction = (scaled_grad * x).mean(dim=-1, keepdim=True)
+    grad_value = (scaled_grad * rstd - x * rstd.pow(3) * correction).to(value.dtype)
+    reduce_dims = tuple(range(grad.ndim - 1))
+    grad_weight = (grad * x * rstd).sum(dim=reduce_dims).to(weight.dtype)
+    return grad_value, grad_weight
+
+
+def _residual_rms_norm_vjp(grad_output, grad_residual, x, residual, weight, eps):
+    grad_sum, grad_weight = _rms_norm_vjp(
+        grad_output, x.float() + residual.float(), weight, eps
+    )
+    grad_sum = grad_sum + grad_residual.float()
+    return grad_sum.to(x.dtype), grad_sum.to(residual.dtype), grad_weight
+
+
+def _gated_rms_norm_vjp(grad_output, x, gate, weight, group_size, eps):
+    g = gate.float()
+    sigmoid = torch.sigmoid(g)
+    groups = (x.float() * g * sigmoid).unflatten(-1, (-1, group_size))
+    rstd = torch.rsqrt(groups.square().mean(dim=-1, keepdim=True) + eps)
+    normalized = groups * rstd
+    grad = grad_output.float()
+    scaled_grad = (grad * weight.float()).unflatten(-1, (-1, group_size))
+    correction = (scaled_grad * normalized).mean(dim=-1, keepdim=True)
+    grad_y = ((scaled_grad - normalized * correction) * rstd).flatten(-2)
+    grad_x = (grad_y * g * sigmoid).to(x.dtype)
+    grad_gate = (grad_y * x.float() * sigmoid * (1 + g * (1 - sigmoid))).to(gate.dtype)
+    reduce_dims = tuple(range(grad.ndim - 1))
+    grad_weight = (grad * normalized.flatten(-2)).sum(dim=reduce_dims).to(weight.dtype)
+    return grad_x, grad_gate, grad_weight
+
+
+_compiled_rms_norm_vjp = torch.compile(_rms_norm_vjp, fullgraph=True, dynamic=False)
+_compiled_residual_rms_norm_vjp = torch.compile(
+    _residual_rms_norm_vjp, fullgraph=True, dynamic=False
+)
+_compiled_gated_rms_norm_vjp = torch.compile(
+    _gated_rms_norm_vjp, fullgraph=True, dynamic=False
+)
+
+
+class _RMSNormVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible, value, weight, eps):
+        ctx.save_for_backward(value, weight)
+        ctx.eps, ctx.versions = eps, parameter_versions((weight,))
+        return visible(value, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        value, weight = ctx.saved_tensors
+        check_parameter_versions((weight,), ctx.versions)
+        grad_value, grad_weight = compiled_vjp_or_eager(
+            _compiled_rms_norm_vjp, _rms_norm_vjp, grad_output, value, weight, ctx.eps
+        )
+        return None, grad_value, grad_weight, None
+
+
+class _ResidualRMSNormVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible, x, residual, weight, eps):
+        ctx.save_for_backward(x, residual, weight)
+        ctx.eps, ctx.versions = eps, parameter_versions((weight,))
+        return visible(x, residual, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_residual):
+        x, residual, weight = ctx.saved_tensors
+        check_parameter_versions((weight,), ctx.versions)
+        grads = compiled_vjp_or_eager(
+            _compiled_residual_rms_norm_vjp,
+            _residual_rms_norm_vjp,
+            grad_output,
+            grad_residual,
+            x,
+            residual,
+            weight,
+            ctx.eps,
+        )
+        return None, *grads, None
+
+
+class _GatedRMSNormVJP(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible, x, gate, weight, group_size, eps):
+        ctx.save_for_backward(x, gate, weight)
+        ctx.group_size, ctx.eps = group_size, eps
+        ctx.versions = parameter_versions((weight,))
+        return visible(x, gate, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, gate, weight = ctx.saved_tensors
+        check_parameter_versions((weight,), ctx.versions)
+        grads = compiled_vjp_or_eager(
+            _compiled_gated_rms_norm_vjp,
+            _gated_rms_norm_vjp,
+            grad_output,
+            x,
+            gate,
+            weight,
+            ctx.group_size,
+            ctx.eps,
+        )
+        return None, *grads, None, None
+
+
 class GatedRMSNorm(torch.nn.Module):
     def __init__(self, width, group_size, eps, *, device=None, dtype=None):
         super().__init__()
@@ -116,15 +238,11 @@ class GatedRMSNorm(torch.nn.Module):
         def visible(x, gate, weight):
             return gated_forward(x, gate, weight, self.group_size, self.eps)
 
-        def native(x, gate, weight):
-            y = x.float() * torch.nn.functional.silu(gate.float())
-            groups = y.unflatten(-1, (-1, self.group_size))
-            groups = groups * torch.rsqrt(
-                groups.square().mean(-1, keepdim=True) + self.eps
-            )
-            return weight * groups.flatten(-2).to(x.dtype)
-
-        return visible_forward(visible, native, x, gate, self.weight)
+        if not torch.is_grad_enabled():
+            return visible(x, gate, self.weight)
+        return _GatedRMSNormVJP.apply(
+            visible, x, gate, self.weight, self.group_size, self.eps
+        )
 
 
 class RMSNorm(torch.nn.Module):
@@ -143,20 +261,13 @@ class RMSNorm(torch.nn.Module):
             def visible(x, weight):
                 return rms_forward(x, weight, self.eps)
 
-            def native(x, weight):
-                y = x.float()
-                y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + self.eps)
-                return weight * y.to(x.dtype)
-
-            return visible_forward(visible, native, x, self.weight)
+            if not torch.is_grad_enabled():
+                return visible(x, self.weight)
+            return _RMSNormVJP.apply(visible, x, self.weight, self.eps)
 
         def visible(x, residual, weight):
             return rms_forward(x, weight, self.eps, residual)
 
-        def native(x, residual, weight):
-            y = x.float() + residual.float()
-            residual_out = y.to(weight.dtype)
-            y = y * torch.rsqrt(y.square().mean(-1, keepdim=True) + self.eps)
-            return y.to(weight.dtype) * weight, residual_out
-
-        return visible_forward(visible, native, x, residual, self.weight)
+        if not torch.is_grad_enabled():
+            return visible(x, residual, self.weight)
+        return _ResidualRMSNormVJP.apply(visible, x, residual, self.weight, self.eps)
