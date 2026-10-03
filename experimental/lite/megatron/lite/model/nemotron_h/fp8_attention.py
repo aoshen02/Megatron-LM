@@ -37,8 +37,8 @@ class Fa4Fp8KVAttention(torch.nn.Module):
     """Serving FA4 over the static FP8 KV cache, with a FlashAttention VJP.
 
     Replays ``vllm.model_executor.models.nemotron_h_fa4``: FP8 query and
-    KV-cache quantization with fixed scales, one 6768-token page per request
-    slot and the fixed split-KV schedule. The VJP is the FlashAttention varlen
+    KV-cache quantization with fixed scales, serving's 6768-token pages and
+    the fixed split-KV schedule. The VJP is the FlashAttention varlen
     backward on the dequantized Q/K/V with the visible output and LSE (an
     identity straight-through estimator for the quantization). Supports TP1
     causal packed sequences starting at zero, without prefix sharing or
