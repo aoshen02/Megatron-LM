@@ -68,10 +68,10 @@ def validate_proxy_config(config, impl):
     full_depth = config.num_hidden_layers not in (4, 5)
     if impl.optimizer_config is None:
         raise ValueError("Quantized proxy requires explicit optimizer_config")
-    if any(value != 1 for value in (p.tp, p.etp or 1, p.ep, p.cp, p.vpp)):
-        raise ValueError("Quantized proxy requires TP/ETP/EP/CP/VPP1")
-    if p.pp not in (1, 4):
-        raise ValueError("Quantized Nemotron supports PP1 or PP4")
+    if any(value != 1 for value in (p.tp, p.etp or 1, p.cp, p.vpp)):
+        raise ValueError("Quantized proxy requires TP/ETP/CP/VPP1")
+    if (p.pp, p.ep) not in ((1, 1), (4, 1), (1, 4)):
+        raise ValueError("Quantized Nemotron supports PP1/EP1, PP4/EP1 or PP1/EP4")
     if impl.routed_forward_reduction is None:
         raise ValueError(
             "Quantized Nemotron requires routed_forward_reduction (the rollout's "
@@ -130,9 +130,9 @@ def _check_runtime(ps):
         raise RuntimeError("Quantized proxy requires BI=1 before startup")
     if (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != ps.pp_size
+        or torch.distributed.get_world_size() != ps.pp_size * ps.ep_size
     ):
-        raise RuntimeError("Torch world must match the pipeline size")
+        raise RuntimeError("Torch world must be PP x EP")
 
 
 def stage_quantization_contract(config, layer_range):
@@ -191,10 +191,14 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             intermediate_size=config.moe_intermediate_size,
             tp_size=ps.tp_size,
             ep_size=ps.ep_size,
+            ep_rank=ps.ep_rank,
             device=device,
         )
         return Nvfp4RoutedDeployment(
-            weights, config, routed_forward_reduction=impl.routed_forward_reduction
+            weights,
+            config,
+            routed_forward_reduction=impl.routed_forward_reduction,
+            ep_group=ps.ep_group if ps.ep_size > 1 else None,
         )
 
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)

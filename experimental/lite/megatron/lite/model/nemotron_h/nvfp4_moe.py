@@ -16,7 +16,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     keep its visible FC1 output for ``nvfp4_moe_vjp.routed_vjp``.
     """
 
-    def __init__(self, weights, model_config, *, routed_forward_reduction):
+    def __init__(self, weights, model_config, *, routed_forward_reduction, ep_group=None):
         super().__init__()
         from .nvfp4_ep4 import validate_reduction
 
@@ -36,6 +36,9 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             raise ValueError("Expected matching bias-free ReLU2 expert geometry")
         if not 1 <= model_config.num_experts_per_tok <= weights.num_experts:
             raise ValueError("Invalid top-k expert count")
+        self.ep_group = ep_group
+        if (weights.num_local != weights.num_experts) != (ep_group is not None):
+            raise ValueError("EP experts need the EP group, and only they")
         if (
             weights.num_experts, model_config.hidden_size,
             model_config.moe_intermediate_size, model_config.num_experts_per_tok,
@@ -80,7 +83,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
                 for projection in ("up_proj", "down_proj")
             ),
             num_experts=self.config.n_routed_experts,
-            offset=0,
+            offset=w.offset,
             layer_name=w.prefix,
         )
         self._deployed_versions = w._versions()
@@ -102,6 +105,11 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             t.requires_grad
             for t in (x, routing_weights, self.weights.up_proj, self.weights.down_proj)
         )
+        if self.ep_group is not None:
+            from .ep import ep_routed_experts
+
+            self._check_inputs(x, ids, routing_weights)
+            return ep_routed_experts(self, x, ids, routing_weights, grad=active_grad)
         if not active_grad:
             return self._visible(x, ids, routing_weights)
         return RoutedExpertsVJP.apply(
@@ -109,6 +117,19 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         )
 
     def _visible(self, x, ids, routing_weights, *, return_fc1=False):
+        self._check_inputs(x, ids, routing_weights)
+        if x.shape[0] == 0:
+            if return_fc1:
+                raise ValueError("Routed training requires at least one token")
+            return torch.empty_like(x)
+        from .nvfp4_ep4 import ep4_routed_experts
+
+        return ep4_routed_experts(
+            self._experts, x, routing_weights, ids,
+            self.routed_forward_reduction, return_fc1=return_fc1,
+        )
+
+    def _check_inputs(self, x, ids, routing_weights):
         self._validate_checkpoint()
         if not self._ready or self.weights._versions() != self._deployed_versions:
             raise RuntimeError("Refresh deployment before routed forward")
@@ -136,13 +157,3 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             or (ids >= c.n_routed_experts).any()
         ):
             raise ValueError("Nonfinite input or out-of-range expert IDs")
-        if x.shape[0] == 0:
-            if return_fc1:
-                raise ValueError("Routed training requires at least one token")
-            return torch.empty_like(x)
-        from .nvfp4_ep4 import ep4_routed_experts
-
-        return ep4_routed_experts(
-            self._experts, x, routing_weights, ids,
-            self.routed_forward_reduction, return_fc1=return_fc1,
-        )

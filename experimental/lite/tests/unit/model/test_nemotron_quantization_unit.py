@@ -1070,3 +1070,204 @@ def test_capability_seeding_resolves_restricted_and_reordered_device_lists():
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="1,0", CUDA_DEVICE_ORDER="PCI_BUS_ID")
     result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
     assert result.stdout.strip().endswith("ok"), result.stderr[-2000:]
+
+
+# EP4 tests run four ranks in subprocesses so a plain pytest invocation works.
+EP4_ROWS = ((513, 7, 64, 1), (8192, 4096, 1, 2048))
+# Workers start from the NCCL environment at collection (vLLM's
+# init_batch_invariance exports more). The GB200 image's gcp NET/env plugins
+# find no NIC in a test container; the spcx plugin falls back to sockets.
+_COLLECTION_NCCL_ENV = {k: v for k, v in __import__("os").environ.items() if "NCCL" in k}
+
+
+def _spawn_ep4(worker, *args):
+    import socket
+
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four GPUs")
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    mp.spawn(worker, args=(port, _COLLECTION_NCCL_ENV, *args), nprocs=4, join=True)
+
+
+def _init_ep4_rank(rank, port, nccl_env):
+    import os
+
+    import torch.distributed as dist
+
+    for name in [k for k in os.environ if "NCCL" in k]:
+        del os.environ[name]
+    os.environ.update(nccl_env)
+    if os.environ.get("NCCL_NET_PLUGIN") == "gcp":
+        for name in ("NCCL_ENV_PLUGIN", "NCCL_PROFILER_PLUGIN", "NCCL_TUNER_CONFIG_PATH"):
+            os.environ.pop(name, None)
+        os.environ["NCCL_NET_PLUGIN"] = "spcx"
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4
+    )
+
+
+def _gather_rows(tensor):
+    import torch.distributed as dist
+
+    sizes = [None] * 4
+    dist.all_gather_object(sizes, tensor.shape[0])
+    out = [tensor.new_empty(n, *tensor.shape[1:]) for n in sizes]
+    dist.all_gather(out, tensor.contiguous())
+    return torch.cat(out), sum(sizes[: dist.get_rank()])
+
+
+def _ep4_deepep_worker(rank, port, nccl_env):
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from megatron.lite.model.nemotron_h import ep
+    from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
+    from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
+        EP4_ONESIDED_REDUCTION,
+        ep4_routed_experts,
+    )
+    from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import routed_vjp
+
+    _init_ep4_rank(rank, port, nccl_env)
+    g = torch.Generator(device="cuda").manual_seed(2)
+    up = (torch.randn(128, 1856, 2688, generator=g, device="cuda") * 0.02).bfloat16()
+    down = (torch.randn(128, 2688, 1856, generator=g, device="cuda") * 0.02).bfloat16()
+    mine_experts = slice(rank * 32, (rank + 1) * 32)
+    # theta0 and two updated snapshots; the deployment follows the masters.
+    for snapshot in range(3):
+        if snapshot:
+            up = up + (torch.randn(up.shape, generator=g, device="cuda") * 1e-3).bfloat16()
+            down = down + (torch.randn(down.shape, generator=g, device="cuda") * 1e-3).bfloat16()
+        stacks = {}
+        for stem, master in (("w13", up), ("w2", down)):
+            parts = [requantize("W4A16_NVFP4", master[e]) for e in range(128)]
+            stacks[stem] = tuple(
+                torch.stack([q[name] for q in parts])
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            )
+        full = HummingRoutedExperts(
+            stacks["w13"], stacks["w2"], num_experts=128, offset=0, layer_name="experts"
+        )
+        local = HummingRoutedExperts(
+            *(tuple(t[mine_experts] for t in stacks[s]) for s in ("w13", "w2")),
+            num_experts=128, offset=rank * 32, layer_name="experts",
+        )
+        up_local = up[mine_experts].clone().requires_grad_()
+        down_local = down[mine_experts].clone().requires_grad_()
+        owner = SimpleNamespace(
+            _experts=local, ep_group=dist.group.WORLD,
+            routed_forward_reduction=EP4_ONESIDED_REDUCTION,
+            weights=SimpleNamespace(_versions=lambda: 0),
+        )
+        for rows_per_rank in EP4_ROWS if snapshot == 0 else EP4_ROWS[:1]:
+            _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
+                            down_local, mine_experts, ep4_routed_experts, routed_vjp,
+                            EP4_ONESIDED_REDUCTION)
+    dist.destroy_process_group()
+
+
+def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
+                    down_local, mine_experts, ep4_routed_experts, routed_vjp, recipe):
+    rows = rows_per_rank[rank]
+    mine = torch.Generator(device="cuda").manual_seed(100 + rank)
+    x = torch.randn(rows, 2688, generator=mine, device="cuda").to(torch.bfloat16)
+    ids = _route_ids(rows, mine)
+    weights = torch.rand(rows, 6, generator=mine, device="cuda")
+    expected = ep4_routed_experts(full, x, weights, ids, recipe)
+    with torch.no_grad():
+        actual = ep._forward(owner._experts, owner.ep_group, x, ids, weights, recipe)[0]
+    assert torch.equal(actual, expected), (rank, rows)
+
+    dy = torch.randn(rows, 2688, generator=mine, device="cuda").to(torch.bfloat16)
+    grads = []
+    for _ in range(2):
+        xs, ws = x.clone().requires_grad_(), weights.clone().requires_grad_()
+        out = ep.EPRoutedExpertsVJP.apply(xs, up_local, down_local, ws, ids, owner)
+        assert torch.equal(out, expected)
+        grads.append(torch.autograd.grad(out, (xs, up_local, down_local, ws), dy))
+    for a, b in zip(*grads, strict=True):
+        assert torch.equal(a, b), "EP4 backward is not run-to-run deterministic"
+
+    # Single-rank reference on the whole EP batch.
+    all_x, start = _gather_rows(x)
+    all_ids, _ = _gather_rows(ids)
+    all_w, _ = _gather_rows(weights)
+    all_dy, _ = _gather_rows(dy)
+    fc1, visible = full.routes(all_x, all_ids)
+    dx, d_up, d_down, d_w = routed_vjp(
+        all_x, fc1, visible.view(-1, 2688), up, down, all_w, all_ids, all_dy
+    )
+    mine_rows = slice(start, start + rows)
+    expect = (dx[mine_rows], d_up[mine_experts], d_down[mine_experts], d_w[mine_rows])
+    # Route gradients come from the visible outputs, bitwise as EP1.
+    assert torch.equal(grads[0][3], expect[3])
+    # Only rounding differs: EP sums dx per rank first, and wgrad GEMMs see
+    # other row groupings.
+    for name, a, b in zip(("dx", "d_up", "d_down"), grads[0], expect):
+        error = ((a.float() - b.float()).norm() / b.float().norm()).item()
+        assert error < 1e-2, (name, error)
+
+
+@cuda
+@pytest.mark.gpus(4, min_architecture="blackwell")
+def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise():
+    """Real EP4 over DeepEP: forward equals the single-rank EP4 serving
+    reduction bitwise; backward is deterministic and matches the EP1 VJP."""
+    pytest.importorskip("deep_ep")
+    _spawn_ep4(_ep4_deepep_worker)
+
+
+def _flashinfer_combine_worker(rank, port, nccl_env):
+    import torch.distributed as dist
+    from flashinfer.comm import Mapping
+    from flashinfer.comm.comm_backend import TorchDistBackend
+    from flashinfer.comm.mnnvl import MnnvlConfig
+    from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
+    from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
+        EP4_ONESIDED_REDUCTION,
+        reduce_ep4_parts,
+    )
+
+    _init_ep4_rank(rank, port, nccl_env)
+    hidden, max_tokens = 2688, 1024
+    a2a = MoeAlltoAll(
+        Mapping(world_size=4, rank=rank, gpus_per_node=4, tp_size=4, moe_ep_size=4),
+        max_num_tokens=max_tokens, top_k=6, num_experts=128, hidden_size=hidden,
+        mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
+    )
+    for rows in ((513, 7, 64, 1), (1024, 1024, 300, 1))[0:2]:
+        mine = rows[rank]
+        g = torch.Generator(device="cuda").manual_seed(10 + rank)
+        ids = _route_ids(mine, g)
+        token = torch.arange(mine, dtype=torch.int32, device="cuda")[:, None]
+        recv_ids, recv_token = a2a.dispatch(ids, [ids, token], max(rows))
+
+        def partial(source, dest, tokens):
+            # The BF16 partial rank `dest` returns for `tokens` of `source`.
+            gen = torch.Generator(device="cuda").manual_seed(1000 * source + dest)
+            table = torch.randn(rows[source], hidden, generator=gen, device="cuda")
+            return table.to(torch.bfloat16)[tokens]
+
+        payload = torch.zeros(4, max(rows), hidden, dtype=torch.bfloat16, device="cuda")
+        for source in range(4):
+            valid = (recv_ids[source] // 32 == rank).any(1)
+            tokens = recv_token[source, :, 0].long().clamp(0, rows[source] - 1)
+            payload[source][valid] = partial(source, rank, tokens)[valid]
+        combined = a2a.combine(payload, max(rows))
+        parts = [partial(rank, dest, torch.arange(mine, device="cuda")) for dest in range(4)]
+        assert torch.equal(combined, reduce_ep4_parts(parts, ids, EP4_ONESIDED_REDUCTION))
+    dist.destroy_process_group()
+
+
+@cuda
+@pytest.mark.gpus(4, min_architecture="blackwell")
+def test_flashinfer_one_sided_combine_matches_ep4_reduction_bitwise():
+    """Guard against a FlashInfer upgrade changing the serving combine order."""
+    pytest.importorskip("flashinfer.comm.trtllm_moe_alltoall")
+    _spawn_ep4(_flashinfer_combine_worker)

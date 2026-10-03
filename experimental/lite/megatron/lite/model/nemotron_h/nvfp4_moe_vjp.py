@@ -42,7 +42,8 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
         visible: Visible expert output per route (same order), ``[M*topk, K]``.
         up, down: BF16 masters, ``[E, I, K]`` and ``[E, K, I]``.
         routes: FP32 routing weights, ``[M, topk]``.
-        ids: Expert ids, ``[M, topk]``.
+        ids: Expert ids, ``[M, topk]``; ``-1`` marks a route held elsewhere
+            (zero gradients for it).
         dy: BF16 output gradient, ``[M, K]``.
 
     Returns:
@@ -51,8 +52,10 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
     m, k = x.shape
     topk, experts = ids.shape[1], up.shape[0]
     flat = ids.reshape(-1).long()
-    order = torch.argsort(flat, stable=True)
-    counts = torch.bincount(flat, minlength=experts).tolist()
+    held = int((flat >= 0).sum())
+    # Absent routes sort first (as -1) and are dropped.
+    order = torch.argsort(flat, stable=True)[flat.numel() - held :]
+    counts = torch.bincount(flat[flat >= 0], minlength=experts).tolist()
     token = order // topk
     u = fc1.index_select(0, order)
     h = u.float().relu().square().to(torch.bfloat16)
@@ -78,9 +81,9 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
     d_up = torch.zeros_like(up)
     _te_grouped_gemm(split(x_rows), split(du), d_up.unbind(0), layout="NT",
                      m_splits=counts)
-    per_route = torch.empty_like(dx_rows).index_copy_(0, order, dx_rows).view(m, topk, k)
+    per_route = dx_rows.new_zeros(m * topk, k).index_copy_(0, order, dx_rows).view(m, topk, k)
     dx = sum_route_grads(per_route)
-    d_routes = torch.empty_like(d_weight).index_copy_(0, order, d_weight).view(m, topk)
+    d_routes = d_weight.new_zeros(m * topk).index_copy_(0, order, d_weight).view(m, topk)
     return dx.to(x.dtype), d_up, d_down, d_routes
 
 

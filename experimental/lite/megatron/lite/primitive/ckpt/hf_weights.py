@@ -846,12 +846,15 @@ def extract_layer_idx(name: str) -> int:
 
 
 def parse_expert_idx(name: str) -> int:
-    m = re.search(r"weight(\d+)$", name)
+    """Expert index of ``...weight<i>`` or HF-style ``...experts.<i>.`` names."""
+    m = re.search(r"weight(\d+)$", name) or re.search(r"\.experts\.(\d+)\.", name)
     return int(m.group(1)) if m else 0
 
 
 def set_expert_idx(name: str, idx: int) -> str:
-    return re.sub(r"weight\d+$", f"weight{idx}", name)
+    if re.search(r"weight\d+$", name):
+        return re.sub(r"weight\d+$", f"weight{idx}", name)
+    return re.sub(r"\.experts\.\d+\.", f".experts.{idx}.", name, count=1)
 
 
 def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:

@@ -22,20 +22,18 @@ def _routed_checkpoint_owners(model):
         if any(name.startswith(parent + ".") for parent in owners):
             continue
         if isinstance(module, Nvfp4RoutedDeployment | Nvfp4ExpertWeights):
-            if (
-                getattr(model.ps, "tp_size", 1) != 1
-                or model.ps.ep_size != 1
-                or model.ps.ep_rank != 0
-            ):
-                raise ValueError("Quantized routed checkpoint IO requires TP1/EP1")
+            if getattr(model.ps, "tp_size", 1) != 1:
+                raise ValueError("Quantized routed checkpoint IO requires TP1")
             weights = (
                 module.weights
                 if isinstance(module, Nvfp4RoutedDeployment)
                 else module
             )
+            local = model.config.n_routed_experts // model.ps.ep_size
             if (
                 weights.prefix != f"backbone.{name}"
                 or weights.num_experts != model.config.n_routed_experts
+                or (weights.num_local, weights.offset) != (local, model.ps.ep_rank * local)
             ):
                 raise ValueError("Routed checkpoint prefix/ownership mismatch")
             owners[name] = weights
@@ -112,8 +110,9 @@ class NemotronExport:
         for prefix, tensors in quantized.items():
             for suffix, tensor in tensors.items():
                 yield f"{prefix}.{suffix}", tensor
+        # EP shards use local expert numbers; the exporter gathers them.
         for weights in _routed_checkpoint_owners(model).values():
-            yield from weights.export_quantized().items()
+            yield from weights.export_quantized(local_names=model.ps.ep_size > 1).items()
 
 
 @torch.no_grad()
@@ -204,9 +203,9 @@ def _quantized_masters(model):
             yield prefix, algorithm, module.weight, module._tensors
     for weights in _routed_checkpoint_owners(model).values():
         for projection in ("up_proj", "down_proj"):
-            for expert in range(weights.num_experts):
+            for expert in range(weights.num_local):
                 yield (
-                    f"{weights.prefix}.{expert}.{projection}",
+                    f"{weights.prefix}.{weights.offset + expert}.{projection}",
                     "W4A16_NVFP4",
                     getattr(weights, projection)[expert],
                     lambda w=weights, p=projection, e=expert: (
@@ -550,12 +549,12 @@ def load_hf_weights(model, path):
                 check_reversible(algorithm, module.weight, module._tensors(), name)
         for weights in _routed_checkpoint_owners(model).values():
             for projection in ("up_proj", "down_proj"):
-                for expert in range(weights.num_experts):
+                for expert in range(weights.num_local):
                     check_reversible(
                         "W4A16_NVFP4",
                         getattr(weights, projection)[expert],
                         weights._checkpoint(projection, expert).tensors,
-                        f"{weights.prefix}.{expert}.{projection}",
+                        f"{weights.prefix}.{weights.offset + expert}.{projection}",
                     )
     for prefix, tensors in quantized.items():
         for suffix, deployed in tensors.items():

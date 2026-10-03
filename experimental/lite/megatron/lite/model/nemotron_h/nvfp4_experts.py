@@ -9,7 +9,10 @@ from .quantization import QuantizedWeight, load_quantized_weight, requantize
 
 
 class Nvfp4ExpertWeights(torch.nn.Module):
-    """TP1/EP1 BF16 masters and their NVFP4 deployment bytes, with explicit refresh.
+    """BF16 masters and NVFP4 deployment bytes of this EP rank's experts.
+
+    EP rank ``r`` owns the contiguous experts ``[r * E / EP, (r + 1) * E / EP)``,
+    stored at local indices.
 
     The deployment bytes are the checkpoint's until the first
     ``refresh_quantized`` with ``recompute_scales`` (after the first optimizer
@@ -33,11 +36,12 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         intermediate_size,
         tp_size=1,
         ep_size=1,
+        ep_rank=0,
         device="cpu",
     ):
         super().__init__()
-        if tp_size != 1 or ep_size != 1:
-            raise ValueError("NVFP4 expert checkpoint container requires TP1/EP1")
+        if tp_size != 1 or num_experts % ep_size or not 0 <= ep_rank < ep_size:
+            raise ValueError("NVFP4 experts require TP1 and EP dividing the experts")
         if (
             not isinstance(prefix, str)
             or not prefix.startswith("backbone.layers.")
@@ -53,6 +57,8 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                 "Both expert contraction dimensions must be positive multiples of 16"
             )
         self.prefix, self.num_experts = prefix, num_experts
+        self.num_local = num_experts // ep_size
+        self.offset = ep_rank * self.num_local
         self._geometry = {
             "up_proj": (intermediate_size, hidden_size),
             "down_proj": (hidden_size, intermediate_size),
@@ -88,23 +94,18 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             ("up_proj", intermediate_size, hidden_size),
             ("down_proj", hidden_size, intermediate_size),
         ):
-            master = torch.empty(
-                num_experts, rows, columns, dtype=torch.bfloat16, device=device
-            )
+            local = self.num_local
+            master = torch.empty(local, rows, columns, dtype=torch.bfloat16, device=device)
             packed = torch.empty(
-                num_experts, rows, columns // 2, dtype=torch.uint8, device=device
+                local, rows, columns // 2, dtype=torch.uint8, device=device
             )
             scales = torch.empty(
-                num_experts,
-                rows,
-                columns // 16,
-                dtype=torch.float8_e4m3fn,
-                device=device,
+                local, rows, columns // 16, dtype=torch.float8_e4m3fn, device=device
             )
-            global_scales = torch.empty(num_experts, dtype=torch.float32, device=device)
+            global_scales = torch.empty(local, dtype=torch.float32, device=device)
             shapes = []
-            for expert in range(num_experts):
-                name = f"{prefix}.{expert}.{projection}"
+            for expert in range(local):
+                name = f"{prefix}.{self.offset + expert}.{projection}"
                 checkpoint = load_quantized_weight(root, name, quantized_layers[name])
                 if checkpoint.tensors["weight"].shape != (rows, columns // 2):
                     raise ValueError(f"Wrong packed geometry for {name}")
@@ -141,10 +142,10 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         for projection, (rows, columns) in self._geometry.items():
             master = getattr(self, projection)
             specs = [
-                (master, (self.num_experts, rows, columns), torch.bfloat16),
+                (master, (self.num_local, rows, columns), torch.bfloat16),
                 (
                     getattr(self, f"_{projection}_packed"),
-                    (self.num_experts, rows, columns // 2),
+                    (self.num_local, rows, columns // 2),
                     torch.uint8,
                 ),
             ]
@@ -152,7 +153,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                 specs.append(
                     (
                         getattr(self, f"_{projection}_{suffix}"),
-                        (self.num_experts, rows, columns // 16),
+                        (self.num_local, rows, columns // 16),
                         torch.float8_e4m3fn,
                     )
                 )
@@ -160,7 +161,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                 specs.append(
                     (
                         getattr(self, f"_{projection}_{suffix}"),
-                        (self.num_experts,),
+                        (self.num_local,),
                         torch.float32,
                     )
                 )
@@ -208,7 +209,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         if self._requantized and not restore:
             for projection in ("up_proj", "down_proj"):
                 parameter = getattr(self, projection)
-                for expert in range(self.num_experts):
+                for expert in range(self.num_local):
                     tensors = requantize("W4A16_NVFP4", parameter[expert])
                     getattr(self, f"_{projection}_packed")[expert].copy_(tensors["weight"])
                     getattr(self, f"_{projection}_scale")[expert].copy_(
@@ -220,14 +221,19 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         self._synced_versions = self._versions()
         self._dirty = False
 
-    def export_quantized(self):
-        """Return independent tensors under complete original HF expert keys."""
+    def export_quantized(self, *, local_names=False):
+        """Return independent tensors under HF expert keys.
+
+        ``local_names`` numbers the experts locally, for an exporter that maps
+        EP shards to global indices.
+        """
         self._validate_storage()
         if self._dirty or self._versions() != self._synced_versions:
             raise RuntimeError("Refresh quantized expert weights after master updates")
+        base = 0 if local_names else self.offset
         return {
-            f"{self.prefix}.{expert}.{projection}.{suffix}": tensor.detach().clone()
-            for expert in range(self.num_experts)
+            f"{self.prefix}.{base + expert}.{projection}.{suffix}": tensor.detach().clone()
+            for expert in range(self.num_local)
             for projection in ("up_proj", "down_proj")
             for suffix, tensor in self._checkpoint(projection, expert).tensors.items()
         }

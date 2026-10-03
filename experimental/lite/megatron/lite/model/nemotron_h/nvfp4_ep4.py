@@ -41,7 +41,11 @@ def reduce_ep4_parts(parts, ids, recipe):
         duplicate = (owners[:, :slot] == rank[:, None]).any(dim=1)
         value = stacked[rank, rows]
         slots.append(torch.where(duplicate[:, None], 0, value).float())
-    # FlashInfer TOP_K=6 combines first-occurrence rank slots in FP32.
+    # FlashInfer 0.7.0 one-sided combine (csrc/nv_internal/tensorrt_llm/kernels/
+    # communicationKernels/moeAlltoAllKernels.cu): dispatch sends each token once
+    # per target rank, from the first top-k slot naming it (:495); combine loads
+    # that rank's partial for the first slot and FP32 zero for duplicates
+    # (:971); TOP_K=6 sums ((s0+s1)+(s2+s3))+(s4+s5) in FP32 (:1104-1115).
     total = ((slots[0] + slots[1]) + (slots[2] + slots[3])) + (slots[4] + slots[5])
     return total.to(torch.bfloat16)
 
