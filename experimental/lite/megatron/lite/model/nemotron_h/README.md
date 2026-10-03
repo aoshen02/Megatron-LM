@@ -33,7 +33,11 @@ rejects checkpoints without a `quantization_config`.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
   the BF16 masters and the BF16 inputs (`functional.native_linear_vjp`), and
   grouped BF16 GEMMs for the routed experts from the visible FC1 output
-  (`nvfp4_moe_vjp.routed_vjp`).
+  (`nvfp4_moe_vjp.routed_vjp`). Every other visible op has its own autograd
+  Function, as in the DeepSeek-V4 actor: closed-form compiled FP32 VJPs for
+  the RMSNorms, the mamba_ssm / causal_conv1d backwards for Mamba2, the
+  FlashAttention varlen backward for attention and DS4's chunked selected
+  log-probabilities.
 - **Parallelism.** TP/EP/CP 1 with PP1 or PP4; the validated topology is PP4
   with `dist_opt`.
 

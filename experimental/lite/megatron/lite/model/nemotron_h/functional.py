@@ -1,39 +1,6 @@
-"""Inference-visible arithmetic with native training VJPs for Nemotron-H."""
+"""Inference-visible forwards with dedicated training VJPs for Nemotron-H."""
 
 import torch
-
-
-class _VisibleForward(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, visible, native, *inputs):
-        ctx.native = native
-        ctx.save_for_backward(*inputs)
-        return visible(*inputs)
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        with torch.enable_grad():
-            inputs = tuple(
-                x.detach().requires_grad_(required)
-                for x, required in zip(
-                    ctx.saved_tensors, ctx.needs_input_grad[2:], strict=True
-                )
-            )
-            active = tuple(x for x in inputs if x.requires_grad)
-            output = ctx.native(*inputs)
-            gradients = iter(torch.autograd.grad(output, active, grad_outputs))
-        return (
-            None,
-            None,
-            *(next(gradients) if x.requires_grad else None for x in inputs),
-        )
-
-
-def visible_forward(visible, native, *inputs):
-    """Keep inference rounding in forward; recompute the native VJP only in backward."""
-    if not torch.is_grad_enabled() or not any(x.requires_grad for x in inputs):
-        return visible(*inputs)
-    return _VisibleForward.apply(visible, native, *inputs)
 
 
 def native_linear_vjp(grad_output, value, weight):

@@ -1,8 +1,7 @@
-"""Request boundaries, native VJP ownership, and packed conv/SSD VJP accuracy."""
+"""Request boundaries and packed conv/SSD VJP accuracy."""
 
 import pytest
 import torch
-from megatron.lite.model.nemotron_h.functional import visible_forward
 from megatron.lite.model.nemotron_h.mamba import SSMMeta
 
 
@@ -17,40 +16,6 @@ def test_chunks_restart_at_every_request_not_packed_offset():
 def test_invalid_request_boundaries_fail_closed(boundaries):
     with pytest.raises(ValueError):
         SSMMeta(boundaries)
-
-
-def test_visible_value_and_native_gradient_with_frozen_input():
-    x = torch.tensor([2.0, 3.0], requires_grad=True)
-    weight = torch.tensor([4.0, 5.0])
-    native = lambda a, b: a.square() * b
-    visible = lambda a, b: native(a, b) + 0.125
-    result = visible_forward(visible, native, x, weight)
-    assert torch.equal(result, visible(x, weight))
-    upstream = torch.tensor([0.5, -2.0])
-    assert torch.equal(
-        torch.autograd.grad(result, x, upstream)[0],
-        torch.autograd.grad(native(x, weight), x, upstream)[0],
-    )
-
-
-def test_parameter_mutation_before_backward_is_rejected():
-    x = torch.tensor([2.0], requires_grad=True)
-    result = visible_forward(torch.square, torch.square, x)
-    with torch.no_grad():
-        x.add_(1)
-    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
-        result.sum().backward()
-
-
-@pytest.mark.parametrize("requires_grad", [False, True])
-def test_scoring_does_not_call_native_backward_reference(requires_grad):
-    x = torch.tensor([2.0], requires_grad=requires_grad)
-
-    def native(_):
-        raise AssertionError("Scoring must not build backward intermediates")
-
-    with torch.no_grad():
-        assert torch.equal(visible_forward(torch.square, native, x), x.square())
 
 
 # Uneven packed requests with non-chunk-aligned tails (chunk 128).
