@@ -2,7 +2,7 @@
 
 import torch
 
-from .quantization import requantize
+from .quantization import full_master, master_version, requantize
 
 
 class Fp8TrainingLinear(torch.nn.Module):
@@ -42,7 +42,12 @@ class Fp8TrainingLinear(torch.nn.Module):
             )
         self.register_buffer("_packed", checkpoint.tensors["weight"].to(device).clone())
         self._requantized = False
-        self._deployed_version = self.weight._version
+        self.bind_master()
+        self._deployed_version = master_version(self._master)
+
+    def bind_master(self):
+        """Track the parameter the optimizer updates (its FSDP2 shard once wrapped)."""
+        self.__dict__["_master"] = self._parameters["weight"]
 
     def _tensors(self):
         return {
@@ -52,7 +57,7 @@ class Fp8TrainingLinear(torch.nn.Module):
         }
 
     def _check_fresh(self):
-        if self.weight._version != self._deployed_version:
+        if master_version(self._master) != self._deployed_version:
             raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
@@ -61,14 +66,14 @@ class Fp8TrainingLinear(torch.nn.Module):
 
         ``restore`` reinstalls the bytes a training checkpoint restored.
         """
-        if self.weight.is_cuda and torch.cuda.is_current_stream_capturing():
+        if self._master.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Refresh deployment outside CUDA Graph capture")
         self._requantized |= recompute_scales
         if self._requantized and not restore:
-            tensors = requantize("FP8", self.weight)
+            tensors = requantize("FP8", full_master(self._master))
             self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"].reshape(1))
-        self._deployed_version = self.weight._version
+        self._deployed_version = master_version(self._master)
 
     def export_quantized(self):
         self._check_fresh()

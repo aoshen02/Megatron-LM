@@ -106,6 +106,10 @@ class NemotronExport:
                 # vLLM's first load keeps KV scales in BF16 parameters, a reload
                 # in FP32 ones; send the BF16-rounded value so both agree.
                 tensor = tensor.to(torch.bfloat16).to(torch.float32)
+            model_dtype = getattr(tensor, "_fsdp2_model_param_dtype", None)
+            if model_dtype is not None:
+                # An FSDP2 FP32 shard of a BF16 parameter: the forward's value.
+                tensor = tensor.full_tensor().to(model_dtype)
             yield name, tensor.detach()
         for prefix, tensors in quantized.items():
             for suffix, tensor in tensors.items():

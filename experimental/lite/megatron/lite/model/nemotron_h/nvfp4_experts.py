@@ -5,7 +5,19 @@ from pathlib import Path
 
 import torch
 
-from .quantization import QuantizedWeight, load_quantized_weight, requantize
+from .quantization import (
+    QuantizedWeight,
+    full_master,
+    load_quantized_weight,
+    master_version,
+    requantize,
+)
+
+
+def _is_dtensor(tensor):
+    from torch.distributed.tensor import DTensor
+
+    return isinstance(tensor, DTensor)
 
 
 class Nvfp4ExpertWeights(torch.nn.Module):
@@ -121,28 +133,40 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             self.register_buffer(f"_{projection}_scale", scales)
             self.register_buffer(f"_{projection}_global", global_scales)
             self._global_shapes[projection] = shapes
+        self.bind_master()
         self._synced_versions = self._versions()
         self._dirty = False
 
+    def bind_master(self):
+        """Track the parameters the optimizer updates (their FSDP2 shards once
+        wrapped); during an FSDP2 forward the attributes are the unsharded BF16
+        copies."""
+        self.__dict__["_masters"] = {p: self._parameters[p] for p in self._geometry}
+
     def _versions(self):
         tensors = []
+        masters = []
         for projection in self._geometry:
-            tensors.append(getattr(self, projection))
+            master = self._masters[projection]
+            masters.append(master_version(master))
+            tensors.append(getattr(master, "_local_tensor", master))
             tensors.extend(
                 getattr(self, f"_{projection}_{suffix}")
                 for suffix in ("packed", "scale", "global")
             )
-        return tuple(
+        return tuple(masters) + tuple(
             (id(t), t.data_ptr(), t._version, t.dtype, t.device, t.shape, t.stride())
             for t in tensors
         )
 
     def _validate_storage(self):
-        device = self.up_proj.device
+        device = self._masters["up_proj"].device
         for projection, (rows, columns) in self._geometry.items():
-            master = getattr(self, projection)
+            master = self._masters[projection]
+            # FSDP2 keeps FP32 shards of the BF16 masters.
+            master_dtype = torch.float32 if _is_dtensor(master) else torch.bfloat16
             specs = [
-                (master, (self.num_local, rows, columns), torch.bfloat16),
+                (master, (self.num_local, rows, columns), master_dtype),
                 (
                     getattr(self, f"_{projection}_packed"),
                     (self.num_local, rows, columns // 2),
@@ -208,7 +232,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         self._requantized = getattr(self, "_requantized", False) | recompute_scales
         if self._requantized and not restore:
             for projection in ("up_proj", "down_proj"):
-                parameter = getattr(self, projection)
+                parameter = full_master(self._masters[projection])
                 for expert in range(self.num_local):
                     tensors = requantize("W4A16_NVFP4", parameter[expert])
                     getattr(self, f"_{projection}_packed")[expert].copy_(tensors["weight"])

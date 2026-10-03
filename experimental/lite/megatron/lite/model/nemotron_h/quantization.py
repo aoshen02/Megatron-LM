@@ -267,6 +267,22 @@ class QuantizedWeight:
         return result
 
 
+def full_master(master):
+    """The BF16 master the forward sees: an FSDP2 shard is gathered, then cast
+    as FSDP2's BF16 unshard casts it."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(master, DTensor):
+        master = master.full_tensor()
+    return master.detach().to(torch.bfloat16)
+
+
+def master_version(master):
+    """Version of a master, advanced by any in-place update: an FSDP2 shard
+    counts updates through the DTensor and through its local tensor apart."""
+    return master._version, getattr(master, "_local_tensor", master)._version
+
+
 class Nvfp4TrainingLinear(torch.nn.Module):
     """Inference-visible W4A16 linear over a BF16 master weight.
 
@@ -288,7 +304,13 @@ class Nvfp4TrainingLinear(torch.nn.Module):
         self.register_buffer("_packed", checkpoint.tensors["weight"].to(device))
         self._factory = deployment_factory
         self._requantized = False
+        self.bind_master()
         self._install()
+
+    def bind_master(self):
+        """Track the parameter the optimizer updates (its FSDP2 shard once wrapped);
+        during an FSDP2 forward ``self.weight`` is the unsharded BF16 copy."""
+        self.__dict__["_master"] = self._parameters["weight"]
 
     def _tensors(self):
         return {
@@ -299,10 +321,10 @@ class Nvfp4TrainingLinear(torch.nn.Module):
 
     def _install(self):
         self._inference = self._factory(**self._tensors())
-        self._deployed_version = self.weight._version
+        self._deployed_version = master_version(self._master)
 
     def _check_fresh(self):
-        if self.weight._version != self._deployed_version:
+        if master_version(self._master) != self._deployed_version:
             raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
@@ -313,7 +335,7 @@ class Nvfp4TrainingLinear(torch.nn.Module):
         """
         self._requantized |= recompute_scales
         if self._requantized and not restore:
-            tensors = requantize("W4A16_NVFP4", self.weight)
+            tensors = requantize("W4A16_NVFP4", full_master(self._master))
             self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"])
             self.weight_scale_2.copy_(

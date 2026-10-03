@@ -1286,3 +1286,56 @@ def test_flashinfer_one_sided_combine_matches_ep4_reduction_bitwise():
     """Guard against a FlashInfer upgrade changing the serving combine order."""
     pytest.importorskip("flashinfer.comm.trtllm_moe_alltoall")
     _spawn_ep4(_flashinfer_combine_worker)
+
+
+def _fsdp_requant_worker(rank, port, nccl_env):
+    import torch.distributed as dist
+    from megatron.lite.model.nemotron_h.fp8_training import Fp8TrainingLinear
+    from megatron.lite.model.nemotron_h.kernels import HummingNvfp4Linear
+    from megatron.lite.model.nemotron_h.quantization import Nvfp4TrainingLinear
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    _init_ep4_rank(rank, port, nccl_env)
+    mesh = init_device_mesh("cuda", (4,))
+    g = torch.Generator(device="cuda").manual_seed(4)
+    master = (torch.randn(512, 2688, generator=g, device="cuda") * 0.02).bfloat16()
+    for algorithm in ("W4A16_NVFP4", "FP8"):
+        start = requantize(algorithm, master)
+        if algorithm == "FP8":
+            start["input_scale"] = torch.tensor([0.05], device="cuda")
+            module = Fp8TrainingLinear(QuantizedWeight("FP8", start), device="cuda")
+        else:
+            module = Nvfp4TrainingLinear(
+                QuantizedWeight(algorithm, start), HummingNvfp4Linear, device="cuda"
+            )
+        # The FP32 FSDP2 shard of the master, as fully_shard leaves it.
+        module.weight = torch.nn.Parameter(
+            distribute_tensor(module.weight.detach().float(), mesh, [Shard(0)])
+        )
+        module.bind_master()
+        module.refresh_deployment()
+        update = (torch.randn(512, 2688, generator=g, device="cuda") * 1e-3).float()
+        with torch.no_grad():
+            module.weight.add_(distribute_tensor(update, mesh, [Shard(0)]))
+        # The optimizer's in-place update of the shard is seen as stale.
+        with pytest.raises(RuntimeError, match="Refresh deployment"):
+            module.export_quantized()
+        module.refresh_deployment(recompute_scales=True)
+        exported = module.export_quantized()
+        expected = requantize(algorithm, module.weight.full_tensor().bfloat16())
+        for name, tensor in expected.items():
+            assert torch.equal(
+                exported[name].reshape(-1).view(torch.uint8),
+                tensor.reshape(-1).view(torch.uint8),
+            ), (algorithm, name)
+    dist.destroy_process_group()
+
+
+@cuda
+@pytest.mark.gpus(4, min_architecture="blackwell")
+def test_fsdp2_shard_requantizes_from_the_full_matrix():
+    """Under FSDP2 a quantized layer tracks its FP32 shard: an optimizer update
+    makes it stale, and the refresh requantizes the gathered BF16 matrix (the
+    one the unsharded forward sees), so its scales come from the full matrix."""
+    _spawn_ep4(_fsdp_requant_worker)

@@ -228,18 +228,19 @@ def build_model(model_cfg, *, impl_cfg):
             while hasattr(current, "module"):
                 current = current.module
             _load_weights(current, impl_cfg.hf_path)
-    elif impl_cfg.optimizer is not None:
-        raise ValueError(
-            "Native Nemotron uses dist_opt, not the historical FSDP adapter"
-        )
+    elif impl_cfg.optimizer not in (None, "fsdp2"):
+        raise ValueError(f"Nemotron optimizers are dist_opt and fsdp2, not {impl_cfg.optimizer}")
+    fsdp2 = impl_cfg.optimizer == "fsdp2"
     extras = {
         "model_cfg": model_cfg,
         "optimizer_backend": impl_cfg.optimizer or "none",
-        "post_optimizer_step_hook": partial(_refresh_quantized, chunks),
+        "post_optimizer_step_hook": partial(_refresh_quantized, chunks, release_grads=fsdp2),
         "post_checkpoint_load_hook": partial(_restore_quantized, chunks),
     }
     if optimizer is not None:
         extras["post_model_load_hook"] = partial(_refresh_after_model_load, chunks)
+    elif fsdp2:
+        extras["post_model_load_hook"] = partial(_build_fsdp2, chunks, impl_cfg, ps)
     return ModelBundle(
         chunks=chunks,
         parallel_state=ps,
@@ -269,7 +270,44 @@ def _check_router_gemm_rows_invariant():
             )
 
 
-def _refresh_quantized(chunks):
+def _build_fsdp2(chunks, impl_cfg, ps):
+    """DS4's deferred FSDP2 wrap (``build_training_backend``) after the HF load.
+
+    As DS4's aligned actor: FP32 shards (no separate master), FP32 parameters
+    replicated, BF16 compute. Dense blocks are sharded over DP x CP, each
+    MoE layer's experts over expert DP. The quantized layers then track the
+    FP32 shards their optimizer updates and requantize from the gathered
+    matrix (``quantization.full_master``), the BF16 matrix the unsharded
+    forward sees, so NVFP4 global and FP8 tensor scales come from the full
+    matrix and the forward and the export read the same bytes.
+    """
+    from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+
+    from .model import Block
+
+    optimizer = build_fsdp2_training_optimizer(
+        chunks,
+        impl_cfg.optimizer_config,
+        ps,
+        unit_modules=(Block,),
+        expert_classifier=is_expert,
+        replicated_param_classifier=lambda _name, param: param.dtype == torch.float32,
+        deterministic=impl_cfg.deterministic,
+        vpp=impl_cfg.parallel.vpp,
+        leaf_module_names=(),
+        use_fp32_shards=True,
+        cast_forward_inputs=False,
+    )
+    for chunk in chunks:
+        for module in chunk.modules():
+            bind = getattr(module, "bind_master", None)
+            if callable(bind):
+                bind()
+    refresh_quantized_projections(chunks)
+    return {"optimizer": optimizer}
+
+
+def _refresh_quantized(chunks, *, release_grads=False):
     # Post-optimizer hook: the checkpoint bytes are only valid for the initial
     # weights (DeepSeek-V4 invalidates its bound scales after an update too).
     # dist_opt overlaps the parameter all-gather with the next forward; with
@@ -281,6 +319,11 @@ def _refresh_quantized(chunks):
             with torch.no_grad():
                 start_param_sync(force_sync=True)
     refresh_quantized_projections(chunks, recompute_scales=True)
+    if release_grads:
+        # FSDP2 gradients are plain .grad tensors and the rollout runs next.
+        for chunk in chunks:
+            for parameter in chunk.parameters():
+                parameter.grad = None
 
 
 def _restore_quantized(chunks):
