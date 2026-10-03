@@ -272,11 +272,16 @@ class HummingRoutedExperts:
             )
         if num_local != num_experts:
             from vllm.model_executor.models.nemotron_h_moe import (
-                configure_nemotron_humming,
+                nemotron_humming_schedule,
             )
 
-            # The serving EP4 rank's launch schedule.
-            configure_nemotron_humming(self)
+            # The launch schedule serving selects for a Lightning EP4 rank
+            # (nemotron_h_moe.schedule_unsupported_reason).
+            if (num_local, num_experts, hidden, intermediate) != (32, 128, 2688, 1856):
+                raise ValueError("The Nemotron EP4 schedule is measured for Lightning")
+            for name in ("w13", "w2"):
+                table = getattr(self, f"{name}_tuning_config")
+                setattr(self, f"{name}_tuning_config", nemotron_humming_schedule(table))
         self.expert_map = None
         if num_local != num_experts:
             self.expert_map = torch.full(

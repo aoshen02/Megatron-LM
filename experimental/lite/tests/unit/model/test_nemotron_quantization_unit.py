@@ -501,13 +501,12 @@ def _oracle_routes(layer, config, x, ids, *, dp_tokens=None):
 
 def _oracle_ep4_rank(stacks, config, rank, monkeypatch):
     """The serving EP4 rank: vLLM FusedMoE with 32 local experts and its
-    expert_map, built under a Nemotron-H model config so ModelOpt applies
-    configure_nemotron_humming."""
-    from types import SimpleNamespace
-
+    expert_map, with the Humming schedule transform NemotronHMoE sets when
+    serving selects the Lightning EP4 schedule."""
     from vllm.config import set_current_vllm_config
     from vllm.model_executor.layers.fused_moe import layer as moe_layer
     from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+    from vllm.model_executor.models.nemotron_h_moe import nemotron_humming_schedule
 
     ep4 = FusedMoEParallelConfig(
         tp_size=1, pcp_size=1, dp_size=1, ep_size=4, tp_rank=0, pcp_rank=0,
@@ -519,9 +518,7 @@ def _oracle_ep4_rank(stacks, config, rank, monkeypatch):
         # kernel construction then run as on the serving rank.
         patch.setattr(moe_layer, "make_parallel_config", lambda **_: ep4)
         layer, local = _empty_oracle_experts(config)
-    local.model_config = SimpleNamespace(
-        hf_config=SimpleNamespace(model_type="nemotron_h", hidden_size=2688)
-    )
+    layer._humming_tuning_transform = nemotron_humming_schedule
     part = slice(rank * 32, (rank + 1) * 32)
     with set_current_vllm_config(local), torch.device("cuda"), torch.no_grad():
         for stem, (packed, scale, global_scale) in stacks.items():
@@ -685,13 +682,14 @@ def test_cute_dsl_linear_builds_on_its_weight_device(monkeypatch):
 
 @cuda
 @pytest.mark.gpus(1, min_architecture="blackwell")
-def test_ep4_rank_humming_schedule_matches_the_full_deployment_bitwise():
+def test_ep4_rank_humming_schedule_matches_the_full_deployment_bitwise(monkeypatch):
     """The serving EP4 rank (32 local experts, configure_nemotron_humming,
     valid_shape_m from the global token count, expert_map, only the tokens
     routed to it) gives the routes and rank partial the trainer's 128-expert
     deployment computes, bit for bit."""
     from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
 
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     g = torch.Generator(device="cuda").manual_seed(8)
     stacks = _lightning_stacks(g)
     full = HummingRoutedExperts(
