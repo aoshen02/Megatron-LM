@@ -1,9 +1,16 @@
 """Explicit HF tensor mapping for locally owned native Nemotron parameters."""
 
+import hashlib
 import json
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
+
+# Trusted digests of the BF16 release (bf16_release.json): the HF LFS sha256 of
+# every shard at the pinned revision, and per layer (or top-level tensor) a
+# sha256 over its tensors, which a proxy cut of release layers reproduces.
+BF16_RELEASE_MANIFEST = Path(__file__).with_name("bf16_release.json")
 
 
 def _routed_checkpoint_owners(model):
@@ -205,15 +212,74 @@ def _quantized_masters(model):
                 )
 
 
+def release_group(name):
+    """``backbone.layers.N`` / ``mtp.layers.N`` for layer tensors, else the name."""
+    parts = name.split(".")
+    if len(parts) > 3 and parts[1] == "layers" and parts[0] in ("backbone", "mtp"):
+        return ".".join(parts[:3])
+    return name
+
+
+def release_group_digests(root, index, groups):
+    """sha256 per group over its tensors' group-relative names, dtypes, shapes, bytes."""
+    from safetensors import safe_open
+
+    members = {}
+    for name in index:
+        group = release_group(name)
+        if group in groups:
+            members.setdefault(group, []).append(name)
+    missing = set(groups) - members.keys()
+    if missing:
+        raise ValueError(f"BF16 master source lacks {sorted(missing)[:4]}")
+    digests = {}
+    with ExitStack() as stack:
+        handles = {}
+        for group, names in sorted(members.items()):
+            digest = hashlib.sha256()
+            for name in sorted(names):
+                if index[name] not in handles:
+                    handles[index[name]] = stack.enter_context(
+                        safe_open(Path(root) / index[name], framework="pt", device="cpu")
+                    )
+                tensor = handles[index[name]].get_tensor(name)
+                header = f"{name[len(group):]}|{tensor.dtype}|{tuple(tensor.shape)}\n"
+                digest.update(header.encode())
+                digest.update(tensor.contiguous().reshape(-1).view(torch.uint8).numpy())
+            digests[group] = digest.hexdigest()
+    return digests
+
+
+def _verify_bf16_release(master_root, source, names, layers, manifest=None):
+    """Fail unless every group read is the trusted release's (proxy layers mapped)."""
+    manifest = manifest or json.loads(BF16_RELEASE_MANIFEST.read_text())
+
+    def released(group):
+        parts = group.split(".")
+        if layers is not None and parts[:2] == ["backbone", "layers"] and len(parts) == 3:
+            return f"backbone.layers.{layers[int(parts[2])]}"
+        return group
+
+    groups = {release_group(name) for name in names}
+    for group, digest in release_group_digests(master_root, source, groups).items():
+        if manifest["groups"].get(released(group)) != digest:
+            raise ValueError(
+                f"BF16 master {group} is not {released(group)} of "
+                f"{manifest['repo']}@{manifest['revision']}"
+            )
+
+
 @torch.no_grad()
-def _load_bf16_masters(model, root, master_root):
+def _load_bf16_masters(model, root, master_root, layers=None):
     """Initialize every BF16 master from the BF16 release the checkpoint was cut from.
 
-    Fails unless the release is this checkpoint's source: every non-quantized
-    tensor is bitwise equal (FP32 router weights equal the BF16 upcast) and
-    every quantized tensor is its BF16 weight encoded on the checkpoint scales.
-    Then every deployment is requantized from its master, so the theta0
-    deployment is requant(BF16 master), not the checkpoint bytes.
+    Identity: every tensor group read must match the trusted release digests
+    (``layers`` names the release layer of each proxy layer). Compatibility
+    validation: every non-quantized tensor is bitwise equal to the checkpoint
+    (FP32 router weights equal the BF16 upcast) and every quantized tensor is
+    its BF16 weight encoded on the checkpoint scales. Then every deployment is
+    requantized from its master, so the theta0 deployment is requant(BF16
+    master), not the checkpoint bytes.
     """
     from .quantization import check_reversible
 
@@ -230,6 +296,20 @@ def _load_bf16_masters(model, root, master_root):
         # The optimizer's FP32 mains are copied from the masters when it is
         # built; a later first load would leave them on the checkpoint grid.
         raise RuntimeError("Load the BF16 masters before building the optimizer")
+    if verify:
+        quantized = {prefix for prefix, *_ in masters}
+        plain = [
+            name
+            for name, _ in hf_tensor_views(model)
+            if not any(name.startswith(prefix + ".") for prefix in quantized)
+            and not name.endswith((".k_proj.k_scale", ".v_proj.v_scale"))
+        ]
+        _verify_bf16_release(
+            master_root,
+            source,
+            [f"{prefix}.weight" for prefix, *_ in masters] + plain,
+            layers,
+        )
     suffixes = {
         "FP8": ("weight", "weight_scale"),
         "W4A16_NVFP4": ("weight", "weight_scale", "weight_scale_2"),
@@ -267,13 +347,6 @@ def _load_bf16_masters(model, root, master_root):
                     exact_global=True,
                 )
     if verify:
-        quantized = {prefix for prefix, *_ in masters}
-        plain = [
-            name
-            for name, _ in hf_tensor_views(model)
-            if not any(name.startswith(prefix + ".") for prefix in quantized)
-            and not name.endswith((".k_proj.k_scale", ".v_proj.v_scale"))
-        ]
         missing = [name for name in plain if name not in source]
         if missing:
             raise ValueError(f"BF16 master source lacks {missing[:4]}")
@@ -296,7 +369,7 @@ def _load_bf16_masters(model, root, master_root):
             )
             if not same:
                 raise ValueError(
-                    f"BF16 master source is not this checkpoint's source: {name}"
+                    f"BF16 master source is incompatible with this checkpoint: {name}"
                 )
     refresh_quantized_projections([model], recompute_scales=True)
     if verify:
@@ -446,7 +519,9 @@ def load_hf_weights(model, path):
     ]
     master_root = getattr(model, "_bf16_master_root", None)
     if master_root is not None:
-        _load_bf16_masters(model, root, master_root)
+        _load_bf16_masters(
+            model, root, master_root, getattr(model, "_bf16_master_layers", None)
+        )
     quantized = {}
     for name, module in model.named_modules():
         if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):

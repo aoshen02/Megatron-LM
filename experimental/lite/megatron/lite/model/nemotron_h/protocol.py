@@ -38,6 +38,8 @@ class ImplConfig:
     # BF16 release the hf_path checkpoint was quantized from; when set, the
     # masters start from it and theta0 deploys their requantization.
     bf16_master_path: str | None = None
+    # Release layer of each layer of a proxy BF16 master (None: the release).
+    bf16_master_layers: tuple[int, ...] | None = None
     routed_forward_reduction: str | None = None
 
     def __post_init__(self):

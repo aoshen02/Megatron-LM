@@ -177,7 +177,8 @@ def nvfp4_encode_values(weight, scale, global_scale):
 def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
     """Fail unless the checkpoint is the BF16 master encoded on its own scales.
 
-    FP8: E4M3(BF16(master / scale)) must give the checkpoint codes. NVFP4: FP4
+    Not an identity check (a master moved within its cells passes). FP8:
+    E4M3(BF16(master / scale)) must give the checkpoint codes. NVFP4: FP4
     rounding of master / (block scale * global scale) must give the checkpoint
     values; with ``exact_global`` (the master is the original BF16 source) the
     global scale must also be amax / 1536. Both hold exactly for the Lightning

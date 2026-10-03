@@ -825,3 +825,65 @@ def test_checkpoint_restore_reinstalls_the_last_deployed_bytes():
             assert torch.equal(exported[name], value), (step, name)
 
 
+def _save_release(root, tensors):
+    import json
+
+    from safetensors.torch import save_file
+
+    root.mkdir()
+    save_file(tensors, str(root / "model.safetensors"))
+    index = {"weight_map": {name: "model.safetensors" for name in tensors}}
+    (root / "model.safetensors.index.json").write_text(json.dumps(index))
+    return index["weight_map"]
+
+
+@cuda
+def test_bf16_release_identity_rejects_a_master_changed_within_its_cell(tmp_path):
+    """Compatibility with the checkpoint does not prove identity: a master value
+    moved by one BF16 ulp inside its FP4 cell still encodes to the checkpoint,
+    but the release digest rejects it. A proxy cut verifies through its layer
+    mapping."""
+    from megatron.lite.model.nemotron_h.checkpoint import (
+        _verify_bf16_release,
+        release_group,
+        release_group_digests,
+    )
+
+    g = torch.Generator(device="cuda").manual_seed(16)
+    masters = [
+        (torch.randn(64, 128, generator=g, device="cuda") * 0.02).bfloat16() for _ in range(2)
+    ]
+    release = {
+        f"backbone.layers.{i}.mixer.experts.0.up_proj.weight": m.cpu()
+        for i, m in enumerate(masters)
+    }
+    release["backbone.embeddings.weight"] = torch.randn(8, 128).bfloat16()
+    index = _save_release(tmp_path / "release", release)
+    groups = {release_group(name) for name in index}
+    manifest = {
+        "repo": "r",
+        "revision": "v",
+        "groups": release_group_digests(tmp_path / "release", index, groups),
+    }
+    _verify_bf16_release(tmp_path / "release", index, list(index), None, manifest)
+
+    proxy = {
+        "backbone.layers.0.mixer.experts.0.up_proj.weight": release[
+            "backbone.layers.1.mixer.experts.0.up_proj.weight"
+        ]
+    }
+    proxy_index = _save_release(tmp_path / "proxy", proxy)
+    _verify_bf16_release(tmp_path / "proxy", proxy_index, list(proxy_index), [1], manifest)
+    with pytest.raises(ValueError, match="is not backbone.layers.0"):
+        _verify_bf16_release(tmp_path / "proxy", proxy_index, list(proxy_index), [0], manifest)
+
+    checkpoint = requantize("W4A16_NVFP4", masters[0])
+    changed = masters[0].clone()
+    j = int(changed[0, :16].float().abs().argmin())
+    changed.view(torch.int16)[0, j] += 1  # one BF16 ulp, away from zero
+    assert not torch.equal(changed, masters[0])
+    check_reversible("W4A16_NVFP4", changed, checkpoint, "m", exact_global=True)
+    release["backbone.layers.0.mixer.experts.0.up_proj.weight"] = changed.cpu()
+    index = _save_release(tmp_path / "tampered", release)
+    with pytest.raises(ValueError, match="backbone.layers.0 is not"):
+        _verify_bf16_release(tmp_path / "tampered", index, list(index), None, manifest)

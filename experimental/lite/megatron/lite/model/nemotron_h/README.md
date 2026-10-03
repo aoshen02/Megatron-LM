@@ -57,6 +57,13 @@ rejects checkpoints without a `quantization_config`.
     - FP8: the 24 of 46 projections whose calibrated scale is not amax/448
       use amax/448 from θ0 on (scheme A), so the first update has no scale
       jump; the per-tensor ratios are in the FP8 table below.
+    Release identity: every tensor group the rank reads (a layer, or a
+    top-level tensor) must match `bf16_release.json`, sha256 digests made
+    after every shard matched its HF LFS sha256 at the pinned revision. A
+    proxy cut names the release layer of each of its layers
+    (`impl_cfg.bf16_master_layers`). The checks against the checkpoint above
+    are compatibility validation only; a master moved within its FP4/FP8
+    cells passes them.
   - The actor forward and the rollout export read the same bytes, so the
     rollout serves exactly the weights the actor computes with.
   - A training-checkpoint restore (`post_checkpoint_load_hook`) reinstalls
