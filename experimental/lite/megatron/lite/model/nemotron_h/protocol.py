@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from functools import partial
 
+import torch
+
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
@@ -226,6 +228,14 @@ def build_model(model_cfg, *, impl_cfg):
 def _refresh_quantized(chunks):
     # Post-optimizer hook: the checkpoint bytes are only valid for the initial
     # weights (DeepSeek-V4 invalidates its bound scales after an update too).
+    # dist_opt overlaps the parameter all-gather with the next forward; with
+    # dense DP > 1 the export and requantization below would read other
+    # ranks' stale shards, so gather now (MCore's explicit param sync).
+    for chunk in chunks:
+        start_param_sync = getattr(chunk, "start_param_sync", None)
+        if callable(start_param_sync):
+            with torch.no_grad():
+                start_param_sync(force_sync=True)
     refresh_quantized_projections(chunks, recompute_scales=True)
 
 
