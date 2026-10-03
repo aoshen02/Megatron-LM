@@ -131,7 +131,8 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             x, self.weights.up_proj, self.weights.down_proj, routing_weights, ids, self
         )
 
-    def _visible(self, x, ids, routing_weights, *, return_fc1=False):
+    def _visible(self, x, ids, routing_weights, *, return_fc1=False,
+                 return_activated=False):
         self._check_inputs(x, ids, routing_weights)
         if x.shape[0] == 0:
             if return_fc1:
@@ -142,6 +143,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         return ep4_routed_experts(
             self._experts, x, routing_weights, ids,
             self.routed_forward_reduction, return_fc1=return_fc1,
+            return_activated=return_activated,
         )
 
     def _check_inputs(self, x, ids, routing_weights):

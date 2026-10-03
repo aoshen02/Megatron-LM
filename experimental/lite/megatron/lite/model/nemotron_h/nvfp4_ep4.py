@@ -50,13 +50,18 @@ def reduce_ep4_parts(parts, ids, recipe):
     return total.to(torch.bfloat16)
 
 
-def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1=False):
+def ep4_routed_experts(
+    experts, x, topk_weights, topk_ids, recipe, *, return_fc1=False,
+    return_activated=False,
+):
     """Run all 128 experts locally (Humming or CuTe-DSL) with an EP4 serving combine.
 
     Forms the four BF16 rank partials an EP4 deployment computes (each rank's
     ``moe_fused_mul_sum`` over its 32 experts) and combines them in the
     selected serving order. ``return_fc1`` also returns the visible FC1 and
-    expert outputs per route (token-major, slot-minor).
+    expert outputs per route (token-major, slot-minor); ``return_activated``
+    also the activation GEMM2 consumed, or None where it is recomputable
+    (Humming applies ReLU2 to the visible FC1).
     """
     validate_reduction(recipe)
     if recipe is None:
@@ -70,9 +75,13 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1
         # CuTe-DSL: the rank partials come from the serving kernel's own
         # per-rank top-k combine (moe_unpermute).
         result = experts.ep_partials(x, topk_weights, topk_ids, return_fc1=return_fc1)
-        parts, fc1, per_route = result if return_fc1 else (result, None, None)
+        parts, fc1, per_route, activated = (
+            result if return_fc1 else (result, None, None, None)
+        )
         out = reduce_ep4_parts(parts, topk_ids, recipe)
-        return (out, fc1, per_route) if return_fc1 else out
+        if not return_fc1:
+            return out
+        return (out, fc1, per_route, activated) if return_activated else (out, fc1, per_route)
     fc1, per_route = experts.routes(x, topk_ids)
     parts = []
     for rank in range(4):
@@ -80,4 +89,7 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1
         mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=x.device)
         parts.append(experts.rank_partial(per_route, topk_weights, topk_ids, mapping))
     out = reduce_ep4_parts(parts, topk_ids, recipe)
-    return (out, fc1, per_route.view(-1, x.shape[1])) if return_fc1 else out
+    if not return_fc1:
+        return out
+    saved = (out, fc1, per_route.view(-1, x.shape[1]))
+    return (*saved, None) if return_activated else saved

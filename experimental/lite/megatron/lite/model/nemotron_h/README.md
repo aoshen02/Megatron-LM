@@ -89,12 +89,21 @@ rejects checkpoints without a `quantization_config`.
     epilogue activates;
   - token input, up and down weights: Transformer Engine `high_precision`
     BF16 GEMMs on the BF16 masters through `u` (identity straight-through
-    for the quantization; the down-weight gradient uses `bf16(relu(u)^2)`,
-    which for CuTe-DSL can differ from the fused activation by one BF16 ulp);
+    for the quantization). The down-weight gradient uses the activation
+    GEMM2 consumed: CuTe-DSL saves its fused `bf16(relu(alpha * acc)^2)`
+    (one more BF16 `[tokens x 6 x 1856]` per MoE layer, 21.75 KiB per token
+    per layer); for Humming it is `bf16(relu(u)^2)`, recomputed;
     a token's route input gradients are summed in slot order and rounded to
     BF16 after each add, as DS4's deterministic scatter backward;
   - routing weights: `<dy, visible per-route expert output>` (exact; the
     BF16 GEMM2 output before the top-k combine).
+
+  CuTe-DSL calls two private FlashInfer helpers (`_get_workspace`,
+  `_run_grouped_gemm`); `kernels.check_flashinfer_w4a16` checks their
+  signatures and the source of the launcher the actor mirrors when the
+  deployment is built, and fails on any change. Per call the launch allocates
+  FlashInfer's workspace (`route_slots x (2688 + 1856)` BF16, `route_slots`
+  about `6 M + 127 x 128`) plus the identity FC1 buffer (`route_slots x 1856`).
 
   Every other visible op has its own autograd Function, as in the
   DeepSeek-V4 actor: closed-form compiled FP32 VJPs for the RMSNorms, the

@@ -54,6 +54,29 @@ def test_flashinfer_private_w4a16_helpers_keep_their_signatures():
     assert workspace_fields == ("moe_sort_buffers", "hidden_workspace", "intermediate")
 
 
+def test_actor_runtime_guard_pins_the_same_flashinfer_w4a16_helpers():
+    """The actor checks the same pins at construction (check_flashinfer_w4a16)."""
+    _module()
+    from megatron.lite.model.nemotron_h import kernels
+
+    assert kernels.FLASHINFER_W4A16_SIGNATURES == PINNED_SIGNATURES
+    assert kernels.FLASHINFER_W4A16_SOURCE_SHA256 == PINNED_SOURCE_SHA256
+    kernels.check_flashinfer_w4a16()
+
+
+def test_actor_runtime_guard_rejects_a_changed_helper(monkeypatch):
+    module = _module()
+    from megatron.lite.model.nemotron_h import kernels
+
+    def _run_grouped_gemm(weight, weight_sf, activations):  # noqa: ARG001
+        raise AssertionError
+
+    monkeypatch.setattr(module, "_run_grouped_gemm", _run_grouped_gemm)
+    monkeypatch.setattr(kernels, "_FLASHINFER_W4A16_CHECKED", False)
+    with pytest.raises(RuntimeError, match="_run_grouped_gemm"):
+        kernels.check_flashinfer_w4a16()
+
+
 def test_flashinfer_w4a16_launcher_source_is_the_reviewed_one():
     module = _module()
     for name, digest in PINNED_SOURCE_SHA256.items():
@@ -105,8 +128,8 @@ def _serving_rank(stacks, x, ids, routes, rank, ranks=4):
     )
     out = torch.empty_like(x)
     runner.forward(
-        [x, ids, routes, w1[s], prepare_w4a16_scales(s1)[s], a1[s], w2[s],
-         prepare_w4a16_scales(s2)[s], a2[s], out],
+        [x, ids, routes, w1[s], prepare_w4a16_scales(s1[s]), a1[s], w2[s],
+         prepare_w4a16_scales(s2[s]), a2[s], out],
         tactic=(BATCH_INVARIANT_TACTIC, BATCH_INVARIANT_TACTIC),
     )
     return out
@@ -127,7 +150,9 @@ def test_cutedsl_rank_partials_equal_the_serving_runner_bitwise(rows, monkeypatc
     x = (torch.randn(rows, 2688, generator=g, device="cuda") * 0.5).bfloat16()
     ids = _route_ids(rows, g)
     routes = torch.softmax(torch.randn(rows, 6, generator=g, device="cuda"), -1)
-    parts, fc1, visible = experts.ep_partials(x, routes, ids, return_fc1=True)
+    parts, fc1, visible, activated = experts.ep_partials(
+        x, routes, ids, return_fc1=True
+    )
     assert all(
         torch.equal(a, b) for a, b in zip(parts, experts.ep_partials(x, routes, ids))
     )
@@ -146,7 +171,15 @@ def test_cutedsl_rank_partials_equal_the_serving_runner_bitwise(rows, monkeypatc
         slot = owned.float().argmax(-1)
         expected = per_route[torch.arange(rows, device="cuda"), slot].bfloat16()
         assert torch.equal(expected[single], parts[rank][single]), rank
-    assert fc1.shape == (rows * 6, 1856) and fc1.dtype == torch.bfloat16
+    assert fc1.shape == activated.shape == (rows * 6, 1856)
+    # The saved fused activation is relu(a)^2 of an FP32 a that rounds to fc1:
+    # it lies between the activations of fc1's BF16 rounding-interval ends.
+    u = fc1.float()
+    ulp = 2.0 ** (torch.floor(torch.log2(u.abs().clamp_min(2.0**-126))) - 7)
+    lo = ((u - ulp / 2).clamp_min(0) ** 2).bfloat16().float()
+    hi = ((u + ulp / 2).clamp_min(0) ** 2).bfloat16().float()
+    h = activated.float()
+    assert bool(((h >= lo) & (h <= hi)).all())
 
 
 @cuda
@@ -185,18 +218,21 @@ def test_routed_vjp_on_the_cutedsl_deployment_at_updated_weights(monkeypatch):
                 for name in ("weight", "weight_scale", "weight_scale_2")
             ))
         experts = CuteDslRoutedExperts(*stacks, num_experts=128)
-        out, fc1, visible = ep4_routed_experts(
-            experts, x, routes, ids, EP4_ONESIDED_REDUCTION, return_fc1=True
+        out, fc1, visible, activated = ep4_routed_experts(
+            experts, x, routes, ids, EP4_ONESIDED_REDUCTION, return_fc1=True,
+            return_activated=True,
         )
         assert torch.equal(
             out, ep4_routed_experts(experts, x, routes, ids, EP4_ONESIDED_REDUCTION)
         )
-        got = routed_vjp(x, fc1, visible, up, down, routes, ids, dy)
+        got = routed_vjp(x, fc1, visible, up, down, routes, ids, dy, activated)
         ref = [t.detach().float().requires_grad_() for t in (x, up, down, routes)]
         idx = ids.long()
         u = torch.einsum("mk,msik->msi", ref[0], ref[1][idx])
         u = u + (fc1.view(rows, 6, -1).float() - u).detach()
-        v = torch.einsum("msi,mski->msk", u.relu().square(), ref[2][idx])
+        a = u.relu().square()
+        a = a + (activated.view(rows, 6, -1).float() - a).detach()
+        v = torch.einsum("msi,mski->msk", a, ref[2][idx])
         v = v + (visible.view(rows, 6, -1).float() - v).detach()
         (ref[3][..., None] * v).sum(1).backward(dy.float())
         expected = [t.grad for t in ref]

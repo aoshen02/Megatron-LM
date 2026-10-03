@@ -434,6 +434,55 @@ class HummingRoutedExperts:
         return moe_fused_mul_sum(down, weights, topk_ids=ids, expert_map=expert_map)
 
 
+# FlashInfer private W4A16 helpers the actor calls, and the launcher whose
+# stage order it mirrors (flashinfer-python 0.7.0.post1,
+# flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py :49/:59/:195/:358).
+FLASHINFER_W4A16_SIGNATURES = {
+    "_get_workspace": (
+        "x", "top_k", "num_experts", "num_local_experts", "intermediate_size",
+        "route_tile",
+    ),
+    "_run_grouped_gemm": (
+        "weight", "weight_sf", "activations", "tile_idx_to_expert_idx",
+        "tile_idx_to_mn_limit", "num_non_exiting_tiles", "alpha", "output",
+        "num_local_experts", "activation_type", "swiglu_alpha", "swiglu_beta",
+        "swiglu_limit", "situ_beta", "situ_linear_beta", "use_fused_finalize",
+        "permuted_idx_to_expanded_idx", "token_final_scales", "enable_pdl", "tactic",
+    ),
+}
+FLASHINFER_W4A16_SOURCE_SHA256 = {
+    "_W4A16Workspace": "9a4534c8fd89a1093c3007874c77f39cfb200bdc74036f0f6f6a05d9e73aed87",
+    "_get_workspace": "c5acedc5bb61dffbb894aba3d015ade3c301886d9e671cb08ac7cd09235b1fa4",
+    "_run_grouped_gemm": "430265499f90cf3552e2dfbf2bc4d58649d6d814423563843579bd55df771fc1",
+    "launch_w4a16_moe": "ae7abf3e50ea6ef411240f602a9b90980f8994faaefe10e47c5726c3c9abbc55",
+}
+_FLASHINFER_W4A16_CHECKED = False
+
+
+def check_flashinfer_w4a16():
+    """Fail unless FlashInfer's W4A16 helpers are the reviewed ones."""
+    global _FLASHINFER_W4A16_CHECKED
+    if _FLASHINFER_W4A16_CHECKED:
+        return
+    import hashlib
+    import inspect
+
+    from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16
+
+    for name, parameters in FLASHINFER_W4A16_SIGNATURES.items():
+        actual = tuple(inspect.signature(getattr(moe_w4a16, name)).parameters)
+        if actual != parameters:
+            raise RuntimeError(f"FlashInfer {name} signature changed: {actual}")
+    for name, digest in FLASHINFER_W4A16_SOURCE_SHA256.items():
+        source = inspect.getsource(getattr(moe_w4a16, name))
+        if hashlib.sha256(source.encode()).hexdigest() != digest:
+            raise RuntimeError(
+                f"FlashInfer {name} changed; re-review CuteDslRoutedExperts "
+                "before training with it"
+            )
+    _FLASHINFER_W4A16_CHECKED = True
+
+
 class CuteDslRoutedExperts:
     """FlashInfer CuTe-DSL W4A16 ReLU2 experts (vLLM ``flashinfer_cutedsl``, BI).
 
@@ -451,8 +500,8 @@ class CuteDslRoutedExperts:
     ``bf16(alpha * acc)``, the visible FC1 pre-activation for the VJP.
 
     Uses FlashInfer's ``_get_workspace`` and ``_run_grouped_gemm``
-    (``flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py``), pinned by
-    ``tests/unit/model/test_nemotron_cutedsl_unit.py``.
+    (``flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py``); construction
+    checks their signatures and source (``check_flashinfer_w4a16``).
     """
 
     TOP_K = 6
@@ -465,6 +514,7 @@ class CuteDslRoutedExperts:
         )
 
         require_batch_invariance()
+        check_flashinfer_w4a16()
         tensors = {}
         for stem, (packed, scale, global_scale) in (("w1", up), ("w2", down)):
             if torch.isnan(scale.float()).any():
@@ -517,9 +567,10 @@ class CuteDslRoutedExperts:
         )
 
     def ep_partials(self, x, routes, ids, *, ranks=4, return_fc1=False):
-        """BF16 EP-rank partials; with ``return_fc1`` also the per-route
-        visible FC1 ``[M*topk, I]`` and expert output ``[M*topk, H]``
-        (token-major, slot-minor)."""
+        """BF16 EP-rank partials; with ``return_fc1`` also, per route
+        (token-major, slot-minor), the visible FC1 pre-activation
+        ``[M*topk, I]``, expert output ``[M*topk, H]`` and the fused GEMM1
+        activation GEMM2 consumed ``[M*topk, I]``."""
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _get_workspace
         from flashinfer.fused_moe.cute_dsl.moe_utils import (
             get_max_num_permuted_tokens,
@@ -600,7 +651,12 @@ class CuteDslRoutedExperts:
         if not return_fc1:
             return parts
         index = e2p.reshape(-1).long()
-        return parts, fc1.index_select(0, index), hidden.index_select(0, index)
+        return (
+            parts,
+            fc1.index_select(0, index),
+            hidden.index_select(0, index),
+            activated.index_select(0, index),
+        )
 
 
 def scaled_fp8_quant(x, scale):
