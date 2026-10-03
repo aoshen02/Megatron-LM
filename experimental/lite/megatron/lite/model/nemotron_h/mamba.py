@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import torch
 from megatron.lite.model.nemotron_h.functional import visible_forward
-from megatron.lite.model.nemotron_h.ssd_reference import chunk_scan as native_scan
 
 
 @dataclass(frozen=True)
@@ -38,16 +37,22 @@ class SSMMeta:
         if tokens != self.boundaries[-1]:
             raise ValueError("Packed SSM token count disagrees with request boundaries")
 
+    def seq_idx(self, device):
+        """Per-token request index [1, T], as MCore ``PackedSeqParams.seq_idx``."""
+        lengths = [b - a for a, b in zip(self.boundaries, self.boundaries[1:])]
+        return torch.repeat_interleave(
+            torch.arange(len(lengths), dtype=torch.int32, device=device),
+            torch.tensor(lengths, device=device),
+            output_size=self.boundaries[-1],
+        )[None]
+
 
 def packed_conv(x, weight, bias, meta: SSMMeta):
     """Causal SiLU convolution, x[T,C], weight[C,K]; no cross-request history."""
-    from transformers.models.nemotron_h.modeling_nemotron_h import (
-        causal_conv1d_fn as native_conv,
-    )
+    from causal_conv1d import causal_conv1d_fn as native_conv
 
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 
-    native_conv = getattr(native_conv, "__wrapped__", native_conv)
     meta.validate_tokens(x.shape[0])
 
     def visible(x, weight, *bias_arg):
@@ -67,19 +72,13 @@ def packed_conv(x, weight, bias, meta: SSMMeta):
         ).T
 
     def native(x, weight, *bias_arg):
-        return torch.cat(
-            [
-                native_conv(
-                    x[a:b].T.unsqueeze(0),
-                    weight,
-                    bias_arg[0] if bias_arg else None,
-                    activation="silu",
-                )
-                .squeeze(0)
-                .T
-                for a, b in zip(meta.boundaries, meta.boundaries[1:])
-            ]
-        )
+        return native_conv(
+            x.T[None],
+            weight,
+            bias_arg[0] if bias_arg else None,
+            seq_idx=meta.seq_idx(x.device),
+            activation="silu",
+        )[0].T
 
     inputs = (x, weight) if bias is None else (x, weight, bias)
     return visible_forward(visible, native, *inputs)
@@ -87,6 +86,8 @@ def packed_conv(x, weight, bias, meta: SSMMeta):
 
 def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
     """Cache-free SSD, x[T,H,P], B/C[T,G,N]; inference forward and native VJP."""
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+
     from vllm.model_executor.layers.mamba.ops.ssd_combined import (
         mamba_chunk_scan_combined_varlen,
     )
@@ -120,23 +121,20 @@ def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
         return output
 
     def native(x, dt, A, B, C, D, dt_bias):
-        return torch.cat(
-            [
-                native_scan(
-                    x[a:b].unsqueeze(0),
-                    dt[a:b].unsqueeze(0),
-                    A,
-                    B[a:b].unsqueeze(0),
-                    C[a:b].unsqueeze(0),
-                    chunk_size=meta.chunk_size,
-                    D=D,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    dt_limit=(0.0, float("inf")),
-                ).squeeze(0)
-                for a, b in zip(meta.boundaries, meta.boundaries[1:])
-            ]
-        )
+        return mamba_chunk_scan_combined(
+            x[None],
+            dt[None],
+            A,
+            B[None],
+            C[None],
+            meta.chunk_size,
+            D=D,
+            dt_bias=dt_bias,
+            seq_idx=meta.seq_idx(x.device),
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            state_dtype=torch.float32,
+        )[0]
 
     return visible_forward(visible, native, x, dt, A, B, C, D, dt_bias)
 
