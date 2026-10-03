@@ -413,3 +413,32 @@ def test_router_gemm_row_check_detects_a_missing_batch_invariance_init(init_firs
         assert result.returncode == 0, result.stderr[-2000:]
     else:
         assert "depends on the row count" in result.stderr, result.stderr[-2000:]
+
+
+@pytest.mark.gpus(1)
+def test_fp8_attention_cache_pages_follow_request_lengths(monkeypatch):
+    """1024 one-token requests and one of 7000 tokens take 1026 cache pages of
+    3.3 MiB (3.4 GiB; three pages per request alone would be 10 GiB; FA4's
+    split scratch adds about 4 GiB), and each request's output is the one it
+    gets alone."""
+    from megatron.lite.model.nemotron_h.fp8_attention import Fa4Fp8KVAttention
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(3)
+    module = Fa4Fp8KVAttention(
+        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
+    )
+    lengths = [1] * 1024 + [7000]
+    bounds = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+    q, k, v = (
+        torch.randn(bounds[-1], h, 128, device="cuda", dtype=torch.bfloat16)
+        for h in (32, 2, 2)
+    )
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    packed = module._visible(q, k, v, bounds)[0]
+    assert torch.cuda.max_memory_allocated() - base < 9 * 2**30
+    for start, end in ((0, 1), (1023, 1024), (1024, bounds[-1])):
+        alone = module._visible(q[start:end], k[start:end], v[start:end], [0, end - start])
+        assert torch.equal(packed[start:end], alone[0])

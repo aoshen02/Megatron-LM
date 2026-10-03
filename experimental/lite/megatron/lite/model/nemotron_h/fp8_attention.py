@@ -78,21 +78,31 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
         if any(length <= 0 or length > MAX_SEQ_LEN for length in lengths):
             raise ValueError(f"Expected nonempty sequences no longer than {MAX_SEQ_LEN}")
-        pages = -(-MAX_SEQ_LEN // 6768)
-        table = torch.arange(
-            len(lengths) * pages, device=q.device, dtype=torch.int32
-        ).reshape(-1, pages)
+        # Serving's page geometry (6768-token pages, a table row wide enough
+        # for MAX_SEQ_LEN); each sequence owns only the pages it fills, and
+        # the rest of its row repeats its last page, which is never read.
+        width = -(-MAX_SEQ_LEN // 6768)
+        owned = [-(-length // 6768) for length in lengths]
+        first = [sum(owned[:index]) for index in range(len(owned))]
+        table = torch.tensor(
+            [
+                [start + min(page, count - 1) for page in range(width)]
+                for start, count in zip(first, owned)
+            ],
+            device=q.device,
+            dtype=torch.int32,
+        )
         slots = torch.cat(
             [
                 torch.arange(length, device=q.device, dtype=torch.int64)
-                + index * pages * 6768
-                for index, length in enumerate(lengths)
+                + start * 6768
+                for start, length in zip(first, lengths)
             ]
         )
         lengths = torch.tensor(lengths, device=q.device, dtype=torch.int32)
         cu = torch.tensor(boundaries, device=q.device, dtype=torch.int32)
         cache = torch.zeros(
-            table.numel(), 2, 6768, 256, dtype=torch.uint8, device=q.device
+            sum(owned), 2, 6768, 256, dtype=torch.uint8, device=q.device
         )
         # Serving loads scale parameters under the BF16 model default dtype,
         # then copies their rounded values into FP32 runtime buffers. Keep the
@@ -130,7 +140,7 @@ class Fa4Fp8KVAttention(torch.nn.Module):
             out=output,
             return_lse=True,
         )
-        saved = cache.transpose(1, 2)[slots // 6768, slots % 6768]
+        saved = cache[slots // 6768, :, slots % 6768]
         saved_k, saved_v = saved.view(torch.float8_e4m3fn).split(128, -1)
         k_ref = (saved_k.float() * ks).to(k.dtype)
         v_ref = (saved_v.float() * vs).to(v.dtype)
