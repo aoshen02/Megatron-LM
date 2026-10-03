@@ -3,7 +3,10 @@
 from dataclasses import dataclass
 
 import torch
-from megatron.lite.model.nemotron_h.functional import visible_forward
+from megatron.lite.model.nemotron_h.functional import (
+    check_parameter_versions,
+    parameter_versions,
+)
 
 
 @dataclass(frozen=True)
@@ -47,21 +50,53 @@ class SSMMeta:
         )[None]
 
 
+class _PackedConvVJP(torch.autograd.Function):
+    """Visible vLLM convolution; causal_conv1d backward on the packed batch."""
+
+    @staticmethod
+    def forward(ctx, visible, x, weight, bias, seq_idx):
+        ctx.save_for_backward(x, weight, bias, seq_idx)
+        ctx.versions = parameter_versions((weight,) if bias is None else (weight, bias))
+        return visible(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad):
+        from causal_conv1d.cpp_functions import causal_conv1d_bwd_function
+
+        x, weight, bias, seq_idx = ctx.saved_tensors
+        check_parameter_versions(
+            (weight,) if bias is None else (weight, bias), ctx.versions
+        )
+        dx, dweight, dbias, _ = causal_conv1d_bwd_function(
+            x.T[None],
+            weight,
+            bias,
+            grad.contiguous().T[None],
+            seq_idx,
+            None,
+            None,
+            None,
+            False,
+            True,
+        )
+        return None, dx[0].T, dweight, dbias, None
+
+
 def packed_conv(x, weight, bias, meta: SSMMeta):
     """Causal SiLU convolution, x[T,C], weight[C,K]; no cross-request history."""
-    from causal_conv1d import causal_conv1d_fn as native_conv
+    import causal_conv1d.cpp_functions  # noqa: F401
 
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn
 
     meta.validate_tokens(x.shape[0])
 
-    def visible(x, weight, *bias_arg):
+    def visible(x, weight, bias):
         sequences = len(meta.boundaries) - 1
         states = x.new_zeros(sequences + 1, x.shape[1], weight.shape[1] - 1)
         return causal_conv1d_fn(
             x.T,
             weight,
-            bias_arg[0] if bias_arg else None,
+            bias,
             states,
             torch.tensor(meta.boundaries, dtype=torch.int32, device=x.device),
             cache_indices=torch.arange(
@@ -71,22 +106,52 @@ def packed_conv(x, weight, bias, meta: SSMMeta):
             activation="silu",
         ).T
 
-    def native(x, weight, *bias_arg):
-        return native_conv(
-            x.T[None],
-            weight,
-            bias_arg[0] if bias_arg else None,
-            seq_idx=meta.seq_idx(x.device),
-            activation="silu",
-        )[0].T
+    if not torch.is_grad_enabled():
+        return visible(x, weight, bias)
+    return _PackedConvVJP.apply(visible, x, weight, bias, meta.seq_idx(x.device))
 
-    inputs = (x, weight) if bias is None else (x, weight, bias)
-    return visible_forward(visible, native, *inputs)
+
+class _PackedScanVJP(torch.autograd.Function):
+    """Visible vLLM SSD; mamba_ssm SSD backward on the packed batch."""
+
+    @staticmethod
+    def forward(ctx, visible, x, dt, A, B, C, D, dt_bias, seq_idx, chunk_size):
+        output = visible(x, dt, A, B, C, D, dt_bias)
+        ctx.save_for_backward(x, dt, A, B, C, D, dt_bias, seq_idx, output)
+        ctx.chunk_size, ctx.versions = chunk_size, parameter_versions((D, dt_bias))
+        return output
+
+    @staticmethod
+    def backward(ctx, grad):
+        from mamba_ssm.ops.triton.ssd_combined import _mamba_chunk_scan_combined_bwd
+
+        x, dt, A, B, C, D, dt_bias, seq_idx, output = ctx.saved_tensors
+        check_parameter_versions((D, dt_bias), ctx.versions)
+        # The output is only shape-checked without a gate z.
+        dx, ddt, dA, dB, dC, dD, _, ddt_bias, _ = _mamba_chunk_scan_combined_bwd(
+            grad[None],
+            x[None],
+            dt[None],
+            A,
+            B[None],
+            C[None],
+            output[None],
+            ctx.chunk_size,
+            D=D,
+            dt_bias=dt_bias,
+            seq_idx=seq_idx,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            state_dtype=torch.float32,
+        )
+        grads = (dx[0], ddt[0], dA, dB[0], dC[0], dD, ddt_bias)
+        inputs = (x, dt, A, B, C, D, dt_bias)
+        return None, *(g.to(t.dtype) for g, t in zip(grads, inputs)), None, None
 
 
 def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
-    """Cache-free SSD, x[T,H,P], B/C[T,G,N]; inference forward and native VJP."""
-    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+    """Cache-free SSD, x[T,H,P], B/C[T,G,N]; inference forward, mamba_ssm VJP."""
+    import mamba_ssm.ops.triton.ssd_combined  # noqa: F401
 
     from vllm.model_executor.layers.mamba.ops.ssd_combined import (
         mamba_chunk_scan_combined_varlen,
@@ -120,23 +185,11 @@ def packed_scan(x, dt, A, B, C, D, dt_bias, meta: SSMMeta):
         )
         return output
 
-    def native(x, dt, A, B, C, D, dt_bias):
-        return mamba_chunk_scan_combined(
-            x[None],
-            dt[None],
-            A,
-            B[None],
-            C[None],
-            meta.chunk_size,
-            D=D,
-            dt_bias=dt_bias,
-            seq_idx=meta.seq_idx(x.device),
-            dt_softplus=True,
-            dt_limit=(0.0, float("inf")),
-            state_dtype=torch.float32,
-        )[0]
-
-    return visible_forward(visible, native, x, dt, A, B, C, D, dt_bias)
+    if not torch.is_grad_enabled():
+        return visible(x, dt, A, B, C, D, dt_bias)
+    return _PackedScanVJP.apply(
+        visible, x, dt, A, B, C, D, dt_bias, meta.seq_idx(x.device), meta.chunk_size
+    )
 
 
 class MambaMixer(torch.nn.Module):
