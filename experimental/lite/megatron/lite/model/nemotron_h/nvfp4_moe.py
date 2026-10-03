@@ -1,89 +1,33 @@
-"""Humming routed forward with the explicit v3 routed surrogate VJP."""
+"""Humming routed forward with the BF16 master-weight routed VJP."""
 
 from copy import copy
 
 import torch
 
 from .nvfp4_experts import Nvfp4ExpertWeights
-from .nvfp4_moe_vjp import (
-    COMPACT_BACKEND,
-    PADDED_BACKEND,
-    SURROGATE_CONTRACT,
-    RoutedSurrogateVJP,
-    compact_kernel_path,
-    validate_backend,
-    validate_matmul_policy,
-)
-
-
-def validate_token_limit(backend, contract, token_limit):
-    """Resolve the explicit diagnostic length bound without changing defaults."""
-    if backend not in (PADDED_BACKEND, COMPACT_BACKEND):
-        raise ValueError("Unknown routed VJP backend")
-    if token_limit is None:
-        return 512 if backend == COMPACT_BACKEND else 128
-    if type(token_limit) is not int or token_limit not in (2048, 8192, 9216, 16384):
-        raise ValueError(
-            "Explicit routed VJP token limit must be 2048, 8192, 9216 or 16384"
-        )
-    if backend != COMPACT_BACKEND or contract != SURROGATE_CONTRACT:
-        raise ValueError("Extended token limit requires compact and the v3 contract")
-    return token_limit
+from .nvfp4_moe_vjp import RoutedExpertsVJP
 
 
 class Nvfp4RoutedDeployment(torch.nn.Module):
-    """Own a frozen W4A16 Humming deployment alongside FP32 expert masters.
+    """Own a frozen W4A16 Humming deployment alongside BF16 expert masters.
 
     Caller initializes vLLM config, TP/EP1 groups and workspace before construction.
     Inputs are fixed expert IDs and continuous routing weights; this adapter does
     not route, normalize scores, apply routed_scaling_factor, or add shared output.
-    No Graph/compile/concurrent-host dispatch support is claimed. Default forward
-    rejects active autograd. Training requires the explicit v3 surrogate
-    contract (see ``nvfp4_moe_vjp``).
+    No Graph/compile/concurrent-host dispatch support is claimed. Training runs
+    the EP4 serving reduction (``routed_forward_reduction``) so the forward can
+    keep its visible FC1 output for ``nvfp4_moe_vjp.routed_vjp``.
     """
 
     def __init__(
         self, weights, model_config, vllm_config, quant_config,
-        *, surrogate_contract=None, routed_vjp_backend=PADDED_BACKEND,
-        routed_vjp_kernel_source=None, routed_vjp_token_limit=None,
-        routed_forward_reduction=None,
-        recompute_surrogate=False,
+        *, routed_forward_reduction=None,
     ):
         super().__init__()
         from .nvfp4_ep4 import validate_reduction
 
         validate_reduction(routed_forward_reduction)
         self.routed_forward_reduction = routed_forward_reduction
-        validate_token_limit(
-            routed_vjp_backend, surrogate_contract, routed_vjp_token_limit
-        )
-        self.routed_vjp_token_limit = routed_vjp_token_limit
-        if surrogate_contract not in (None, SURROGATE_CONTRACT):
-            raise ValueError("Unknown routed surrogate contract")
-        if surrogate_contract is not None and model_config.num_experts_per_tok != 6:
-            raise ValueError("Routed surrogate requires top6")
-        self.surrogate_contract = surrogate_contract
-        if type(recompute_surrogate) is not bool or (
-            recompute_surrogate and surrogate_contract != SURROGATE_CONTRACT
-        ):
-            raise ValueError("Surrogate recomputation requires the explicit v3 contract")
-        self.recompute_surrogate = recompute_surrogate
-        validate_backend(
-            routed_vjp_backend, routed_vjp_kernel_source, surrogate_contract
-        )
-        self.routed_vjp_backend = routed_vjp_backend
-        self.routed_vjp_kernel_source = (
-            str(compact_kernel_path())
-            if routed_vjp_backend == COMPACT_BACKEND
-            else None
-        )
-        self.routed_vjp_execution_revision = (
-            "compact-grouped-tf32-r4-f32-tma-base"
-            if routed_vjp_backend == COMPACT_BACKEND else "padded-v2"
-        )
-        self._compact_adapter = None
-        self._compact_busy = False
-        self._surrogate_generation = 0
         if not isinstance(weights, Nvfp4ExpertWeights):
             raise TypeError("Expected Nvfp4ExpertWeights")
         if (
@@ -96,11 +40,11 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             raise ValueError("Expected matching bias-free ReLU2 expert geometry")
         if not 1 <= model_config.num_experts_per_tok <= weights.num_experts:
             raise ValueError("Invalid top-k expert count")
-        if (routed_vjp_backend == COMPACT_BACKEND or routed_forward_reduction is not None) and (
+        if routed_forward_reduction is not None and (
             weights.num_experts, model_config.hidden_size,
             model_config.moe_intermediate_size, model_config.num_experts_per_tok,
         ) != (128, 2688, 1856, 6):
-            raise ValueError("Compact diagnostic requires Lightning expert geometry")
+            raise ValueError("EP4 reduction requires Lightning expert geometry")
         if weights.up_proj.device.type != "cuda":
             raise ValueError("Humming deployment requires CUDA checkpoint storage")
         self.weights = weights
@@ -124,7 +68,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             raise RuntimeError(
                 "Refresh deployment after changing expert masters/storage"
             )
-        self.weights._validate_fixed_scales()
 
     def _validate_runtime(self):
         import vllm.envs as envs
@@ -230,37 +173,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         self._deployment = layer
         self._deployment_config = deployment_config
         self._deployed_versions = self.weights._versions()
-        if self.surrogate_contract is not None:
-            self._snapshot_surrogate()
         self._ready = True
-
-    @torch.no_grad()
-    def _snapshot_surrogate(self):
-        if getattr(self, "recompute_surrogate", False):
-            self._surrogate_generation += 1
-            return
-        # Allocate new snapshots so outstanding forwards retain their own values.
-        for projection, name in (("up_proj", "up"), ("down_proj", "down")):
-            snapshot = torch.empty_like(getattr(self.weights, projection))
-            for expert in range(self.weights.num_experts):
-                snapshot[expert].copy_(
-                    self.weights._checkpoint(projection, expert).initial_master()
-                )
-            self.register_buffer(f"_surrogate_{name}", snapshot, persistent=False)
-        self._surrogate_generation += 1
-
-    @torch.no_grad()
-    def _recompute_surrogate_weights(self):
-        """Rebuild identical checkpoint-valued operands only for this VJP."""
-        values = []
-        for projection in ("up_proj", "down_proj"):
-            value = torch.empty_like(getattr(self.weights, projection))
-            for expert in range(self.weights.num_experts):
-                value[expert].copy_(
-                    self.weights._checkpoint(projection, expert).initial_master()
-                )
-            values.append(value)
-        return tuple(values)
 
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
@@ -272,64 +185,19 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         self._install()
 
     def forward(self, x, ids, routing_weights):
-        # Masters normally require grad, so even a detached x must not bypass
-        # this gate. This diagnostic API requires caller-owned torch.no_grad().
         active_grad = torch.is_grad_enabled() and any(
             t.requires_grad
             for t in (x, routing_weights, self.weights.up_proj, self.weights.down_proj)
         )
-        if active_grad:
-            if getattr(self, "surrogate_contract", None) != SURROGATE_CONTRACT:
-                raise RuntimeError(
-                    "Routed training VJP is not approved; use diagnostic no_grad"
-                )
-            self._validate_vjp_length(x.shape[0])
-            validate_matmul_policy(x.device)
-            return RoutedSurrogateVJP.apply(
-                x, self.weights.up_proj, self.weights.down_proj,
-                routing_weights, ids, self,
-            )
-        return self._visible(x, ids, routing_weights)
-
-    def _validate_vjp_length(self, tokens):
-        backend = getattr(self, "routed_vjp_backend", PADDED_BACKEND)
-        limit = validate_token_limit(
-            backend, getattr(self, "surrogate_contract", None),
-            getattr(self, "routed_vjp_token_limit", None),
+        if not active_grad:
+            return self._visible(x, ids, routing_weights)
+        if self.routed_forward_reduction is None:
+            raise RuntimeError("Routed training requires the EP4 serving reduction")
+        return RoutedExpertsVJP.apply(
+            x, self.weights.up_proj, self.weights.down_proj, routing_weights, ids, self
         )
-        if not 1 <= tokens <= limit:
-            raise ValueError(
-                f"Diagnostic {backend} surrogate is limited to M1..{limit}"
-            )
 
-    def _routed_vjp(self, x, up, down, routes, ids, dy):
-        from . import nvfp4_moe_vjp
-
-        self._validate_vjp_length(x.shape[0])
-        validate_matmul_policy(x.device)
-        if getattr(self, "routed_vjp_backend", PADDED_BACKEND) == PADDED_BACKEND:
-            return nvfp4_moe_vjp.grouped_vjp(x, up, down, routes, ids, dy)
-        if not x.is_cuda or torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Compact diagnostic requires eager CUDA execution")
-        if self._compact_busy:
-            raise RuntimeError("Compact diagnostic forbids concurrent dispatch")
-        from .nvfp4_compact_vjp import GroupedTF32, compact_vjp
-
-        self._compact_busy = True
-        try:
-            if self._compact_adapter is None:
-                self._compact_adapter = GroupedTF32(self.routed_vjp_kernel_source)
-            return compact_vjp(self._compact_adapter, x, up, down, routes, ids, dy)
-        finally:
-            # Keep launch metadata alive until all work completes, including errors.
-            try:
-                torch.cuda.synchronize(x.device)
-                if self._compact_adapter is not None:
-                    self._compact_adapter.release_metadata()
-            finally:
-                self._compact_busy = False
-
-    def _visible(self, x, ids, routing_weights):
+    def _visible(self, x, ids, routing_weights, *, return_fc1=False):
         self._validate_checkpoint()
         if not self._ready or self.weights._versions() != self._deployed_versions:
             raise RuntimeError("Refresh deployment before routed forward")
@@ -372,8 +240,11 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
                 "Diagnostic adapter must own an unnested forward context"
             )
         if x.shape[0] == 0:
+            if return_fc1:
+                raise ValueError("Routed training requires at least one token")
             return torch.empty_like(x)
         with set_forward_context(None, self._deployment_config, num_tokens=x.shape[0]):
+            fc1 = None
             if self.routed_forward_reduction is None:
                 out = self._deployment.quant_method.apply(
                     self._deployment, x, routing_weights, ids, None, None
@@ -383,12 +254,14 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
 
                 out = ep4_routed_experts(
                     self._deployment, x, routing_weights, ids,
-                    self.routed_forward_reduction,
+                    self.routed_forward_reduction, return_fc1=return_fc1,
                 )
+                if return_fc1:
+                    out, fc1 = out
         if (
             not isinstance(out, torch.Tensor)
             or out.shape != x.shape
             or out.dtype != x.dtype
         ):
             raise RuntimeError("Unexpected Humming routed output contract")
-        return out
+        return (out, fc1) if return_fc1 else out

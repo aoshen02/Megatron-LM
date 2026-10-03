@@ -1,4 +1,4 @@
-"""Explicit quantized diagnostic construction, not a production recipe.
+"""Construction of the quantized Lightning model (full depth or 4/5-layer proxy).
 
 Torch distributed must be initialized. The vLLM config, groups and workspace
 are either caller-owned or created by vllm_runtime.ensure_vllm_runtime().
@@ -10,7 +10,6 @@ from pathlib import Path
 import torch
 
 from .checkpoint import load_fp8_kv_scales
-from .nvfp4_moe_vjp import SURROGATE_CONTRACT, validate_matmul_policy
 
 
 def _reject_grad_enabled_forward(module, args):
@@ -71,21 +70,15 @@ def validate_proxy_config(config, impl):
     if not impl.hf_path:
         raise ValueError("Quantized Nemotron requires an explicit hf_path")
     forward_only = impl.diagnostic_forward_only
-    full_training = impl.diagnostic_full_training
-    # Full training runs the formal PP4 recipe on the full model or on the
-    # 4/5-layer proxy; forward-only diagnostics always cover full depth.
-    proxy_depth = config.num_hidden_layers in (4, 5)
-    full_depth = forward_only or (full_training and not proxy_depth)
-    if not forward_only and impl.surrogate_contract != SURROGATE_CONTRACT:
-        raise ValueError("Quantized training requires the explicit v3 surrogate contract")
+    # Training covers the full model or the 4/5-layer proxy; forward-only
+    # diagnostics always cover full depth.
+    full_depth = forward_only or config.num_hidden_layers not in (4, 5)
     if not forward_only and impl.optimizer_config is None:
         raise ValueError("Quantized proxy requires explicit optimizer_config")
     if any(value != 1 for value in (p.tp, p.etp or 1, p.ep, p.cp, p.vpp)):
         raise ValueError("Quantized proxy requires TP/ETP/EP/CP/VPP1")
-    if p.pp != 1 and not ((forward_only or full_training) and p.pp == 4):
-        raise ValueError(
-            "Quantized PP4 requires explicit forward-only or full-training diagnostic"
-        )
+    if p.pp not in (1, 4):
+        raise ValueError("Quantized Nemotron supports PP1 or PP4")
     if not full_depth and (
         config.num_hidden_layers not in (4, 5)
         or not {
@@ -161,7 +154,6 @@ def caller_runtime(*, pipeline_size=1):
         raise RuntimeError("Quantized runtime requires matching world/PP and TP1/EP1")
     if workspace._device != torch.device("cuda", torch.cuda.current_device()):
         raise RuntimeError("Caller workspace must use the current CUDA device")
-    validate_matmul_policy(torch.device("cuda"))
     return cfg
 
 
@@ -231,12 +223,7 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
             config,
             cfg,
             quant,
-            surrogate_contract=impl.surrogate_contract,
-            routed_vjp_backend=impl.routed_vjp_backend,
-            routed_vjp_kernel_source=impl.routed_vjp_kernel_source,
-            routed_vjp_token_limit=impl.routed_vjp_token_limit,
             routed_forward_reduction=impl.routed_forward_reduction,
-            recompute_surrogate=impl.diagnostic_full_training,
         )
 
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)

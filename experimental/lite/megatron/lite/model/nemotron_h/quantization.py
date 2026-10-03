@@ -115,68 +115,38 @@ class CheckpointProjectionFactory:
         )
 
 
-_E4M3_MAX = 448.0
+def requantize(algorithm, weight):
+    """Quantize a BF16 master with the rule that produced the checkpoint.
 
-
-def _e4m3_ceil(value):
-    """Smallest E4M3 value >= ``value`` (``value`` finite, positive, <= 448)."""
-    rounded = value.to(torch.float8_e4m3fn)
-    short = rounded.float() < value
-    bumped = (rounded.view(torch.uint8) + short.to(torch.uint8)).view(torch.float8_e4m3fn)
-    return bumped
-
-
-def grow_scales(algorithm, master, current):
-    """Encode a master, enlarging the current scales only where it overflows.
-
-    ``current`` holds the scales in use (checkpoint-domain ``weight_scale`` and,
-    for NVFP4, ``weight_scale_2``). A block keeps its scale while its largest
-    magnitude still rounds to the top code without exceeding the top grid's
-    rounding error (|x| <= 7 * factor for NVFP4, whose top codes are 4 and 6;
-    <= 464 * scale for FP8, whose top values are 448 and the 480 it lacks).
-    Otherwise it gets the smallest E4M3 scale that holds it, and the NVFP4
-    global only grows when a block exceeds the top E4M3 scale by the same
-    tolerance. An unchanged
-    master therefore re-encodes to identical bytes.
+    NVFP4 uses Transformer Engine's 4over6 quantizer with the 256 E4M3 bound,
+    which reproduces the Lightning checkpoint from its dequantized weights. FP8
+    uses vLLM's dynamic per-tensor quantization (scale = amax / 448).
     """
-    if master.dtype != torch.float32 or master.ndim != 2:
-        raise ValueError("Expected an FP32 master matrix")
-    if not torch.isfinite(master).all():
-        raise ValueError("Expected finite FP32 master weights")
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        raise ValueError("Expected a BF16 master matrix")
     if algorithm == "FP8":
-        scale = current["weight_scale"].float().reshape(())
-        amax = master.abs().max()
-        if amax > 464.0 * scale:
-            scale = amax / _E4M3_MAX
-        weight = QuantizedWeight("FP8", {"weight": master.to(torch.float8_e4m3fn),
-                                         "weight_scale": scale}).encode_master(master)
-        return {"weight": weight, "weight_scale": scale}
-    if algorithm != "W4A16_NVFP4" or master.shape[-1] % 16:
-        raise ValueError(f"Unsupported scale update: {algorithm}")
-    rows, cols = master.shape
-    block_amax = master.abs().reshape(rows, cols // 16, 16).amax(-1)
-    global_scale = current["weight_scale_2"].float().reshape(())
-    scale = current["weight_scale"].float().reshape(rows, cols // 16)
-    needed = block_amax / (6.0 * global_scale)
-    # Same tolerance as a block: the top scale still rounds |x| <= 7/6 of it.
-    if needed.max() > _E4M3_MAX * (7.0 / 6.0):
-        old = global_scale
-        global_scale = block_amax.max() / (6.0 * _E4M3_MAX)
-        # Rescaled scales leave the E4M3 grid; round up so no block clips.
-        scale = _e4m3_ceil((scale * (old / global_scale)).clamp_max(_E4M3_MAX)).float()
-        needed = block_amax / (6.0 * global_scale)
-    grow = needed > scale * (7.0 / 6.0)
-    scale = torch.where(grow, _e4m3_ceil(needed.clamp_max(_E4M3_MAX)).float(), scale)
-    encoded = {
-        "weight_scale": scale.to(torch.float8_e4m3fn),
-        "weight_scale_2": global_scale.to(torch.float32),
+        from vllm import _custom_ops as ops
+
+        packed, scale = ops.scaled_fp8_quant(weight.contiguous())
+        return {"weight": packed, "weight_scale": scale.reshape(())}
+    if algorithm != "W4A16_NVFP4" or weight.shape[-1] % 16:
+        raise ValueError(f"Unsupported requantization: {algorithm}")
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+
+    quantizer = NVFP4Quantizer(
+        rowwise=True, columnwise=False, nvfp4_use_4over6=True, nvfp4_e4m3_max=256
+    )
+    quantized = quantizer(weight.contiguous())
+    rows, cols = weight.shape
+    amax = quantized._amax_rowwise.float().reshape(())
+    return {
+        "weight": quantized._rowwise_data.view(torch.uint8)[:rows, : cols // 2]
+        .contiguous(),
+        "weight_scale": quantized._rowwise_scale_inv.view(torch.float8_e4m3fn)[
+            :rows, : cols // 16
+        ].contiguous(),
+        "weight_scale_2": amax / (6.0 * 256.0),
     }
-    packed_shape = (rows, cols // 2)
-    weight = QuantizedWeight(
-        "W4A16_NVFP4",
-        {"weight": torch.zeros(packed_shape, dtype=torch.uint8, device=master.device), **encoded},
-    ).encode_master(master)
-    return {"weight": weight, **encoded}
 
 
 @dataclass(frozen=True)
@@ -187,7 +157,7 @@ class QuantizedWeight:
     tensors: dict[str, torch.Tensor]
 
     def initial_master(self):
-        """Recover an FP32 representative, not the original prequantized weight."""
+        """Dequantize the checkpoint to FP32."""
         weight = self.tensors["weight"]
         scale = self.tensors["weight_scale"]
         if self.algorithm == "FP8":
@@ -227,153 +197,76 @@ class QuantizedWeight:
             raise ValueError("Nonfinite checkpoint weights")
         return result
 
-    def encode_master(self, master):
-        """Fixed-scale reference serializer; scales are not recalibrated."""
-        if master.dtype != torch.float32 or not torch.isfinite(master).all():
-            raise ValueError("Expected finite FP32 master weights")
-        stored = self.tensors["weight"]
-        expected = (
-            (stored.shape[0], stored.shape[1] * 2)
-            if self.algorithm == "W4A16_NVFP4"
-            else stored.shape
-        )
-        if master.shape != expected:
-            raise ValueError("Master shape does not match checkpoint geometry")
-        scale = self.tensors["weight_scale"].float()
-        if self.algorithm == "FP8":
-            maximum = torch.finfo(torch.float8_e4m3fn).max
-            return (
-                (master * scale.reciprocal())
-                .clamp(-maximum, maximum)
-                .to(torch.float8_e4m3fn)
-            )
-        factors = scale.repeat_interleave(16, -1) * self.tensors["weight_scale_2"]
-        # A zero group scale encodes an all-zero block; never divide by it.
-        normalized = torch.where(factors > 0, master / factors, 0.0)
-        midpoints = master.new_tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
-        magnitude = normalized.abs().contiguous()
-        index = torch.bucketize(magnitude, midpoints, right=False)
-        tie = (index < 7) & (magnitude == midpoints[index.clamp_max(6)])
-        index = index + (tie & ((index & 1) != 0)).long()
-        codes = index.to(torch.uint8) | (torch.signbit(normalized).to(torch.uint8) << 3)
-        return codes[:, 0::2] | (codes[:, 1::2] << 4)
-
-
-class _Nvfp4LinearVJP(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, master, dequantized, deployment):
-        # Saving master also catches an optimizer update before backward.
-        ctx.save_for_backward(x, master, dequantized)
-        return deployment(x)
-
-    @staticmethod
-    def backward(ctx, dy):
-        x, master, dequantized = ctx.saved_tensors
-        dx = (dy.float() @ dequantized).to(x.dtype)
-        dw = dy.flatten(0, -2).float().T @ x.flatten(0, -2).float()
-        return dx, dw, None, None
-
 
 class Nvfp4TrainingLinear(torch.nn.Module):
-    """Inference-visible W4A16 linear with fixed-scale identity weight STE.
+    """Inference-visible W4A16 linear over a BF16 master weight.
 
-    The factory consumes checkpoint-domain tensors and constructs a fresh frozen
-    inference layer. Refresh explicitly after optimizer updates and outside Graph
-    capture; this initial adapter does not promise stable deployment pointers.
+    The deployment starts from the checkpoint bytes. After an optimizer update,
+    ``refresh_deployment(recompute_scales=True)`` requantizes the master with
+    the checkpoint's own rule. Backward is the BF16 master-weight VJP.
+    Refresh outside Graph capture; deployment pointers are not stable.
     """
 
     def __init__(self, checkpoint, deployment_factory, *, device):
         super().__init__()
         if checkpoint.algorithm != "W4A16_NVFP4":
-            raise ValueError("This VJP supports W4A16 NVFP4 only")
-        self.weight = torch.nn.Parameter(checkpoint.initial_master().to(device))
-        self.register_buffer(
-            "weight_scale", checkpoint.tensors["weight_scale"].to(device)
+            raise ValueError("This adapter supports W4A16 NVFP4 only")
+        self.weight = torch.nn.Parameter(
+            checkpoint.initial_master().to(device, torch.bfloat16)
         )
-        self.register_buffer(
-            "weight_scale_2", checkpoint.tensors["weight_scale_2"].to(device)
-        )
+        for name in ("weight_scale", "weight_scale_2"):
+            self.register_buffer(name, checkpoint.tensors[name].to(device))
         self.register_buffer(
             "_packed", checkpoint.tensors["weight"].to(device), persistent=False
         )
-        self.register_buffer(
-            "_dequantized", self.weight.detach().clone(), persistent=False
-        )
         self._factory = deployment_factory
-        self._install(self._packed)
+        self._requantized = False
+        self._install()
 
-    def _checkpoint(self, packed):
-        return QuantizedWeight(
-            "W4A16_NVFP4",
-            {
-                "weight": packed,
-                "weight_scale": self.weight_scale,
-                "weight_scale_2": self.weight_scale_2,
-            },
-        )
-
-    def _install(self, packed):
-        # Clone loader inputs: runtime transforms must not mutate export scales.
-        tensors = {
-            k: v.detach().clone() for k, v in self._checkpoint(packed).tensors.items()
+    def _tensors(self):
+        return {
+            "weight": self._packed,
+            "weight_scale": self.weight_scale,
+            "weight_scale_2": self.weight_scale_2,
         }
-        deployment = self._factory(tensors)
+
+    def _install(self):
+        # Clone loader inputs: runtime transforms must not mutate export bytes.
+        deployment = self._factory(
+            {k: v.detach().clone() for k, v in self._tensors().items()}
+        )
         deployment.requires_grad_(False)
         self._inference = deployment
-        self._packed = packed.detach().clone()
-        self._dequantized = self._checkpoint(self._packed).initial_master()
-        self._deployed_versions = self._versions()
+        self._deployed_version = self.weight._version
 
-    def _versions(self):
-        return (
-            self.weight._version,
-            self.weight_scale._version,
-            self.weight_scale_2._version,
-        )
+    def _check_fresh(self):
+        if self.weight._version != self._deployed_version:
+            raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
-        """Re-encode the master; after the first update, grow overflowing scales.
-
-        Scales stay the checkpoint's until ``recompute_scales`` is first set
-        (after the first optimizer update); from then on a block's scale only
-        grows where the master overflows it (``grow_scales``).
-        """
-        self._recompute_scales = getattr(self, "_recompute_scales", False)
-        self._recompute_scales |= recompute_scales
-        if not self._recompute_scales:
-            packed = self._checkpoint(self._packed).encode_master(self.weight)
-        else:
-            tensors = grow_scales(
-                "W4A16_NVFP4",
-                self.weight,
-                {"weight_scale": self.weight_scale, "weight_scale_2": self.weight_scale_2},
-            )
+        """Reinstall; once the master has been updated, requantize it first."""
+        self._requantized |= recompute_scales
+        if self._requantized:
+            tensors = requantize("W4A16_NVFP4", self.weight)
+            self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"])
             self.weight_scale_2.copy_(
                 tensors["weight_scale_2"].reshape(self.weight_scale_2.shape)
             )
-            packed = tensors["weight"]
-        self._install(packed)
+        self._install()
 
     def export_quantized(self):
-        if self._versions() != self._deployed_versions:
-            raise RuntimeError(
-                "Refresh deployment after updating master weights or scales"
-            )
-        return {
-            k: v.detach().clone()
-            for k, v in self._checkpoint(self._packed).tensors.items()
-        }
+        self._check_fresh()
+        return {k: v.detach().clone() for k, v in self._tensors().items()}
 
     def forward(self, x):
-        if self._versions() != self._deployed_versions:
-            raise RuntimeError(
-                "Refresh deployment after updating master weights or scales"
-            )
+        from .functional import visible_linear
+
+        self._check_fresh()
         if x.dtype != torch.bfloat16 or x.shape[-1] != self.weight.shape[-1]:
             raise ValueError("Expected BF16 activations with checkpoint K")
-        return _Nvfp4LinearVJP.apply(x, self.weight, self._dequantized, self._inference)
+        return visible_linear(self._inference, x, self.weight)
 
 
 def load_quantized_weight(root, prefix, recipe):

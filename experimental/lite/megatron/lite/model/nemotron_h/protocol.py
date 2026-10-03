@@ -34,49 +34,17 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
     hf_path: str | None = None
-    surrogate_contract: str | None = None
-    routed_vjp_backend: str = "padded-v2"
-    routed_vjp_kernel_source: str | None = None
-    routed_vjp_token_limit: int | None = None
     routed_forward_reduction: str | None = None
     diagnostic_forward_only: bool = False
-    diagnostic_full_training: bool = False
 
     def __post_init__(self):
         from .nvfp4_ep4 import validate_reduction
-        from .nvfp4_moe_vjp import COMPACT_BACKEND, SURROGATE_CONTRACT, validate_backend
 
         validate_reduction(self.routed_forward_reduction)
         if type(self.diagnostic_forward_only) is not bool:
             raise ValueError("diagnostic_forward_only must be boolean")
-        if type(self.diagnostic_full_training) is not bool:
-            raise ValueError("diagnostic_full_training must be boolean")
-        if self.diagnostic_full_training and (
-            self.diagnostic_forward_only or self.optimizer != "dist_opt"
-            or self.parallel.pp != 4
-            or self.surrogate_contract != SURROGATE_CONTRACT
-            or self.routed_vjp_backend != COMPACT_BACKEND
-        ):
-            raise ValueError("Full training diagnostic requires PP4, dist_opt and compact V2")
-        if self.diagnostic_forward_only and (
-            self.optimizer is not None or self.surrogate_contract is not None
-            or self.routed_vjp_backend != "padded-v2"
-            or self.routed_vjp_kernel_source is not None
-            or self.routed_vjp_token_limit is not None
-        ):
-            raise ValueError("Full-depth forward-only requires no optimizer or VJP")
-        from .nvfp4_moe import validate_token_limit
-        validate_token_limit(
-            self.routed_vjp_backend,
-            self.surrogate_contract,
-            self.routed_vjp_token_limit,
-        )
-
-        validate_backend(
-            self.routed_vjp_backend,
-            self.routed_vjp_kernel_source,
-            self.surrogate_contract,
-        )
+        if self.diagnostic_forward_only and self.optimizer is not None:
+            raise ValueError("Full-depth forward-only requires no optimizer")
 
 
 def build_model_config(source, **overrides):
@@ -198,24 +166,20 @@ def build_model(model_cfg, *, impl_cfg):
     from .vllm_runtime import ensure_vllm_runtime
 
     validate_proxy_config(model_cfg, impl_cfg)
-    if impl_cfg.surrogate_contract is not None:
-        # The surrogate VJPs are defined in FP32 matmul arithmetic; this
-        # protocol owns that policy instead of relying on each launcher.
-        torch.backends.cuda.matmul.allow_tf32 = False
     with set_current_vllm_config(ensure_vllm_runtime(impl_cfg.parallel.pp)):
         return _build_model(model_cfg, impl_cfg)
 
 
 def _refresh_quantized(chunks):
-    # Post-optimizer hook: checkpoint scales are only valid for the initial
-    # weights (DeepSeek-V4 invalidates them after its first update too).
+    # Post-optimizer hook: the checkpoint bytes are only valid for the initial
+    # weights (DeepSeek-V4 invalidates its bound scales after an update too).
     with vllm_context(chunks[0]):
         refresh_quantized_projections(chunks, recompute_scales=True)
 
 
 def _refresh_after_model_load(chunks):
-    # The runtime's HF loader rewrites the masters after build_model; re-encode
-    # with the checkpoint scales before the optimizer copies them.
+    # The runtime's HF loader may rebind the masters after build_model;
+    # reinstall the deployments before the first forward.
     with vllm_context(chunks[0]):
         refresh_quantized_projections(chunks)
 
@@ -233,8 +197,6 @@ def _build_model(model_cfg, impl_cfg):
         )
 
         caller_runtime(pipeline_size=impl_cfg.parallel.pp)
-    elif impl_cfg.surrogate_contract is not None:
-        raise ValueError("Surrogate contract requires a quantized checkpoint")
     elif impl_cfg.routed_forward_reduction is not None:
         raise ValueError("EP4 forward reduction requires a quantized checkpoint")
     p = impl_cfg.parallel

@@ -36,6 +36,46 @@ def visible_forward(visible, native, *inputs):
     return _VisibleForward.apply(visible, native, *inputs)
 
 
+def native_linear_vjp(grad_output, value, weight):
+    """BF16 dgrad/wgrad on the master weight (TE ``high_precision`` semantics).
+
+    Same arithmetic as the DeepSeek-V4 aligned actor (NVIDIA/Megatron-LM#7050).
+    """
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+    x2d = value.reshape(-1, value.shape[-1]).contiguous()
+    dy2d = grad_output.reshape(-1, grad_output.shape[-1]).to(value.dtype).contiguous()
+    grad_value = general_gemm(
+        weight.to(dy2d.dtype), dy2d, out_dtype=value.dtype, layout="NN", grad=True
+    )[0]
+    grad_weight = general_gemm(
+        x2d, dy2d, out_dtype=weight.dtype, layout="NT", grad=True
+    )[0]
+    return grad_value.reshape(value.shape), grad_weight
+
+
+class _VisibleLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible, value, weight):
+        ctx.save_for_backward(value)
+        ctx.weight, ctx.version = weight, weight._version
+        return visible(value)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if ctx.weight._version != ctx.version:
+            raise RuntimeError("Master weight changed between forward and backward")
+        (value,) = ctx.saved_tensors
+        return None, *native_linear_vjp(grad_output, value, ctx.weight)
+
+
+def visible_linear(visible, value, weight):
+    """Inference-visible forward; BF16 master-weight VJP for value and weight."""
+    if not torch.is_grad_enabled() or not (value.requires_grad or weight.requires_grad):
+        return visible(value)
+    return _VisibleLinear.apply(visible, value, weight)
+
+
 def linear(x, weight, bias=None):
     from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
 

@@ -46,13 +46,14 @@ def reduce_ep4_parts(parts, ids, recipe):
     return total.to(torch.bfloat16)
 
 
-def ep4_routed_experts(layer, x, topk_weights, topk_ids, recipe):
+def ep4_routed_experts(layer, x, topk_weights, topk_ids, recipe, *, return_fc1=False):
     """Run unsharded Humming indexed experts with an EP4 serving combine.
 
     Calls the experts' own stages in the order ``HummingIndexedExperts.apply``
     does (no prepare quantization applies to W4A16), then replaces only its
     final ``moe_fused_mul_sum`` with the four rank partials an EP4 deployment
-    computes and combines them in the selected serving order.
+    computes and combines them in the selected serving order. ``return_fc1``
+    also returns the visible FC1 output per route (token-major, slot-minor).
     """
     validate_reduction(recipe)
     if recipe is None:
@@ -109,4 +110,5 @@ def ep4_routed_experts(layer, x, topk_weights, topk_ids, recipe):
         parts.append(
             moe_fused_mul_sum(per_route, topk_weights, topk_ids=topk_ids, expert_map=mapping)
         )
-    return reduce_ep4_parts(parts, topk_ids, recipe)
+    out = reduce_ep4_parts(parts, topk_ids, recipe)
+    return (out, buffers["gate_up_output"]) if return_fc1 else out

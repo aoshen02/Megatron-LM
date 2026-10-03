@@ -84,25 +84,6 @@ def test_missing_mamba_heads_cannot_fall_back_to_expand(lightning_config):
         NemotronHConfig._from_hf_dict(lightning_config)
 
 
-def test_routed_vjp_token_limit_admits_only_listed_extended_bounds():
-    from megatron.lite.model.nemotron_h.nvfp4_moe import validate_token_limit
-    from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import (
-        COMPACT_BACKEND,
-        PADDED_BACKEND,
-        SURROGATE_CONTRACT,
-    )
-
-    assert validate_token_limit(COMPACT_BACKEND, SURROGATE_CONTRACT, 16384) == 16384
-    assert validate_token_limit(COMPACT_BACKEND, None, None) == 512
-    for limit in (16048, 16385, 32768):
-        with pytest.raises(ValueError):
-            validate_token_limit(COMPACT_BACKEND, SURROGATE_CONTRACT, limit)
-    with pytest.raises(ValueError):
-        validate_token_limit(PADDED_BACKEND, SURROGATE_CONTRACT, 16384)
-    with pytest.raises(ValueError):
-        validate_token_limit(COMPACT_BACKEND, None, 16384)
-
-
 def test_nemotron_registers_only_the_vllm_aligned_impl():
     from megatron.lite.model.registry import resolve_runtime_model_name
 

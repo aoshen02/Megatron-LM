@@ -1,138 +1,99 @@
-"""Grouped routed-expert surrogate VJP, contract v3.
+"""Routed-expert VJP on the BF16 masters (TE ``high_precision`` semantics).
 
-Fixed-scale STE onto the FP32 masters with BF16 intermediate edges. The expert
-GEMMs of the compact backend read FP32 storage as TF32 operands (the dequantized
-weights are truncated toward zero; BF16 activations are exact) and accumulate in
-FP32. The padded backend evaluates the same graph with torch GEMMs and serves as
-a diagnostic reference only; it is not an FP32 reference when batch invariance
-replaces those GEMMs. This module establishes no SFT/RL quality approval.
+Mirrors the DeepSeek-V4 aligned actor's grouped backward
+(NVIDIA/Megatron-LM#7050): the visible FC1 output is saved in forward and the
+dgrad/wgrad GEMMs run as Transformer Engine grouped BF16 GEMMs.
 """
-
-import hashlib
-from pathlib import Path
 
 import torch
 
-SURROGATE_CONTRACT = "moe-fixedscale-grouped-tf32rz-bf16edges-v3"
-PADDED_BACKEND = "padded-v2"
-COMPACT_BACKEND = "compact-f32-tma-nosplit"
-COMPACT_KERNEL_SHA = "b30d3192f88a5dc324278f0b3f22b9cb44bcea6c8eb2c2cfa380c07d75368e74"
+
+def _te_grouped_gemm(lhs, rhs, out, *, layout, m_splits, single_output=False):
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+
+    outputs = [out] if isinstance(out, torch.Tensor) else list(out)
+    general_grouped_gemm(
+        list(lhs),
+        list(rhs),
+        outputs,
+        [None] * len(lhs),
+        torch.bfloat16,
+        single_output=single_output,
+        layout=layout,
+        m_splits=list(m_splits),
+        grad=True,
+        use_split_accumulator=True,
+    )
 
 
-def compact_kernel_path():
-    """Return the kernel shipped with this training package."""
-    return Path(__file__).with_name("grouped_gemm_tma_f32.py").resolve()
+def routed_vjp(x, fc1, up, down, routes, ids, dy):
+    """ReLU2 routed experts: ``y = sum_s routes[:, s] * down(relu(up(x))**2)``.
 
+    Args:
+        x: BF16 tokens, ``[M, K]``.
+        fc1: Visible FC1 output per route (token-major, slot-minor), ``[M*topk, I]``.
+        up, down: BF16 masters, ``[E, I, K]`` and ``[E, K, I]``.
+        routes: FP32 routing weights, ``[M, topk]``.
+        ids: Expert ids, ``[M, topk]``.
+        dy: BF16 output gradient, ``[M, K]``.
 
-def validate_backend(backend, kernel_source, surrogate_contract):
-    """Validate diagnostic selection without importing a CUDA runtime."""
-    if backend not in (PADDED_BACKEND, COMPACT_BACKEND):
-        raise ValueError("Unknown routed VJP backend")
-    if backend == PADDED_BACKEND:
-        if kernel_source is not None:
-            raise ValueError("padded-v2 does not accept a compact kernel artifact")
-        return
-    if surrogate_contract != SURROGATE_CONTRACT:
-        raise ValueError("Compact backend requires the explicit v3 surrogate contract")
-    path = compact_kernel_path()
-    if kernel_source is not None and Path(kernel_source).resolve() != path:
-        raise ValueError("Compact backend requires the installed package kernel")
-    if (
-        not path.is_file()
-        or hashlib.sha256(path.read_bytes()).hexdigest() != COMPACT_KERNEL_SHA
-    ):
-        raise ValueError("Missing or unreviewed compact kernel artifact")
-
-
-def validate_matmul_policy(device):
-    if torch.is_autocast_enabled(device.type):
-        raise RuntimeError("Routed surrogate requires caller-disabled autocast")
-    if device.type == "cuda" and torch.backends.cuda.matmul.allow_tf32:
-        raise RuntimeError(
-            "Routed surrogate requires caller-disabled TF32 matmul; only the compact "
-            "kernel opts its own operands into TF32"
-        )
-
-
-def grouped_vjp(x, up, down, routes, ids, dy):
-    """Fixed top6 padded FP32 VJP; no per-token Python dispatch loops."""
-    validate_matmul_policy(x.device)
+    Returns:
+        ``(dx, d_up, d_down, d_routes)``.
+    """
     m, k = x.shape
-    topk = ids.shape[1]
-    if topk != 6:
-        raise ValueError("Routed surrogate requires top6")
-    experts = up.shape[0]
-    count = m * topk
-    flat_ids = ids.reshape(-1).long()
-    route_index = torch.arange(count, device=x.device)
-    flat_pos = flat_ids * count + route_index
-    token_index = torch.arange(m, device=x.device).repeat_interleave(topk)
-
-    def dispatch(rows):
-        padded = rows.new_zeros(experts * count, rows.shape[-1])
-        return padded.index_copy(0, flat_pos, rows).view(experts, count, -1)
-
-    xp = dispatch(x.float().index_select(0, token_index))
-    u = torch.bmm(xp, up.transpose(1, 2)).to(torch.bfloat16)
+    topk, experts = ids.shape[1], up.shape[0]
+    flat = ids.reshape(-1).long()
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=experts).tolist()
+    token = order // topk
+    u = fc1.index_select(0, order)
     h = u.float().relu().square().to(torch.bfloat16)
-    v = torch.bmm(h.float(), down.transpose(1, 2)).to(torch.bfloat16)
-    gr = dy.float().index_select(0, token_index)
-    selected_v = v[flat_ids, route_index].float()
-    dr = (gr * selected_v).sum(-1).view(m, topk)
-    gv = dispatch((gr * routes.reshape(-1, 1)).to(torch.bfloat16).float())
-    dd = torch.bmm(gv.transpose(1, 2), h.float())
-    gh = torch.bmm(gv, down).to(torch.bfloat16).float()
-    gu = (gh * 2 * u.float().relu()).to(torch.bfloat16).float()
-    du = torch.bmm(gu.transpose(1, 2), xp)
-    dx_routes = torch.bmm(gu, up)[flat_ids, route_index].view(m, topk, k)
-    dx = torch.zeros_like(x, dtype=torch.float32)
-    for slot in reversed(range(topk)):
-        dx = dx + dx_routes[:, slot]
-    return dx.to(x.dtype), du, dd, dr
+    x_rows = x.index_select(0, token)
+    dy_rows = dy.index_select(0, token)
+    weight = routes.reshape(-1).index_select(0, order)
+    dv = (dy_rows.float() * weight[:, None]).to(torch.bfloat16)
+
+    def split(rows):
+        return torch.split(rows, counts)
+
+    v = torch.empty_like(dy_rows)
+    _te_grouped_gemm(down.unbind(0), split(h), v, layout="TN", m_splits=counts,
+                     single_output=True)
+    d_weight = (dy_rows.float() * v.float()).sum(-1)
+    dh = torch.empty_like(h)
+    _te_grouped_gemm(down.unbind(0), split(dv), dh, layout="NN", m_splits=counts,
+                     single_output=True)
+    d_down = torch.zeros_like(down)
+    _te_grouped_gemm(split(h), split(dv), d_down.unbind(0), layout="NT",
+                     m_splits=counts)
+    du = (dh.float() * 2 * u.float().relu()).to(torch.bfloat16)
+    dx_rows = torch.empty_like(x_rows)
+    _te_grouped_gemm(up.unbind(0), split(du), dx_rows, layout="NN", m_splits=counts,
+                     single_output=True)
+    d_up = torch.zeros_like(up)
+    _te_grouped_gemm(split(x_rows), split(du), d_up.unbind(0), layout="NT",
+                     m_splits=counts)
+    per_route = torch.empty_like(dx_rows).index_copy_(0, order, dx_rows).view(m, topk, k)
+    dx = per_route[:, 0].float()
+    for slot in range(1, topk):
+        dx = dx + per_route[:, slot].float()
+    d_routes = torch.empty_like(d_weight).index_copy_(0, order, d_weight).view(m, topk)
+    return dx.to(x.dtype), d_up, d_down, d_routes
 
 
-class RoutedSurrogateVJP(torch.autograd.Function):
+class RoutedExpertsVJP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, up_master, down_master, routes, ids, owner):
-        validate_matmul_policy(x.device)
-        ctx.owner = owner
-        ctx.generation = owner._surrogate_generation
-        ctx.versions = owner.weights._versions()
-        ctx.recompute = getattr(owner, "recompute_surrogate", False)
-        ctx.backend = (
-            getattr(owner, "routed_vjp_backend", PADDED_BACKEND),
-            getattr(owner, "routed_vjp_kernel_source", None),
-        )
-        ctx.save_for_backward(
-            x, routes, ids, up_master, down_master,
-            None if ctx.recompute else owner._surrogate_up,
-            None if ctx.recompute else owner._surrogate_down,
-        )
-        return owner._visible(x, ids, routes)
+    def forward(ctx, x, up, down, routes, ids, owner):
+        out, fc1 = owner._visible(x, ids, routes, return_fc1=True)
+        ctx.owner, ctx.versions = owner, owner.weights._versions()
+        ctx.save_for_backward(x, fc1, up, down, routes, ids)
+        return out
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, dy):
-        owner = ctx.owner
-        owner._validate_checkpoint()
-        if (
-            not owner._ready
-            or owner._surrogate_generation != ctx.generation
-            or owner.weights._versions() != ctx.versions
-            or getattr(owner, "recompute_surrogate", False) != ctx.recompute
-            or ctx.backend != (
-                getattr(owner, "routed_vjp_backend", PADDED_BACKEND),
-                getattr(owner, "routed_vjp_kernel_source", None),
-            )
-        ):
-            raise RuntimeError("Routed deployment changed before backward")
-        x, routes, ids, up_master, down_master, up, down = ctx.saved_tensors
-        if (
-            owner.weights.up_proj is not up_master
-            or owner.weights.down_proj is not down_master
-        ):
+        if ctx.owner.weights._versions() != ctx.versions:
             raise RuntimeError("Expert masters changed before backward")
-        if ctx.recompute:
-            up, down = owner._recompute_surrogate_weights()
-        dx, du, dd, dr = owner._routed_vjp(x, up, down, routes, ids, dy)
-        return dx, du, dd, dr, None, None
+        x, fc1, up, down, routes, ids = ctx.saved_tensors
+        dx, d_up, d_down, d_routes = routed_vjp(x, fc1, up, down, routes, ids, dy)
+        return dx, d_up, d_down, d_routes, None, None

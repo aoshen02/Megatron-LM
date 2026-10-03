@@ -5,15 +5,16 @@ from pathlib import Path
 
 import torch
 
-from .quantization import QuantizedWeight, load_quantized_weight
+from .quantization import QuantizedWeight, load_quantized_weight, requantize
 
 
 class Nvfp4ExpertWeights(torch.nn.Module):
-    """TP1/EP1 FP32 masters and group16 scales, with explicit refresh.
+    """TP1/EP1 BF16 masters and their NVFP4 deployment bytes, with explicit refresh.
 
-    Scales are the checkpoint's until the first ``refresh_quantized`` with
-    ``recompute_scales`` (after the first optimizer update); from then on each
-    refresh grows a block's scale only where its expert master overflows it.
+    The deployment bytes are the checkpoint's until the first
+    ``refresh_quantized`` with ``recompute_scales`` (after the first optimizer
+    update); from then on every refresh requantizes the masters with the
+    checkpoint's rule (``quantization.requantize``).
 
     No forward, backward, routing, Humming packing, or deployment is implemented.
     Ordinary optimizer mutations are version-checked. Runtime updates through
@@ -88,7 +89,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             ("down_proj", hidden_size, intermediate_size),
         ):
             master = torch.empty(
-                num_experts, rows, columns, dtype=torch.float32, device=device
+                num_experts, rows, columns, dtype=torch.bfloat16, device=device
             )
             packed = torch.empty(
                 num_experts, rows, columns // 2, dtype=torch.uint8, device=device
@@ -107,8 +108,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                 checkpoint = load_quantized_weight(root, name, quantized_layers[name])
                 if checkpoint.tensors["weight"].shape != (rows, columns // 2):
                     raise ValueError(f"Wrong packed geometry for {name}")
-                value = checkpoint.initial_master()
-                master[expert].copy_(value)
+                master[expert].copy_(checkpoint.initial_master())
                 packed[expert].copy_(checkpoint.tensors["weight"])
                 scales[expert].copy_(checkpoint.tensors["weight_scale"])
                 global_scales[expert].copy_(
@@ -119,12 +119,6 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             self.register_buffer(f"_{projection}_packed", packed)
             self.register_buffer(f"_{projection}_scale", scales)
             self.register_buffer(f"_{projection}_global", global_scales)
-            self.register_buffer(
-                f"_{projection}_scale_fixed", scales.clone(), persistent=False
-            )
-            self.register_buffer(
-                f"_{projection}_global_fixed", global_scales.clone(), persistent=False
-            )
             self._global_shapes[projection] = shapes
         self._synced_versions = self._versions()
         self._dirty = False
@@ -147,14 +141,14 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         for projection, (rows, columns) in self._geometry.items():
             master = getattr(self, projection)
             specs = [
-                (master, (self.num_experts, rows, columns), torch.float32),
+                (master, (self.num_experts, rows, columns), torch.bfloat16),
                 (
                     getattr(self, f"_{projection}_packed"),
                     (self.num_experts, rows, columns // 2),
                     torch.uint8,
                 ),
             ]
-            for suffix in ("scale", "scale_fixed"):
+            for suffix in ("scale",):
                 specs.append(
                     (
                         getattr(self, f"_{projection}_{suffix}"),
@@ -162,7 +156,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                         torch.float8_e4m3fn,
                     )
                 )
-            for suffix in ("global", "global_fixed"):
+            for suffix in ("global",):
                 specs.append(
                     (
                         getattr(self, f"_{projection}_{suffix}"),
@@ -198,58 +192,28 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             },
         )
 
-    def _validate_fixed_scales(self):
-        if getattr(self, "_recompute_scales", False):
-            return
-        for projection in ("up_proj", "down_proj"):
-            for suffix in ("scale", "global"):
-                current = getattr(self, f"_{projection}_{suffix}")
-                fixed = getattr(self, f"_{projection}_{suffix}_fixed")
-                if not torch.equal(
-                    current.reshape(-1).view(torch.uint8),
-                    fixed.reshape(-1).view(torch.uint8),
-                ):
-                    raise RuntimeError("Fixed checkpoint scales must not change")
-
     def mark_dirty(self):
         """Invalidate before non-versioned runtime writes; refresh before export."""
         self._dirty = True
 
     @torch.no_grad()
     def refresh_quantized(self, recompute_scales=False):
-        """Re-encode masters without rebinding parameters or storage."""
-        from .quantization import grow_scales
-
+        """Once the masters have been updated, requantize them in place."""
         self._dirty = True
         self._validate_storage()
-        self._validate_fixed_scales()
-        self._recompute_scales = getattr(self, "_recompute_scales", False)
-        self._recompute_scales |= recompute_scales
-        for projection in ("up_proj", "down_proj"):
-            parameter = getattr(self, projection)
-            for expert in range(self.num_experts):
-                checkpoint = self._checkpoint(projection, expert)
-                if not self._recompute_scales:
-                    packed = checkpoint.encode_master(parameter[expert])
-                    checkpoint.tensors["weight"].copy_(packed)
-                    continue
-                tensors = grow_scales(
-                    "W4A16_NVFP4",
-                    parameter[expert],
-                    {
-                        "weight_scale": getattr(self, f"_{projection}_scale")[expert],
-                        "weight_scale_2": getattr(self, f"_{projection}_global")[expert],
-                    },
-                )
-                getattr(self, f"_{projection}_scale")[expert].copy_(
-                    tensors["weight_scale"]
-                )
-                getattr(self, f"_{projection}_global")[expert].copy_(
-                    tensors["weight_scale_2"]
-                )
-                getattr(self, f"_{projection}_packed")[expert].copy_(
-                    tensors["weight"]
-                )
+        self._requantized = getattr(self, "_requantized", False) | recompute_scales
+        if self._requantized:
+            for projection in ("up_proj", "down_proj"):
+                parameter = getattr(self, projection)
+                for expert in range(self.num_experts):
+                    tensors = requantize("W4A16_NVFP4", parameter[expert])
+                    getattr(self, f"_{projection}_packed")[expert].copy_(tensors["weight"])
+                    getattr(self, f"_{projection}_scale")[expert].copy_(
+                        tensors["weight_scale"]
+                    )
+                    getattr(self, f"_{projection}_global")[expert].copy_(
+                        tensors["weight_scale_2"]
+                    )
         self._synced_versions = self._versions()
         self._dirty = False
 
@@ -258,7 +222,6 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         self._validate_storage()
         if self._dirty or self._versions() != self._synced_versions:
             raise RuntimeError("Refresh quantized expert weights after master updates")
-        self._validate_fixed_scales()
         return {
             f"{self.prefix}.{expert}.{projection}.{suffix}": tensor.detach().clone()
             for expert in range(self.num_experts)

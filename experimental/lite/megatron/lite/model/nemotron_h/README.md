@@ -17,18 +17,19 @@ build. With verl, select it with `actor_rollout_ref.actor.engine.impl=vllm`.
 - **Unquantized layers** (Mamba2, norms, embeddings, router) are BF16 and use
   vLLM's batch-invariant kernels; Mamba2 uses vLLM's exact-replay SSD.
 - **Parameters.**
-  - Each quantized weight is an FP32 master `Parameter`. The forward never
-    reads it; it reads the FP4/FP8 encoding refreshed by the
-    `post_optimizer_step_hook` after every successful optimizer step.
-  - The actor forward and the rollout export read the same refreshed bytes,
-    so the rollout serves exactly the weights the actor computes with.
-- **Backward.**
-  - Weight gradients use a straight-through estimator onto the FP32 masters.
-  - The routed-expert VJP follows the surrogate contract
-    `moe-fixedscale-grouped-tf32rz-bf16edges-v3`: TF32 operands (the
-    dequantized weights are truncated toward zero), FP32 accumulation, BF16
-    intermediate edges.
-  - Sequence length is bounded by `routed_vjp_token_limit` (at most 16384).
+  - Each quantized weight is a BF16 master `Parameter` with FP32 optimizer
+    main parameters, as in the DeepSeek-V4 aligned actor. The forward never
+    reads it; it reads the FP4/FP8 deployment bytes.
+  - The deployment starts from the checkpoint bytes. After every optimizer
+    step the `post_optimizer_step_hook` requantizes the masters with the
+    checkpoint's own rule: Transformer Engine NVFP4 4over6 (E4M3 bound 256)
+    and FP8 per-tensor amax/448.
+  - The actor forward and the rollout export read the same bytes, so the
+    rollout serves exactly the weights the actor computes with.
+- **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
+  the BF16 masters and the BF16 inputs (`functional.native_linear_vjp`), and
+  grouped BF16 GEMMs for the routed experts from the visible FC1 output
+  (`nvfp4_moe_vjp.routed_vjp`).
 - **Parallelism.** The validated topology is PP4 with `dist_opt`.
 
 ## Limits
