@@ -16,10 +16,12 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     keep its visible FC1 output for ``nvfp4_moe_vjp.routed_vjp``.
     """
 
-    def __init__(self, weights, model_config, *, routed_forward_reduction=None):
+    def __init__(self, weights, model_config, *, routed_forward_reduction):
         super().__init__()
         from .nvfp4_ep4 import validate_reduction
 
+        if routed_forward_reduction is None:
+            raise ValueError("Name the rollout's EP4 reduction (routed_forward_reduction)")
         validate_reduction(routed_forward_reduction)
         self.routed_forward_reduction = routed_forward_reduction
         if not isinstance(weights, Nvfp4ExpertWeights):
@@ -34,7 +36,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             raise ValueError("Expected matching bias-free ReLU2 expert geometry")
         if not 1 <= model_config.num_experts_per_tok <= weights.num_experts:
             raise ValueError("Invalid top-k expert count")
-        if routed_forward_reduction is not None and (
+        if (
             weights.num_experts, model_config.hidden_size,
             model_config.moe_intermediate_size, model_config.num_experts_per_tok,
         ) != (128, 2688, 1856, 6):
@@ -102,8 +104,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         )
         if not active_grad:
             return self._visible(x, ids, routing_weights)
-        if self.routed_forward_reduction is None:
-            raise RuntimeError("Routed training requires the EP4 serving reduction")
         return RoutedExpertsVJP.apply(
             x, self.weights.up_proj, self.weights.down_proj, routing_weights, ids, self
         )
@@ -140,9 +140,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             if return_fc1:
                 raise ValueError("Routed training requires at least one token")
             return torch.empty_like(x)
-        if self.routed_forward_reduction is None:
-            _, down = self._experts.routes(x, ids)
-            return self._experts.rank_partial(down, routing_weights, ids, None)
         from .nvfp4_ep4 import ep4_routed_experts
 
         return ep4_routed_experts(
