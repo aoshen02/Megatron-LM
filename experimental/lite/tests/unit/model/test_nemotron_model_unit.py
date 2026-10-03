@@ -442,3 +442,32 @@ def test_fp8_attention_cache_pages_follow_request_lengths(monkeypatch):
     for start, end in ((0, 1), (1023, 1024), (1024, bounds[-1])):
         alone = module._visible(q[start:end], k[start:end], v[start:end], [0, end - start])
         assert torch.equal(packed[start:end], alone[0])
+
+
+def test_vendor_backward_signatures_match_the_positional_calls():
+    """The attention and Mamba VJPs pass these vendor backwards positionally;
+    a reordered signature would silently swap arguments."""
+    import inspect
+
+    flash = pytest.importorskip("vllm.vllm_flash_attn.cute.interface")
+    conv = pytest.importorskip("causal_conv1d.cpp_functions")
+    ssd = pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
+    expected = {
+        flash._flash_attn_bwd: (
+            ["q", "k", "v", "out", "dout", "lse", "softmax_scale", "causal"],
+            ["cu_seqlens_q", "cu_seqlens_k", "max_seqlen_q", "max_seqlen_k", "deterministic"],
+        ),
+        conv.causal_conv1d_bwd_function: (
+            ["x", "weight", "bias", "dout", "seq_idx", "initial_states",
+             "dfinal_states", "dx", "return_dinitial_states", "silu_activation"],
+            [],
+        ),
+        ssd._mamba_chunk_scan_combined_bwd: (
+            ["dout", "x", "dt", "A", "B", "C", "out", "chunk_size"],
+            ["D", "dt_bias", "seq_idx", "dt_softplus", "dt_limit", "state_dtype"],
+        ),
+    }
+    for function, (positional, keywords) in expected.items():
+        parameters = list(inspect.signature(function).parameters)
+        assert parameters[: len(positional)] == positional, function.__name__
+        assert set(keywords) <= set(parameters), function.__name__
