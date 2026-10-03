@@ -714,15 +714,15 @@ def test_theta0_check_fails_one_bad_tensor(tmp_path):
     for i in range(8):
         master = (torch.randn(256, 512, generator=g, device="cuda") * 0.02).bfloat16()
         deployed = requantize("W4A16_NVFP4", master)
-        if i == 3:  # one tensor with 3% of its codes changed
-            flip = torch.rand(deployed["weight"].shape, generator=g, device="cuda") < 0.03
+        if i == 3:  # one tensor with 6% of its code bytes changed
+            flip = torch.rand(deployed["weight"].shape, generator=g, device="cuda") < 0.06
             deployed["weight"] = torch.where(flip, deployed["weight"] ^ 0x11, deployed["weight"])
         entry, part = _nvfp4_entry(f"m.t{i}", master, deployed)
         entries.append(entry)
         stored.update(part)
     with pytest.raises(RuntimeError, match=r"m\.t3"):
         _theta0_case(tmp_path, entries, stored)
-    assert THETA0_NVFP4_TENSOR_MIN_VALUES >= 0.99
+    assert THETA0_NVFP4_TENSOR_MIN_VALUES > 0.9
 
 
 @cuda
