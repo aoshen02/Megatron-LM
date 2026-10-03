@@ -145,6 +145,30 @@ class CuteDslNvfp4Linear:
         return out.view(*x.shape[:-1], self.out_features)
 
 
+def _cache_device_capability(device):
+    """Resolve vLLM's cached capability for ``device`` by torch ordinal.
+
+    moe_fused_mul_sum maps the tensor's ordinal through CUDA_VISIBLE_DEVICES.
+    A Ray actor sets that variable to its one physical GPU after CUDA has
+    initialized with every GPU visible, so the torch ordinal is the physical
+    one and the mapping raises. Resolve the cached lookup with the mapping
+    torch actually uses.
+    """
+    import os
+
+    from vllm.platforms import current_platform
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and torch.cuda.device_count() > len(visible.split(",")):
+        del os.environ["CUDA_VISIBLE_DEVICES"]
+        try:
+            current_platform.get_device_capability(device.index)
+        finally:
+            os.environ["CUDA_VISIBLE_DEVICES"] = visible
+    else:
+        current_platform.get_device_capability(device.index)
+
+
 class HummingRoutedExperts:
     """BI Humming indexed W4A16 ReLU2 experts (ModelOpt NVFP4 MoE, Humming).
 
@@ -199,6 +223,7 @@ class HummingRoutedExperts:
         self.offset = offset
         self.hidden, self.intermediate = hidden, intermediate
         self.locks = torch.zeros(1024, dtype=torch.int32, device=device)
+        _cache_device_capability(device)
         gemm_type = GemmType.INDEXED
         self.compute_config = {
             "use_batch_invariant": True,
@@ -303,6 +328,8 @@ class HummingRoutedExperts:
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Routed experts are eager only")
         rows, topk = ids.shape
+        if rows == 0:
+            return x.new_empty(0, self.intermediate), x.new_empty(0, topk, self.hidden)
         tokens = rows if global_tokens is None else global_tokens
         valid_shape_m = math.ceil(
             tokens * topk * self.num_experts / self.global_num_experts
