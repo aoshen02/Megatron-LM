@@ -51,8 +51,8 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1
 
     Forms the four BF16 rank partials an EP4 deployment computes (each rank's
     ``moe_fused_mul_sum`` over its 32 experts) and combines them in the
-    selected serving order. ``return_fc1`` also returns the visible FC1 output
-    per route (token-major, slot-minor).
+    selected serving order. ``return_fc1`` also returns the visible FC1 and
+    expert outputs per route (token-major, slot-minor).
     """
     validate_reduction(recipe)
     if recipe is None:
@@ -69,4 +69,4 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, recipe, *, return_fc1
         mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=x.device)
         parts.append(experts.rank_partial(per_route, topk_weights, topk_ids, mapping))
     out = reduce_ep4_parts(parts, topk_ids, recipe)
-    return (out, fc1) if return_fc1 else out
+    return (out, fc1, per_route.view(-1, x.shape[1])) if return_fc1 else out

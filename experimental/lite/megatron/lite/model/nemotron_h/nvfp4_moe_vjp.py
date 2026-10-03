@@ -1,7 +1,8 @@
 """Routed-expert VJP on the BF16 masters (TE ``high_precision`` semantics).
 
 Mirrors the DeepSeek-V4 aligned actor's grouped backward
-(NVIDIA/Megatron-LM#7050): the visible FC1 output is saved in forward and the
+(NVIDIA/Megatron-LM#7050): the visible FC1 and expert outputs are saved in
+forward, the route gradient comes from the visible expert output and the
 dgrad/wgrad GEMMs run as Transformer Engine grouped BF16 GEMMs.
 """
 
@@ -26,12 +27,19 @@ def _te_grouped_gemm(lhs, rhs, out, *, layout, m_splits, single_output=False):
     )
 
 
-def routed_vjp(x, fc1, up, down, routes, ids, dy):
+def routed_vjp(x, fc1, visible, up, down, routes, ids, dy):
     """ReLU2 routed experts: ``y = sum_s routes[:, s] * down(relu(up(x))**2)``.
+
+    Per-input contract (as DeepSeek-V4's grouped MoE): the route-weight
+    gradient is ``<dy, visible expert output>``, exact because the weights
+    only scale the visible outputs; the input and expert-weight gradients are
+    Transformer Engine ``high_precision`` BF16 GEMMs on the masters from the
+    visible FC1 output.
 
     Args:
         x: BF16 tokens, ``[M, K]``.
         fc1: Visible FC1 output per route (token-major, slot-minor), ``[M*topk, I]``.
+        visible: Visible expert output per route (same order), ``[M*topk, K]``.
         up, down: BF16 masters, ``[E, I, K]`` and ``[E, K, I]``.
         routes: FP32 routing weights, ``[M, topk]``.
         ids: Expert ids, ``[M, topk]``.
@@ -56,10 +64,7 @@ def routed_vjp(x, fc1, up, down, routes, ids, dy):
     def split(rows):
         return torch.split(rows, counts)
 
-    v = torch.empty_like(dy_rows)
-    _te_grouped_gemm(down.unbind(0), split(h), v, layout="TN", m_splits=counts,
-                     single_output=True)
-    d_weight = (dy_rows.float() * v.float()).sum(-1)
+    d_weight = (dy_rows.float() * visible.index_select(0, order).float()).sum(-1)
     dh = torch.empty_like(h)
     _te_grouped_gemm(down.unbind(0), split(dv), dh, layout="NN", m_splits=counts,
                      single_output=True)
@@ -84,9 +89,9 @@ def routed_vjp(x, fc1, up, down, routes, ids, dy):
 class RoutedExpertsVJP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, up, down, routes, ids, owner):
-        out, fc1 = owner._visible(x, ids, routes, return_fc1=True)
+        out, fc1, visible = owner._visible(x, ids, routes, return_fc1=True)
         ctx.owner, ctx.versions = owner, owner.weights._versions()
-        ctx.save_for_backward(x, fc1, up, down, routes, ids)
+        ctx.save_for_backward(x, fc1, visible, up, down, routes, ids)
         return out
 
     @staticmethod
@@ -94,6 +99,8 @@ class RoutedExpertsVJP(torch.autograd.Function):
     def backward(ctx, dy):
         if ctx.owner.weights._versions() != ctx.versions:
             raise RuntimeError("Expert masters changed before backward")
-        x, fc1, up, down, routes, ids = ctx.saved_tensors
-        dx, d_up, d_down, d_routes = routed_vjp(x, fc1, up, down, routes, ids, dy)
+        x, fc1, visible, up, down, routes, ids = ctx.saved_tensors
+        dx, d_up, d_down, d_routes = routed_vjp(
+            x, fc1, visible, up, down, routes, ids, dy
+        )
         return dx, d_up, d_down, d_routes, None, None

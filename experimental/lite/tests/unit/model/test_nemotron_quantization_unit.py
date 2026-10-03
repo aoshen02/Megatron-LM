@@ -66,8 +66,23 @@ def test_linear_vjp_is_the_bf16_master_weight_gradient():
     torch.testing.assert_close(dw.float(), dy.float().T @ x.float(), rtol=1e-2, atol=1e-2)
 
 
+def _routed_reference(x, fc1, visible, up, down, routes, ids, dy):
+    """The per-input VJP contract, in FP32 autograd: FC1 and expert outputs
+    take their visible values (identity straight-through), so the route
+    gradient is <dy, visible> and the rest is the master-weight VJP."""
+    ref = [t.detach().float().requires_grad_() for t in (x, up, down, routes)]
+    u = torch.einsum("mk,msik->msi", ref[0], ref[1][ids])
+    u = u + (fc1.float() - u).detach()
+    v = torch.einsum("msi,mski->msk", u.relu().square(), ref[2][ids])
+    v = v + (visible.float() - v).detach()
+    (ref[3][..., None] * v).sum(1).backward(dy.float())
+    return [t.grad for t in ref]
+
+
 @cuda
-def test_routed_vjp_matches_the_dense_relu2_reference():
+def test_routed_vjp_follows_the_per_input_contract():
+    """Route weights: <dy, visible expert output> (exact). Inputs and expert
+    weights: the BF16-master VJP through the visible FC1 output."""
     from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import routed_vjp
 
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -82,16 +97,18 @@ def test_routed_vjp_matches_the_dense_relu2_reference():
     ids[0] = torch.tensor([0, 1, 2])  # expert 7 may receive no rows
     routes = torch.rand(m, topk, generator=g, device="cuda")
     fc1 = torch.einsum("mk,msik->msi", x.float(), up[ids].float()).to(torch.bfloat16)
-
-    ref = [t.detach().float().requires_grad_() for t in (x, up, down, routes)]
-    u = torch.einsum("mk,msik->msi", ref[0], ref[1][ids])
-    u = u + (fc1.float() - u).detach()  # the visible FC1 value, the native gradient
-    v = torch.einsum("msi,mski->msk", u.relu().square(), ref[2][ids])
-    (ref[3][..., None] * v).sum(1).backward(dy.float())
-
-    got = routed_vjp(x, fc1.reshape(m * topk, i), up, down, routes, ids, dy)
-    for actual, expected in zip(got, ref, strict=True):
-        torch.testing.assert_close(actual.float(), expected.grad, rtol=5e-2, atol=5e-2)
+    # A deployment output that differs from the master product, as quantized
+    # serving does.
+    visible = (
+        torch.einsum("msi,mski->msk", fc1.float().relu().square(), down[ids].float())
+        * (1 + 0.05 * torch.randn(m, topk, k, generator=g, device="cuda"))
+    ).to(torch.bfloat16)
+    got = routed_vjp(x, fc1.reshape(m * topk, i), visible.reshape(m * topk, k),
+                     up, down, routes, ids, dy)
+    expected = _routed_reference(x, fc1, visible, up, down, routes, ids, dy)
+    for actual, reference in zip(got, expected, strict=True):
+        torch.testing.assert_close(actual.float(), reference, rtol=5e-2, atol=5e-2)
+    torch.testing.assert_close(got[3], expected[3], rtol=1e-5, atol=1e-5)
 
 
 # The direct kernel calls must reproduce the vLLM layer objects bit for bit.
@@ -359,3 +376,57 @@ def test_direct_query_fp8_quant_matches_vllm_quant_fp8_bitwise(vllm_oracle_runti
         expected, _ = oracle.forward_cuda(q, scale)
         actual, _ = scaled_fp8_quant(q, scale)
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), rows
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_routed_vjp_on_the_humming_deployment_at_updated_weights():
+    """The training VJP on the real deployment, at theta0 and two updated
+    snapshots whose deployment is requantized from the updated masters."""
+    from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
+    from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
+        EP4_ONESIDED_REDUCTION,
+        ep4_routed_experts,
+        reduce_ep4_parts,
+    )
+    from megatron.lite.model.nemotron_h.nvfp4_moe_vjp import routed_vjp
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    up = (torch.randn(128, 1856, 2688, generator=g, device="cuda") * 0.02).bfloat16()
+    down = (torch.randn(128, 2688, 1856, generator=g, device="cuda") * 0.02).bfloat16()
+    rows = 33
+    x = torch.randn(rows, 2688, generator=g, device="cuda").to(torch.bfloat16)
+    ids = _route_ids(rows, g)
+    routes = torch.rand(rows, 6, generator=g, device="cuda")
+    dy = torch.randn(rows, 2688, generator=g, device="cuda").to(torch.bfloat16)
+    for snapshot in range(3):
+        if snapshot:
+            up = up + (torch.randn(up.shape, generator=g, device="cuda") * 1e-3).bfloat16()
+            down = down + (torch.randn(down.shape, generator=g, device="cuda") * 1e-3).bfloat16()
+        stacks = []
+        for master in (up, down):
+            parts = [requantize("W4A16_NVFP4", master[e]) for e in range(128)]
+            stacks.append(tuple(
+                torch.stack([q[name] for q in parts])
+                for name in ("weight", "weight_scale", "weight_scale_2")
+            ))
+        experts = HummingRoutedExperts(*stacks, num_experts=128, offset=0, layer_name="experts")
+        out, fc1, visible = ep4_routed_experts(
+            experts, x, routes, ids, EP4_ONESIDED_REDUCTION, return_fc1=True
+        )
+        # The saved per-route output is the one the forward combined.
+        per_route = visible.view(rows, 6, 2688)
+        parts = []
+        for rank in range(4):
+            mapping = torch.full((128,), -1, dtype=torch.int32, device="cuda")
+            mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device="cuda")
+            parts.append(experts.rank_partial(per_route, routes, ids, mapping))
+        assert torch.equal(reduce_ep4_parts(parts, ids, EP4_ONESIDED_REDUCTION), out)
+        got = routed_vjp(x, fc1, visible, up, down, routes, ids, dy)
+        expected = _routed_reference(
+            x, fc1.view(rows, 6, -1), per_route, up, down, routes, ids.long(), dy
+        )
+        torch.testing.assert_close(got[3], expected[3], rtol=1e-5, atol=1e-4)
+        for name, actual, reference in zip(("dx", "d_up", "d_down"), got, expected):
+            error = ((actual.float() - reference).norm() / reference.norm()).item()
+            assert error < 1e-2, (snapshot, name, error)

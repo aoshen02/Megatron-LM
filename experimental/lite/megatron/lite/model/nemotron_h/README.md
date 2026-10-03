@@ -38,7 +38,11 @@ rejects checkpoints without a `quantization_config`.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
   the BF16 masters and the BF16 inputs (`functional.native_linear_vjp`), and
   grouped BF16 GEMMs for the routed experts from the visible FC1 output
-  (`nvfp4_moe_vjp.routed_vjp`). Every other visible op has its own autograd
+  (`nvfp4_moe_vjp.routed_vjp`). Frozen per-input contract of the routed
+  experts, as DeepSeek-V4's grouped MoE:
+  - routing weights: `<dy, visible per-route expert output>` (exact);
+  - token input, up and down weights: BF16-master VJP through the visible
+    FC1 output (identity straight-through for the quantization). Every other visible op has its own autograd
   Function, as in the DeepSeek-V4 actor: closed-form compiled FP32 VJPs for
   the RMSNorms, the mamba_ssm / causal_conv1d backwards for Mamba2, the
   FlashAttention varlen backward for attention and DS4's chunked selected
