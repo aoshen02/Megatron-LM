@@ -217,16 +217,11 @@ def test_parameter_mutation_before_backward_is_rejected():
         output.sum().backward()
 
 
-@pytest.mark.gpus(1)
-@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
-def test_router_vjp_within_bf16_noise_floor(kind):
-    """Lightning router: 128 experts, top-6 sigmoid, renormalized, fixed ids."""
+def _lightning_router():
     from types import SimpleNamespace
 
     from megatron.lite.model.nemotron_h.experts import Router
-    from test_nemotron_mamba_unit import assert_within_noise_floor, upstream_gradient
 
-    torch.manual_seed(0)
     config = SimpleNamespace(
         n_routed_experts=128,
         hidden_size=2688,
@@ -235,7 +230,31 @@ def test_router_vjp_within_bf16_noise_floor(kind):
         n_group=1,
         topk_group=1,
     )
-    router = Router(config, device="cuda")
+    return Router(config, device="cuda")
+
+
+@pytest.mark.gpus(1)
+def test_router_requires_batch_invariance_initialized(monkeypatch):
+    """The FP32-output router GEMM is M-invariant only after init_batch_invariance."""
+    from vllm.model_executor.determinism import batch_invariant
+
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", False)
+    router = _lightning_router()
+    with pytest.raises(RuntimeError, match="init_batch_invariance"):
+        router(torch.zeros(4, 2688, device="cuda", dtype=torch.bfloat16))
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+def test_router_vjp_within_bf16_noise_floor(kind, monkeypatch):
+    """Lightning router: 128 experts, top-6 sigmoid, renormalized, fixed ids."""
+    from test_nemotron_mamba_unit import assert_within_noise_floor, upstream_gradient
+    from vllm.model_executor.determinism import batch_invariant
+
+    # The VJP is measured against FP64; batch-invariant GEMM tiling is not.
+    monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", True)
+    torch.manual_seed(0)
+    router = _lightning_router()
     with torch.no_grad():
         router.weight.normal_(std=0.02)
         router.e_score_correction_bias.normal_(std=0.01)
