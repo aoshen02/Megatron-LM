@@ -45,10 +45,18 @@ rejects checkpoints without a `quantization_config`.
     BF16 weight encoded on the checkpoint's scales, every NVFP4 global scale
     amax/1536. The checkpoint still provides the config and the static FP8
     activation and KV scales. θ0 differs from the checkpoint where ModelOpt's
-    choices are not derivable from the weights: 0.22% of the NVFP4 bytes
-    (4over6 near-ties) and the 24 of 46 FP8 projections whose calibrated
-    scale is not amax/448. Those use amax/448 from θ0 on, so the first update
-    has no scale jump.
+    choices are not reproduced by Transformer Engine's 4over6 MSE quantizer
+    and where FP8 scales were calibrated:
+    - NVFP4: 0.228% of the block scales differ. Of those, 70% are exact ties
+      (blocks that underflow to zero: TE writes scale 0, ModelOpt 2^-9; same
+      values), 19% are E4M3 candidate scales rounding to the other side of a
+      midpoint, 10% come from TE's encode-scale arithmetic and under 1% are
+      near-ties; in addition some codes flip on TE's internal global scale,
+      which is 1 ulp off amax/1536 for 23% of the tensors. The effective
+      weights differ in 0.061% of the values.
+    - FP8: the 24 of 46 projections whose calibrated scale is not amax/448
+      use amax/448 from θ0 on (scheme A), so the first update has no scale
+      jump; the per-tensor ratios are in the FP8 table below.
   - The actor forward and the rollout export read the same bytes, so the
     rollout serves exactly the weights the actor computes with.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
@@ -68,6 +76,40 @@ rejects checkpoints without a `quantization_config`.
 - **Parallelism.** TP/EP/CP 1 with PP1 or PP4; the validated topology is PP4
   with `dist_opt`. The routed experts emulate the rollout's EP4 reduction on
   one rank.
+
+### FP8 projections with a ModelOpt-calibrated scale
+
+24 of the 46 FP8 Mamba projections carry a calibrated weight scale
+that is not amax/448 of the BF16 release. Scheme A replaces it by amax/448 from
+θ0 on; the θ0 codes then agree with the checkpoint's only where both grids
+coincide.
+
+| Tensor (`backbone.layers.`) | checkpoint scale / (amax/448) | θ0 codes equal |
+|---|---|---|
+| `0.mixer.in_proj` | 1.5000 | 0.098% |
+| `11.mixer.in_proj` | 1.4967 | 0.016% |
+| `14.mixer.out_proj` | 1.4962 | 0.032% |
+| `16.mixer.out_proj` | 1.5033 | 0.037% |
+| `18.mixer.in_proj` | 1.4970 | 0.018% |
+| `2.mixer.out_proj` | 1.4969 | 0.038% |
+| `21.mixer.out_proj` | 1.5000 | 0.036% |
+| `23.mixer.in_proj` | 1.5000 | 0.016% |
+| `25.mixer.in_proj` | 1.5000 | 0.015% |
+| `28.mixer.in_proj` | 1.4959 | 0.013% |
+| `28.mixer.out_proj` | 1.5000 | 0.031% |
+| `30.mixer.out_proj` | 1.4979 | 0.032% |
+| `35.mixer.in_proj` | 1.4979 | 0.013% |
+| `37.mixer.out_proj` | 1.4957 | 0.029% |
+| `39.mixer.in_proj` | 1.5000 | 0.021% |
+| `39.mixer.out_proj` | 1.5000 | 0.035% |
+| `4.mixer.out_proj` | 1.5054 | 0.023% |
+| `41.mixer.in_proj` | 1.5000 | 0.017% |
+| `41.mixer.out_proj` | 1.5020 | 0.032% |
+| `44.mixer.in_proj` | 1.5000 | 0.017% |
+| `44.mixer.out_proj` | 1.5000 | 0.037% |
+| `48.mixer.out_proj` | 1.5000 | 0.036% |
+| `50.mixer.out_proj` | 1.5000 | 0.038% |
+| `9.mixer.in_proj` | 1.5000 | 0.015% |
 
 ## Limits
 

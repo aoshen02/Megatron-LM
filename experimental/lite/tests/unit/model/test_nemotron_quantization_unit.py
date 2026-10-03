@@ -671,3 +671,89 @@ def test_ep4_rank_humming_schedule_matches_the_full_deployment_bitwise():
                 rank.rank_partial(local, weights[tokens], ids[tokens], rank.expert_map),
                 full.rank_partial(down, weights, ids, rank.expert_map)[tokens],
             ), (rows, r)
+
+
+def _theta0_case(tmp_path, masters, stored):
+    """Write ``stored`` as a one-shard checkpoint; run the theta0 check."""
+    import json
+
+    from megatron.lite.model.nemotron_h.checkpoint import _check_theta0_agreement
+    from safetensors.torch import save_file
+
+    flat = {name: t.contiguous().cpu() for name, t in stored.items()}
+    save_file(flat, str(tmp_path / "model.safetensors"))
+    index = {name: "model.safetensors" for name in flat}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+    _check_theta0_agreement(masters, tmp_path, index)
+
+
+def _nvfp4_entry(prefix, master, deployed):
+    stored = {f"{prefix}.{k}": v for k, v in requantize("W4A16_NVFP4", master).items()}
+    return (prefix, "W4A16_NVFP4", master, lambda: deployed), stored
+
+
+@cuda
+def test_theta0_check_accepts_the_requantization_and_zero_blocks(tmp_path):
+    """Requantizing the source passes; blocks that underflow to zero are
+    excluded from the code/scale comparison (ModelOpt 2^-9 vs TE 0)."""
+    g = torch.Generator(device="cuda").manual_seed(9)
+    master = (torch.randn(256, 512, generator=g, device="cuda") * 0.02).bfloat16()
+    master[:, :16] = 0
+    deployed = requantize("W4A16_NVFP4", master)
+    entry, stored = _nvfp4_entry("m.a", master, deployed)
+    stored["m.a.weight_scale"][:, 0] = torch.tensor(2.0**-9).to(torch.float8_e4m3fn)
+    _theta0_case(tmp_path, [entry], stored)
+
+
+@cuda
+def test_theta0_check_fails_one_bad_tensor(tmp_path):
+    from megatron.lite.model.nemotron_h.checkpoint import THETA0_NVFP4_TENSOR_MIN_VALUES
+
+    g = torch.Generator(device="cuda").manual_seed(10)
+    entries, stored = [], {}
+    for i in range(8):
+        master = (torch.randn(256, 512, generator=g, device="cuda") * 0.02).bfloat16()
+        deployed = requantize("W4A16_NVFP4", master)
+        if i == 3:  # one tensor with 3% of its codes changed
+            flip = torch.rand(deployed["weight"].shape, generator=g, device="cuda") < 0.03
+            deployed["weight"] = torch.where(flip, deployed["weight"] ^ 0x11, deployed["weight"])
+        entry, part = _nvfp4_entry(f"m.t{i}", master, deployed)
+        entries.append(entry)
+        stored.update(part)
+    with pytest.raises(RuntimeError, match=r"m\.t3"):
+        _theta0_case(tmp_path, entries, stored)
+    assert THETA0_NVFP4_TENSOR_MIN_VALUES >= 0.99
+
+
+@cuda
+def test_theta0_check_allows_calibrated_fp8_and_rejects_standard_mismatch(tmp_path):
+    """FP8 tensors whose checkpoint scale is not amax/448 (ModelOpt-calibrated)
+    may differ at theta0 (scheme A); amax/448 tensors must match exactly."""
+    from megatron.lite.model.nemotron_h.quantization import fp8_encode
+
+    g = torch.Generator(device="cuda").manual_seed(11)
+    master = (torch.randn(128, 256, generator=g, device="cuda") * 0.02).bfloat16()
+    deployed = requantize("FP8", master)
+    calibrated = deployed["weight_scale"] * 1.5
+    stored = {"m.f.weight": fp8_encode(master, calibrated), "m.f.weight_scale": calibrated}
+    entry = ("m.f", "FP8", master, lambda: deployed)
+    _theta0_case(tmp_path, [entry], stored)
+
+    wrong = dict(deployed, weight=fp8_encode(master, deployed["weight_scale"] * 1.01))
+    stored = {"m.f.weight": deployed["weight"], "m.f.weight_scale": deployed["weight_scale"]}
+    with pytest.raises(RuntimeError, match="amax/448"):
+        _theta0_case(tmp_path, [("m.f", "FP8", master, lambda: wrong)], stored)
+
+
+@cuda
+def test_bf16_source_check_rejects_another_release():
+    """A master that is not the checkpoint's source fails the encoding check."""
+    from megatron.lite.model.nemotron_h.quantization import check_reversible
+
+    g = torch.Generator(device="cuda").manual_seed(12)
+    source = (torch.randn(256, 512, generator=g, device="cuda") * 0.02).bfloat16()
+    checkpoint = requantize("W4A16_NVFP4", source)
+    check_reversible("W4A16_NVFP4", source, checkpoint, "m", exact_global=True)
+    other = (source.float() + torch.randn(256, 512, generator=g, device="cuda") * 2e-3)
+    with pytest.raises((RuntimeError, ValueError)):
+        check_reversible("W4A16_NVFP4", other.bfloat16(), checkpoint, "m", exact_global=True)
