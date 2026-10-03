@@ -69,6 +69,18 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 "qat online export and native resync_format are mutually exclusive"
             )
+        if self.impl == "vllm" and self.export_dtype is not None:
+            # Nemotron-H's vLLM-aligned actor exports the deployment bytes;
+            # a cast would change what the rollout serves.
+            raise ValueError(
+                "impl='vllm' exports deployment bytes: set "
+                "actor_rollout_ref.actor.engine.export_dtype=null"
+            )
+        if self.impl == "vllm" and self.param_offload:
+            raise ValueError(
+                "impl='vllm' keeps its deployments on the GPU: use "
+                "grad_offload/optimizer_offload, not param_offload"
+            )
         if self.router_replay_mode not in ("disabled", "R3"):
             raise ValueError(
                 "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "

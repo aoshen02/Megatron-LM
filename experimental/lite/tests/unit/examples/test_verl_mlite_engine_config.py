@@ -316,3 +316,16 @@ def test_checkpoint_load_runs_the_restore_hook_not_the_update_hook(monkeypatch, 
     )
     engine.load_checkpoint(str(tmp_path))
     assert calls == ["load", "restore"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [({"export_dtype": "bfloat16"}, "export_dtype=null"), ({"param_offload": True}, "param_offload")],
+)
+def test_vllm_impl_rejects_casting_export_and_param_offload(kwargs, match) -> None:
+    """Nemotron-H (impl='vllm') exports deployment bytes and keeps its
+    deployments on the GPU; fail at configuration, not at the first sync."""
+    values = {"impl": "vllm", "export_dtype": None, **kwargs}
+    with pytest.raises(ValueError, match=match):
+        _engine_config(**values)
+    _engine_config(impl="vllm", export_dtype=None)
