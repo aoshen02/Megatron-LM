@@ -161,30 +161,36 @@ class CuteDslNvfp4Linear:
         return out.view(*x.shape[:-1], self.out_features)
 
 
+def torch_visible_devices():
+    """CUDA_VISIBLE_DEVICES naming, by UUID, the devices torch enumerates."""
+    return ",".join(
+        f"GPU-{torch.cuda.get_device_properties(i).uuid}"
+        for i in range(torch.cuda.device_count())
+    )
+
+
 def seed_device_capability(device):
     """Cache vLLM's capability lookup for ``device`` once, at actor build.
 
     Consumer: vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py
     ``moe_fused_mul_sum`` -> ``_heuristic_config(..., inputs.device.index)``
-    -> ``current_platform.get_device_capability(device_index)``, which maps
-    the torch ordinal to a physical id through CUDA_VISIBLE_DEVICES
-    (``visible_device_id_to_physical_device_id``; vLLM's
-    ``set_assigned_physical_gpu_ids`` does not affect that mapping). A verl
-    Ray actor initializes CUDA with every GPU visible and Ray then narrows
-    CUDA_VISIBLE_DEVICES to the actor's one GPU, so the torch ordinal is the
-    physical id and the mapping raises ("visible device ordinal 1 is out of
-    range for CUDA_VISIBLE_DEVICES=1"). In exactly that state the lookup is
-    resolved once with the device list torch uses; the result is cached per
-    ordinal. Call from the single-threaded model build only.
+    -> ``current_platform.get_device_capability(device_index)`` (cached per
+    ordinal), which maps the torch ordinal to a physical GPU through
+    CUDA_VISIBLE_DEVICES. A verl Ray actor initializes CUDA before Ray
+    narrows CUDA_VISIBLE_DEVICES to its GPU, so the variable no longer lists
+    the devices torch enumerates. Only then, the lookup is resolved once with
+    the variable naming torch's devices by UUID, which is right for any
+    original (restricted or reordered) list. Call from the single-threaded
+    model build only.
     """
     import os
 
     from vllm.platforms import current_platform
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible or torch.cuda.device_count() <= len(visible.split(",")):
+    if not visible or torch.cuda.device_count() == len(visible.split(",")):
         return
-    del os.environ["CUDA_VISIBLE_DEVICES"]
+    os.environ["CUDA_VISIBLE_DEVICES"] = torch_visible_devices()
     try:
         current_platform.get_device_capability(device.index)
     finally:

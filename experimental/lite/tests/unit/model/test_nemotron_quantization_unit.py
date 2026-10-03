@@ -1017,3 +1017,33 @@ def test_export_rounds_kv_scales_to_bf16():
         assert value.dtype == torch.float32 and value.shape == source.shape
         assert torch.equal(value, source.bfloat16().float())
         assert not torch.equal(value, source)
+
+
+@cuda
+@pytest.mark.gpus(2)
+def test_capability_seeding_resolves_restricted_and_reordered_device_lists():
+    """torch initialized with CUDA_VISIBLE_DEVICES=1,0, then narrowed to 0 (as
+    a Ray actor is): torch ordinal 0 is physical GPU 1, ordinal 1 physical 0,
+    and the UUID list used for seeding maps each ordinal to its own GPU."""
+    import subprocess
+    import sys
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    script = (
+        "import os, torch, pynvml\n"
+        "from vllm.platforms import current_platform\n"
+        "from megatron.lite.model.nemotron_h.kernels import torch_visible_devices\n"
+        "torch.cuda.init()\n"
+        "os.environ['CUDA_VISIBLE_DEVICES'] = '0'\n"
+        "visible = torch_visible_devices()\n"
+        "os.environ['CUDA_VISIBLE_DEVICES'] = visible\n"
+        "pynvml.nvmlInit()\n"
+        "for ordinal, expected in ((0, 1), (1, 0)):\n"
+        "    physical = current_platform.visible_device_id_to_physical_device_id(ordinal)\n"
+        "    assert physical == expected, (ordinal, physical)\n"
+        "print('ok')\n"
+    )
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES="1,0", CUDA_DEVICE_ORDER="PCI_BUS_ID")
+    result = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True)
+    assert result.stdout.strip().endswith("ok"), result.stderr[-2000:]
