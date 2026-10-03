@@ -50,6 +50,32 @@ class SSMMeta:
         )[None]
 
 
+def _shift(x, steps, seq_idx):
+    """``x[t - steps]`` within each request, zero before its start."""
+    if steps == 0:
+        return x
+    out = torch.zeros_like(x)
+    same = seq_idx[steps:] == seq_idx[:-steps]
+    out[steps:] = torch.where(same[:, None], x[:-steps], 0)
+    return out
+
+
+def _conv_weight_grads(x, weight, bias, grad, seq_idx):
+    """FP32 weight/bias gradients of the causal SiLU convolution, reduced in a
+    fixed order (causal_conv1d's backward accumulates them with atomics)."""
+    width = weight.shape[1]
+    x = x.float()
+    pre = torch.zeros_like(x) if bias is None else bias.float().expand_as(x).clone()
+    for k in range(width):
+        pre += weight[:, k].float() * _shift(x, width - 1 - k, seq_idx)
+    sigmoid = pre.sigmoid()
+    g = grad.float() * sigmoid * (1 + pre * (1 - sigmoid))
+    dweight = torch.stack(
+        [(g * _shift(x, width - 1 - k, seq_idx)).sum(0) for k in range(width)], dim=1
+    )
+    return dweight, None if bias is None else g.sum(0)
+
+
 class _PackedConvVJP(torch.autograd.Function):
     """Visible vLLM convolution; causal_conv1d backward on the packed batch."""
 
@@ -67,7 +93,7 @@ class _PackedConvVJP(torch.autograd.Function):
         check_parameter_versions(
             (weight,) if bias is None else (weight, bias), ctx.versions
         )
-        dx, dweight, dbias, _ = causal_conv1d_bwd_function(
+        dx, *_ = causal_conv1d_bwd_function(
             x.T[None],
             weight,
             bias,
@@ -79,6 +105,7 @@ class _PackedConvVJP(torch.autograd.Function):
             False,
             True,
         )
+        dweight, dbias = _conv_weight_grads(x, weight, bias, grad, seq_idx[0])
         return None, dx[0].T, dweight, dbias, None
 
 
