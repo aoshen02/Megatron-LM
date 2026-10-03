@@ -7,10 +7,13 @@ layer, config, process group, forward context or workspace is involved.
 """
 
 import json
+import logging
 import math
 from types import SimpleNamespace
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 _CT_NVFP4 = {
     "quant_method": "compressed-tensors",
@@ -41,8 +44,16 @@ class _Holder(torch.nn.Module):
             setattr(self, name, value)
 
 
-def _modelopt_global_scale(weight_scale_2):
-    # ModelOpt KNvfp4Static.process: one FP32 global scale per matrix.
+def _modelopt_global_scale(weight_scale, weight_scale_2):
+    """ModelOpt KNvfp4Static.process: one FP32 global scale per matrix.
+
+    Fails like serving on unloaded (NaN) group scales; Nemotron's checkpoint
+    has one FP32 global scale per matrix.
+    """
+    if torch.isnan(weight_scale.float()).any():
+        raise RuntimeError("NVFP4 weight_scale was never loaded (NaN)")
+    if weight_scale_2.dtype != torch.float32 or weight_scale_2.numel() != 1:
+        raise ValueError("Expected one FP32 NVFP4 global scale")
     return weight_scale_2.max().to(torch.float32)
 
 
@@ -61,7 +72,8 @@ class HummingNvfp4Linear:
             {
                 "weight_packed": weight.detach().clone(),
                 "weight_scale": weight_scale.detach().clone(),
-                "weight_global_scale": 1.0 / _modelopt_global_scale(weight_scale_2),
+                "weight_global_scale": 1.0
+                / _modelopt_global_scale(weight_scale, weight_scale_2),
             },
             input_size=packed_k * 2,
             output_partition_sizes=[n],
@@ -115,16 +127,20 @@ class CuteDslNvfp4Linear:
         from vllm.utils.flashinfer import flashinfer_prepare_bf16_fp4_weights
 
         require_batch_invariance()
-        scale = _modelopt_global_scale(weight_scale_2)
-        padded, self.padding = pad_nvfp4_weight_for_cutlass(
-            weight.detach().clone(), alignment=64
-        )
-        self.weight, self.weight_scale, self.alpha = flashinfer_prepare_bf16_fp4_weights(
-            padded,
-            swizzle_blockscale(weight_scale.detach().clone()),
-            scale.reshape(1),
-            backend="cute-dsl",
-        )
+        scale = _modelopt_global_scale(weight_scale, weight_scale_2)
+        # swizzle_blockscale allocates on the current device.
+        with torch.cuda.device(weight.device):
+            padded, self.padding = pad_nvfp4_weight_for_cutlass(
+                weight.detach().clone(), alignment=64
+            )
+            self.weight, self.weight_scale, self.alpha = (
+                flashinfer_prepare_bf16_fp4_weights(
+                    padded,
+                    swizzle_blockscale(weight_scale.detach().clone()),
+                    scale.reshape(1),
+                    backend="cute-dsl",
+                )
+            )
         # Humming stores the inverse scale and inverts it again during packing.
         self.alpha.copy_((1.0 / (1.0 / scale)).reshape_as(self.alpha))
         self.out_features = weight.shape[0]
@@ -145,28 +161,34 @@ class CuteDslNvfp4Linear:
         return out.view(*x.shape[:-1], self.out_features)
 
 
-def _cache_device_capability(device):
-    """Resolve vLLM's cached capability for ``device`` by torch ordinal.
+def seed_device_capability(device):
+    """Cache vLLM's capability lookup for ``device`` once, at actor build.
 
-    moe_fused_mul_sum maps the tensor's ordinal through CUDA_VISIBLE_DEVICES.
-    A Ray actor sets that variable to its one physical GPU after CUDA has
-    initialized with every GPU visible, so the torch ordinal is the physical
-    one and the mapping raises. Resolve the cached lookup with the mapping
-    torch actually uses.
+    Consumer: vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py
+    ``moe_fused_mul_sum`` -> ``_heuristic_config(..., inputs.device.index)``
+    -> ``current_platform.get_device_capability(device_index)``, which maps
+    the torch ordinal to a physical id through CUDA_VISIBLE_DEVICES
+    (``visible_device_id_to_physical_device_id``; vLLM's
+    ``set_assigned_physical_gpu_ids`` does not affect that mapping). A verl
+    Ray actor initializes CUDA with every GPU visible and Ray then narrows
+    CUDA_VISIBLE_DEVICES to the actor's one GPU, so the torch ordinal is the
+    physical id and the mapping raises ("visible device ordinal 1 is out of
+    range for CUDA_VISIBLE_DEVICES=1"). In exactly that state the lookup is
+    resolved once with the device list torch uses; the result is cached per
+    ordinal. Call from the single-threaded model build only.
     """
     import os
 
     from vllm.platforms import current_platform
 
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and torch.cuda.device_count() > len(visible.split(",")):
-        del os.environ["CUDA_VISIBLE_DEVICES"]
-        try:
-            current_platform.get_device_capability(device.index)
-        finally:
-            os.environ["CUDA_VISIBLE_DEVICES"] = visible
-    else:
+    if not visible or torch.cuda.device_count() <= len(visible.split(",")):
+        return
+    del os.environ["CUDA_VISIBLE_DEVICES"]
+    try:
         current_platform.get_device_capability(device.index)
+    finally:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible
 
 
 class HummingRoutedExperts:
@@ -192,6 +214,8 @@ class HummingRoutedExperts:
         device = up[0].device
         tensors = {}
         for stem, (packed, scale, global_scale) in (("w13", up), ("w2", down)):
+            if torch.isnan(scale.float()).any():
+                raise RuntimeError(f"NVFP4 {stem}_weight_scale was never loaded (NaN)")
             tensors[f"{stem}_weight"] = packed.detach().clone()
             tensors[f"{stem}_weight_scale"] = scale.detach().clone()
             tensors[f"{stem}_weight_scale_2"] = global_scale.detach().clone()
@@ -223,7 +247,6 @@ class HummingRoutedExperts:
         self.offset = offset
         self.hidden, self.intermediate = hidden, intermediate
         self.locks = torch.zeros(1024, dtype=torch.int32, device=device)
-        _cache_device_capability(device)
         gemm_type = GemmType.INDEXED
         self.compute_config = {
             "use_batch_invariant": True,
@@ -261,6 +284,10 @@ class HummingRoutedExperts:
         for lower, upper, config in getattr(self, f"{name}_tuning_config"):
             if lower < valid_shape_m <= upper:
                 return config["block_shape"][0]
+        # Serving's fallback (fused_humming_moe.prepare_humming_moe_kwargs).
+        if not getattr(self, "_warned_block", False):
+            logger.warning("No Humming tuning interval for M=%s; block 64", valid_shape_m)
+            self._warned_block = True
         return 64
 
     def _process_input(self, name, inputs, outputs, *, activation=None, scatter_idx=None):

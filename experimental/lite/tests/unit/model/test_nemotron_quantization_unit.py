@@ -430,3 +430,39 @@ def test_routed_vjp_on_the_humming_deployment_at_updated_weights():
         for name, actual, reference in zip(("dx", "d_up", "d_down"), got, expected):
             error = ((actual.float() - reference).norm() / reference.norm()).item()
             assert error < 1e-2, (snapshot, name, error)
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_direct_nvfp4_linears_reject_inputs_serving_rejects(monkeypatch):
+    from megatron.lite.model.nemotron_h.kernels import CuteDslNvfp4Linear, HummingNvfp4Linear
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    g = torch.Generator(device="cuda").manual_seed(6)
+    packed, scale, global_scale = _random_nvfp4(256, 512, g)
+    for linear in (HummingNvfp4Linear, CuteDslNvfp4Linear):
+        unloaded = scale.clone()
+        unloaded.view(torch.uint8)[0, 0] = 0x7F  # E4M3 NaN
+        with pytest.raises(RuntimeError, match="never loaded"):
+            linear(packed, unloaded, global_scale)
+        with pytest.raises(ValueError, match="global scale"):
+            linear(packed, scale, global_scale.repeat(2))
+
+
+@cuda
+@pytest.mark.gpus(2, min_architecture="blackwell")
+def test_cute_dsl_linear_builds_on_its_weight_device(monkeypatch):
+    """vLLM's swizzle allocates on the current device; build on the weight's."""
+    from megatron.lite.model.nemotron_h.kernels import CuteDslNvfp4Linear
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    g = torch.Generator(device="cuda:1").manual_seed(7)
+    packed = torch.randint(0, 256, (256, 256), generator=g, device="cuda:1", dtype=torch.uint8)
+    scale = (torch.rand(256, 32, generator=g, device="cuda:1") + 0.5).to(torch.float8_e4m3fn)
+    with torch.cuda.device(0):
+        linear = CuteDslNvfp4Linear(packed, scale, torch.tensor([2e-3], device="cuda:1"))
+    assert {t.device for t in (linear.weight, linear.weight_scale, linear.alpha)} == {
+        torch.device("cuda", 1)
+    }

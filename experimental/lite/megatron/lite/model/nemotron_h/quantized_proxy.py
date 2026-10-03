@@ -156,6 +156,9 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
     from .quantization import CheckpointProjectionFactory, Nvfp4TrainingLinear
 
     _check_runtime(ps)
+    from .kernels import seed_device_capability
+
+    seed_device_capability(torch.device("cuda", torch.cuda.current_device()))
     recipe = config.quantization_config
     factory = CheckpointProjectionFactory(impl.hf_path, recipe["quantized_layers"])
 

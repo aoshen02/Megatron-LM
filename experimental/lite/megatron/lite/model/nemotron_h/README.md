@@ -20,7 +20,8 @@ rejects checkpoints without a `quantization_config`.
   - Routed experts (W4A16 NVFP4, group 16) run the Humming indexed MoE kernel
     on packed FP4 weights with the serving EP4 one-sided reduction order.
   - NVFP4 linears run Humming dense GEMMs (shared expert: the FlashInfer
-    CuTe-DSL GEMM); FP8 linears run the static FP8 quant plus `bmm_fp8`.
+    CuTe-DSL GEMM); FP8 linears run the static FP8 input quant and vLLM's
+    `flashinfer_scaled_fp8_mm` (FlashInfer `bmm_fp8`, CUTLASS under BI).
   - Attention runs the fixed-schedule FA4 kernel over an FP8 KV cache,
     replaying `vllm.model_executor.models.nemotron_h_fa4`.
 - **Unquantized layers** (Mamba2, norms, embeddings, router) are BF16 and use
@@ -30,9 +31,9 @@ rejects checkpoints without a `quantization_config`.
     main parameters, as in the DeepSeek-V4 aligned actor. The forward never
     reads it; it reads the FP4/FP8 deployment bytes.
   - The deployment starts from the checkpoint bytes. After every optimizer
-    step the `post_optimizer_step_hook` requantizes the masters with the
-    checkpoint's own rule: Transformer Engine NVFP4 4over6 (E4M3 bound 256)
-    and FP8 per-tensor amax/448.
+    step the `post_optimizer_step_hook` gathers dist_opt's parameters and
+    requantizes the masters with the checkpoint's own rule: Transformer
+    Engine NVFP4 4over6 (E4M3 bound 256) and FP8 per-tensor amax/448.
   - The actor forward and the rollout export read the same bytes, so the
     rollout serves exactly the weights the actor computes with.
 - **Backward.** Transformer Engine `high_precision` semantics: BF16 GEMMs on
@@ -42,13 +43,16 @@ rejects checkpoints without a `quantization_config`.
   experts, as DeepSeek-V4's grouped MoE:
   - routing weights: `<dy, visible per-route expert output>` (exact);
   - token input, up and down weights: BF16-master VJP through the visible
-    FC1 output (identity straight-through for the quantization). Every other visible op has its own autograd
-  Function, as in the DeepSeek-V4 actor: closed-form compiled FP32 VJPs for
-  the RMSNorms, the mamba_ssm / causal_conv1d backwards for Mamba2, the
-  FlashAttention varlen backward for attention and DS4's chunked selected
-  log-probabilities.
+    FC1 output (identity straight-through for the quantization).
+
+  Every other visible op has its own autograd Function, as in the
+  DeepSeek-V4 actor: closed-form compiled FP32 VJPs for the RMSNorms, the
+  mamba_ssm / causal_conv1d backwards for Mamba2, the deterministic
+  FlashAttention varlen backward from the visible output and LSE for
+  attention, and DS4's chunked selected log-probabilities.
 - **Parallelism.** TP/EP/CP 1 with PP1 or PP4; the validated topology is PP4
-  with `dist_opt`.
+  with `dist_opt`. The routed experts emulate the rollout's EP4 reduction on
+  one rank.
 
 ## Limits
 
