@@ -21,9 +21,12 @@ from megatron.lite.runtime.contracts.loss import get_loss_context
 from .checkpoint import load_hf_weights as _load_weights
 from .checkpoint import refresh_quantized_projections
 from .config import NemotronHConfig
-from .functional import visible_forward
 from .mamba import SSMMeta
 from .vllm_runtime import vllm_context
+
+
+# Tokens per LM-head/log-probability chunk (DS4 default).
+LOGPROB_CHUNK_SIZE = 8192
 
 
 @dataclass(frozen=True)
@@ -84,7 +87,8 @@ def forward_step(model, batch):
 
 
 def _forward_step(model, batch):
-    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+    from .logprob import aligned_selected_log_probs
+    from .vllm_runtime import _base
 
     ps = parallel_state_from_model(model)
     loss_mask = batch.loss_mask
@@ -111,23 +115,24 @@ def _forward_step(model, batch):
         ).reshape(-1)
 
     meta = SSMMeta(tuple(packed.cu_seqlens_padded.cpu().tolist()))
-    output = model(local(packed.input_ids), meta=meta)
+    labels = local(packed.labels)
+    output = model(local(packed.input_ids), meta=meta, return_logits=labels is None)
     if not ps.pp_is_last:
         return {"hidden_states": output}
-    labels = local(packed.labels)
     if labels is None:
         return {"logits": output}
     context = get_loss_context()
-    if context is not None and context.temperature != 1.0:
-        output = output / context.temperature
     valid = labels >= 0
-    labels = labels.clamp_min(0)[:, None]
-    log_probs = visible_forward(
-        compute_token_logprobs,
-        lambda logits, ids: logits.float().log_softmax(-1).gather(-1, ids.long()),
+    calculate_entropy = context is not None and context.calculate_entropy
+    log_probs, entropy = aligned_selected_log_probs(
         output,
-        labels,
-    ).reshape(-1)
+        _base(model).lm_head,
+        labels.clamp_min(0),
+        1.0 if context is None else context.temperature,
+        LOGPROB_CHUNK_SIZE,
+        calculate_entropy=calculate_entropy,
+        tp_group=ps.tp_group,
+    )
     log_probs = log_probs.masked_fill(~valid, 0)
     mask = local(packed.loss_mask)
     mask = valid if mask is None else mask * valid
@@ -136,10 +141,8 @@ def _forward_step(model, batch):
         full_mask = full_mask * packed.loss_mask
     loss = _token_mean_loss(log_probs, mask, full_mask, ps.cp_size)
     result = {"log_probs": log_probs[None], "loss": loss}
-    if context is not None and context.calculate_entropy:
-        from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
-
-        result["entropy"] = vocab_parallel_entropy(output, ps.tp_group)[None]
+    if calculate_entropy:
+        result["entropy"] = entropy[None]
     return result
 
 

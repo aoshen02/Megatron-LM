@@ -154,7 +154,7 @@ class NemotronModel(nn.Module):
             tensor = tensor[0]
         self._input_tensor = tensor
 
-    def forward(self, input_ids, *, meta: SSMMeta):
+    def forward(self, input_ids, *, meta: SSMMeta, return_logits=True):
         if self.pre_process:
             hidden, residual = self.embeddings(input_ids.reshape(-1)), None
         else:
@@ -169,4 +169,4 @@ class NemotronModel(nn.Module):
         if not self.post_process:
             return torch.cat((hidden, residual), dim=-1).unsqueeze(1)
         hidden, _ = self.norm_f(hidden, residual)
-        return projection(hidden, self.lm_head)
+        return projection(hidden, self.lm_head) if return_logits else hidden

@@ -281,3 +281,65 @@ def test_moe_combine_vjp_matches_autograd_bitwise():
     )
     expected = torch.autograd.grad(combine(*inputs), inputs, upstream)
     assert all(map(torch.equal, actual, expected))
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
+    """Chunked LM head + selected log-prob: rollout value unchanged, FP32 VJP."""
+    from megatron.lite.model.nemotron_h.logprob import aligned_selected_log_probs
+    from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
+    from test_nemotron_mamba_unit import assert_within_noise_floor, upstream_gradient
+
+    from vllm.model_executor.determinism.batch_invariant import (
+        init_batch_invariance,
+        linear_batch_invariant,
+    )
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    init_batch_invariance()
+    torch.manual_seed(0)
+    tokens, vocab = 1506, 131072
+    lm_head = torch.nn.Linear(2688, vocab, bias=False, device="cuda")
+    with torch.no_grad():
+        lm_head.weight.normal_(std=0.02)
+    lm_head = lm_head.to(torch.bfloat16)
+    hidden = torch.randn(tokens, 2688, device="cuda")
+    labels = torch.randint(vocab, (tokens,), device="cuda")
+    leaves = (hidden, lm_head.weight.float())
+    inputs = [hidden.to(torch.bfloat16).requires_grad_(), lm_head.weight]
+    log_probs, entropy = aligned_selected_log_probs(
+        inputs[0],
+        lm_head,
+        labels,
+        temperature,
+        512,
+        calculate_entropy=True,
+        tp_group=None,
+    )
+    with torch.no_grad():
+        logits = linear_batch_invariant(inputs[0], lm_head.weight)
+        if temperature != 1.0:
+            logits = logits / temperature
+        assert torch.equal(
+            log_probs, compute_token_logprobs(logits, labels[:, None])[:, 0]
+        )
+        # Entropy is training-only; its reductions see fewer rows per chunk.
+        torch.testing.assert_close(
+            entropy, vocab_parallel_entropy(logits), rtol=1e-6, atol=0
+        )
+    upstream = upstream_gradient(kind, log_probs)
+    actual = torch.autograd.grad(log_probs, inputs, upstream)
+
+    def old_vjp(dtype):
+        inputs = [t.detach().to(dtype).requires_grad_() for t in leaves]
+        logits = torch.nn.functional.linear(*inputs)
+        if temperature != 1.0:
+            logits = logits / temperature
+        logits = logits.to(torch.promote_types(dtype, torch.float32))
+        selected = logits.log_softmax(-1).gather(-1, labels[:, None])
+        return torch.autograd.grad(selected[:, 0], inputs, upstream.to(selected.dtype))
+
+    old, reference = old_vjp(torch.bfloat16), old_vjp(torch.float64)
+    assert_within_noise_floor(("dhidden", "dweight"), actual, old, reference, kind)
