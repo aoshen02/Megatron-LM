@@ -997,3 +997,23 @@ def test_bf16_release_identity_rejects_a_master_changed_within_its_cell(tmp_path
     index = _save_release(tmp_path / "tampered", release)
     with pytest.raises(ValueError, match="backbone.layers.0 is not"):
         _verify_bf16_release(tmp_path / "tampered", index, list(index), None, manifest)
+
+
+def test_export_rounds_kv_scales_to_bf16():
+    """vLLM loads KV scales into BF16 at first load and FP32 on reload; the
+    exporter sends BF16-representable FP32 so both hold the same value."""
+    from megatron.lite.model.nemotron_h.checkpoint import NemotronExport
+
+    model = torch.nn.Module()
+    attention = torch.nn.Module()
+    attention.register_buffer("k_scale", torch.tensor(0.0123456789))
+    attention.register_buffer("v_scale", torch.tensor([0.0987654321]))
+    model.add_module("layers", torch.nn.ModuleDict({"0": torch.nn.Module()}))
+    model.layers["0"].add_module("mixer", torch.nn.Module())
+    model.layers["0"].mixer.add_module("kv_attention", attention)
+    exported = dict(NemotronExport.iter_export_tensors(None, model))
+    for name, source in (("k", attention.k_scale), ("v", attention.v_scale)):
+        value = exported[f"backbone.layers.0.mixer.{name}_proj.{name}_scale"]
+        assert value.dtype == torch.float32 and value.shape == source.shape
+        assert torch.equal(value, source.bfloat16().float())
+        assert not torch.equal(value, source)

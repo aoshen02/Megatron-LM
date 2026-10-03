@@ -101,10 +101,13 @@ class NemotronExport:
                 prefix = name if name.startswith("lm_head") else f"backbone.{name}"
                 quantized[prefix] = module.export_quantized()
         for name, tensor in hf_tensor_views(model):
-            if any(name.startswith(prefix + ".") for prefix in quantized) and not (
-                name.endswith(".k_proj.k_scale") or name.endswith(".v_proj.v_scale")
-            ):
+            kv_scale = name.endswith((".k_proj.k_scale", ".v_proj.v_scale"))
+            if any(name.startswith(prefix + ".") for prefix in quantized) and not kv_scale:
                 continue
+            if kv_scale:
+                # vLLM's first load keeps KV scales in BF16 parameters, a reload
+                # in FP32 ones; send the BF16-rounded value so both agree.
+                tensor = tensor.to(torch.bfloat16).to(torch.float32)
             yield name, tensor.detach()
         for prefix, tensors in quantized.items():
             for suffix, tensor in tensors.items():
