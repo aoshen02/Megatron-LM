@@ -20,6 +20,7 @@ from megatron.lite.primitive.ckpt.local_stage import (
     NodeLocalStagingFileSystem,
     allocate_stage_path,
     publish_staged_file,
+    run_on_all_ranks,
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
@@ -151,12 +152,17 @@ class _NodeLocalDistSaveStrategy(TorchDistSaveShardedStrategy):
 
         original_finalize_fns = tuple(request.finalize_fns)
 
+        def publish() -> None:
+            for stage_path, destination in staged_files:
+                publish_staged_file(stage_path, destination)
+
+        # The original finalizers write .metadata, so they run only once every
+        # rank has published its shards.
         def finalize_and_publish() -> None:
             try:
+                run_on_all_ranks(publish, "publishing staged checkpoint shards")
                 for finalize_fn in original_finalize_fns:
                     finalize_fn()
-                for stage_path, destination in staged_files:
-                    publish_staged_file(stage_path, destination)
             finally:
                 for stage_path, _ in staged_files:
                     stage_path.unlink(missing_ok=True)

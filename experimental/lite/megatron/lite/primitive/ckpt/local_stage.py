@@ -6,14 +6,36 @@ import contextlib
 import os
 import tempfile
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import IO
 
+import torch
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 from torch.distributed.checkpoint.filesystem import (  # pyright: ignore[reportMissingImports]
     FileSystem,
 )
+
+
+def run_on_all_ranks(fn: Callable[[], None], what: str) -> None:
+    """Run ``fn`` on every rank and raise on all of them if it failed on any."""
+    error = None
+    try:
+        fn()
+    except Exception as exc:
+        error = exc
+    if dist.is_initialized():
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if dist.get_backend() == "nccl"
+            else torch.device("cpu")
+        )
+        failed = torch.tensor([int(error is not None)], dtype=torch.int32, device=device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if error is None and failed.item():
+            raise RuntimeError(f"{what} failed on another rank")
+    if error is not None:
+        raise error
 
 
 def local_stage_root() -> Path | None:
