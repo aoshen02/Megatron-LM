@@ -2,7 +2,7 @@
 
 import torch
 
-from .functional import projection
+from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 
 
 def aligned_selected_log_probs(

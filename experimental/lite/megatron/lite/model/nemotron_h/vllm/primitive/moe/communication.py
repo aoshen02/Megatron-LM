@@ -7,12 +7,13 @@ directions. The expert rank computes its local routes and its BF16 partial
 as a serving rank does (the CuTe-DSL launch over its 32 experts and that
 launch's own ``moe_unpermute``), the partial returns to the
 source rank, and the source rank reduces the partials in the serving order
-(``nvfp4_ep4.reduce_ep4_parts``). The backward sends the output gradient over
+(``reduce_ep4_parts``). The backward sends the output gradient over
 the same rows and runs ``routed_vjp`` on the local experts; the input
 gradient of every route returns unsummed, and the source rank adds a token's
 routes in slot order with BF16 rounding after each add (DS4's deterministic
 scatter backward), as the single-rank VJP does.
 """
+
 
 import contextlib
 import socket
@@ -20,8 +21,11 @@ import socket
 import torch
 import torch.distributed as dist
 
-from .nvfp4_ep4 import reduce_ep4_parts
-from .nvfp4_moe_vjp import routed_vjp, sum_route_grads
+from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
+    routed_vjp,
+    sum_route_grads,
+)
+
 
 _buffer = None
 # Normal-mode intranode combine needs the row width (16-byte units) to be a
@@ -31,6 +35,37 @@ _COMBINE_ALIGN = 256
 # The DeepEP build (DEEPEP_NUM_MAX_NVL_PEERS) and the buffer below are NVLink
 # only: no RDMA buffer is allocated.
 _MAX_NVL_PEERS = 4
+
+
+def reduce_ep4_parts(parts, ids):
+    """Combine the four BF16 rank partials as the FlashInfer one-sided combine."""
+    if (
+        len(parts) != 4
+        or ids.ndim != 2
+        or ids.shape[1] != 6
+        or any(
+            p.dtype != torch.bfloat16 or p.ndim != 2 or p.shape != parts[0].shape
+            for p in parts
+        )
+        or parts[0].shape[0] != ids.shape[0]
+    ):
+        raise ValueError("Require four BF16 rank partials and six routes per row")
+    owners = ids // 32
+    stacked = torch.stack(parts)
+    rows = torch.arange(ids.shape[0], device=ids.device)
+    slots = []
+    for slot in range(6):
+        rank = owners[:, slot]
+        duplicate = (owners[:, :slot] == rank[:, None]).any(dim=1)
+        value = stacked[rank, rows]
+        slots.append(torch.where(duplicate[:, None], 0, value).float())
+    # FlashInfer 0.7.0 one-sided combine (csrc/nv_internal/tensorrt_llm/kernels/
+    # communicationKernels/moeAlltoAllKernels.cu): dispatch sends each token once
+    # per target rank, from the first top-k slot naming it (:495); combine loads
+    # that rank's partial for the first slot and FP32 zero for duplicates
+    # (:971); TOP_K=6 sums ((s0+s1)+(s2+s3))+(s4+s5) in FP32 (:1104-1115).
+    total = ((slots[0] + slots[1]) + (slots[2] + slots[3])) + (slots[4] + slots[5])
+    return total.to(torch.bfloat16)
 
 
 @contextlib.contextmanager

@@ -3,7 +3,11 @@
 import torch
 from torch import nn
 
-from .functional import projection, visible_linear
+from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
+    projection,
+    projection_layer,
+    visible_linear,
+)
 
 
 class _FixedRouteVJP(torch.autograd.Function):
@@ -104,8 +108,6 @@ class SharedExperts(nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        from .quantization import projection_layer
-
         self.up_proj = projection_layer(
             projection_factory,
             f"{hf_prefix}.up_proj",

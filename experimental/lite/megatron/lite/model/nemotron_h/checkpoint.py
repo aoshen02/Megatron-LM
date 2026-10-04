@@ -6,8 +6,10 @@ from pathlib import Path
 import torch
 
 def _routed_checkpoint_owners(model):
-    from .nvfp4_experts import Nvfp4ExpertWeights
-    from .nvfp4_moe import Nvfp4RoutedDeployment
+    from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
+        Nvfp4ExpertWeights,
+        Nvfp4RoutedDeployment,
+    )
 
     owners = {}
     for name, module in model.named_modules():
@@ -82,8 +84,7 @@ class NemotronExport:
         return [(name, tensor)]
 
     def iter_export_tensors(self, model):
-        from .fp8_training import Fp8TrainingLinear
-        from .quantization import Nvfp4TrainingLinear
+        from megatron.lite.model.nemotron_h.vllm.primitive.dense import Fp8TrainingLinear, Nvfp4TrainingLinear
 
         quantized = {}
         for name, module in model.named_modules():
@@ -118,10 +119,11 @@ def refresh_quantized_projections(chunks, *, recompute_scales=False):
     ``recompute_scales`` (set by the post-optimizer hook) switches every module
     from checkpoint scales to scales recomputed from its master, for good.
     """
-    from .fp8_training import Fp8TrainingLinear
-    from .nvfp4_experts import Nvfp4ExpertWeights
-    from .nvfp4_moe import Nvfp4RoutedDeployment
-    from .quantization import Nvfp4TrainingLinear
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import Fp8TrainingLinear, Nvfp4TrainingLinear
+    from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
+        Nvfp4ExpertWeights,
+        Nvfp4RoutedDeployment,
+    )
 
     modules = dict.fromkeys(
         module
@@ -179,8 +181,7 @@ def _quantized_masters(model):
 
     The last element is a callable returning the current deployment tensors.
     """
-    from .fp8_training import Fp8TrainingLinear
-    from .quantization import Nvfp4TrainingLinear
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import Fp8TrainingLinear, Nvfp4TrainingLinear
 
     for name, module in model.named_modules():
         if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
@@ -212,7 +213,7 @@ def _load_bf16_masters(model, root, master_root):
     requantized from its master, so the theta0 deployment is requant(BF16
     master), not the checkpoint bytes.
     """
-    from .quantization import check_reversible
+    from megatron.lite.model.nemotron_h.quantization import check_reversible
 
     master_root = Path(master_root)
     source = json.loads((master_root / "model.safetensors.index.json").read_text())[
@@ -329,7 +330,7 @@ def _check_theta0_agreement(masters, root, index):
     import logging
     import re
 
-    from .quantization import QuantizedWeight
+    from megatron.lite.model.nemotron_h.quantization import QuantizedWeight
 
     suffixes = {
         "FP8": ("weight", "weight_scale"),
@@ -434,8 +435,7 @@ def load_hf_weights(model, path):
     """
     from safetensors import safe_open
 
-    from .fp8_training import Fp8TrainingLinear
-    from .quantization import Nvfp4TrainingLinear
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import Fp8TrainingLinear, Nvfp4TrainingLinear
 
     root = Path(path)
     index = json.loads((root / "model.safetensors.index.json").read_text())[
