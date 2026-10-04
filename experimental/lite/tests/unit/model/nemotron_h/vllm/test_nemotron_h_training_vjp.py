@@ -327,8 +327,8 @@ def test_checkpoint_load_redeploys_the_saved_bytes(monkeypatch, tmp_path):
 def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
     """Lightning Q32/KV2/D128 vs per-request SDPA on the dequantized Q/K/V.
 
-    The VJP uses the visible output and LSE (DS4 semantics); the visible P@V
-    is FP8, which puts dQ/dK about 3x the BF16 noise floor of a BF16 forward.
+    The VJP recomputes the BF16 output for D = rowsum(dO * O); the visible
+    output (FP8 P@V) would put dQ/dK about 3x the BF16 noise floor.
     """
     from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
     from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
@@ -369,7 +369,7 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
     old = sdpa_vjp(torch.bfloat16)
     with sdpa_kernel(SDPBackend.MATH):
         reference = sdpa_vjp(torch.float64)
-    assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind, ratio=4.0)
+    assert_within_noise_floor(("dq", "dk", "dv"), actual, old, reference, kind)
 
 
 @pytest.mark.gpus(1)

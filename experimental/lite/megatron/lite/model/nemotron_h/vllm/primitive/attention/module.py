@@ -20,8 +20,8 @@ class Fa4Fp8KVAttention(torch.nn.Module):
     Replays vLLM's ``FlashAttnFixedSplitBackend``: FP8 query and
     KV-cache quantization with fixed scales, serving's 6768-token pages and
     the fixed split-KV schedule. The VJP is the FlashAttention varlen
-    backward on the dequantized Q/K/V with the visible output and LSE (an
-    identity straight-through estimator for the quantization). Supports TP1
+    backward on the dequantized Q/K/V with a recomputed BF16 output and LSE
+    (an identity straight-through estimator for the quantization). Supports TP1
     causal packed sequences starting at zero, without prefix sharing or
     sliding windows.
     """
