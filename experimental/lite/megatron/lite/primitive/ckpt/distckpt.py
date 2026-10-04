@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, is_main_replica
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -87,12 +87,29 @@ def save_dist_opt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
+    if save_model:
+        _stage_model_state_on_host(model_sd)
     dist_checkpointing.save(
         state_dict,
         checkpoint_dir,
         validate_access_integrity=False,
         content_metadata=metadata,
     )
+
+
+def _stage_model_state_on_host(model_sd: dict[str, Any]) -> None:
+    """Copy the model's GPU tensors to pageable host memory for a synchronous save.
+
+    dist_checkpointing otherwise stages them in pinned buffers, which the caching
+    host allocator rounds up to a power of two and keeps after the save; these
+    copies are freed when the save returns. Only main replicas are written.
+    """
+    for chunk_sd in model_sd.values():
+        for sh_ten in chunk_sd.values():
+            if not isinstance(sh_ten, ShardedTensor) or not is_main_replica(sh_ten.replica_id):
+                continue
+            if type(sh_ten.data) in (torch.Tensor, nn.Parameter) and sh_ten.data.is_cuda:
+                sh_ten.data = sh_ten.data.detach().to("cpu")
 
 
 def load_dist_opt_checkpoint(

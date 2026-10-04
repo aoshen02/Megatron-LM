@@ -19,6 +19,7 @@ from megatron.lite.primitive.ckpt.distckpt import (
     _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
+    _stage_model_state_on_host,
     _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
 )
@@ -156,6 +157,25 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_dist_opt_save_stages_main_model_replicas_in_pageable_host_memory() -> None:
+    """GPU model state is written from pageable copies, not cached pinned buffers."""
+    model = torch.nn.Linear(4, 2).cuda()
+    attach_model_sharded_state_dict([model], ParallelState(dp_size=2, dp_rank=0, dp_cp_rank=0))
+    main = _model_sharded_state_dict(model)
+    attach_model_sharded_state_dict([model], ParallelState(dp_size=2, dp_rank=1, dp_cp_rank=1))
+    replica = _model_sharded_state_dict(model)
+
+    _stage_model_state_on_host(main)
+    _stage_model_state_on_host(replica)
+
+    for name, param in model.named_parameters():
+        staged = main["model"][name].data
+        assert staged.device.type == "cpu" and not staged.is_pinned()
+        assert torch.equal(staged, param.detach().cpu())
+        assert replica["model"][name].data.is_cuda
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
