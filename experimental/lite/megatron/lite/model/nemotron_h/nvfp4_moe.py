@@ -1,12 +1,10 @@
-"""Routed W4A16 forward (Humming or FlashInfer CuTe-DSL, as the rollout's
-``moe_backend``) with the BF16 master-weight routed VJP."""
+"""Routed W4A16 forward (FlashInfer CuTe-DSL, the rollout's ``moe_backend``)
+with the BF16 master-weight routed VJP."""
 
 import torch
 
 from .nvfp4_experts import Nvfp4ExpertWeights
 from .nvfp4_moe_vjp import RoutedExpertsVJP
-
-ROUTED_EXPERT_BACKENDS = ("humming", "flashinfer_cutedsl")
 
 
 class Nvfp4RoutedDeployment(torch.nn.Module):
@@ -15,24 +13,12 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     Inputs are fixed expert IDs and continuous routing weights; this adapter does
     not route, normalize scores, apply routed_scaling_factor, or add shared output.
     No Graph/compile/concurrent-host dispatch support is claimed. Training runs
-    the EP4 serving reduction (``routed_forward_reduction``) so the forward can
-    keep its visible FC1 output for ``nvfp4_moe_vjp.routed_vjp``.
+    the rollout's EP4 combine so the forward can keep its visible FC1 output
+    for ``nvfp4_moe_vjp.routed_vjp``.
     """
 
-    def __init__(
-        self, weights, model_config, *, routed_forward_reduction, ep_group=None,
-        routed_expert_backend="humming",
-    ):
+    def __init__(self, weights, model_config, *, ep_group=None):
         super().__init__()
-        from .nvfp4_ep4 import validate_reduction
-
-        if routed_forward_reduction is None:
-            raise ValueError("Name the rollout's EP4 reduction (routed_forward_reduction)")
-        validate_reduction(routed_forward_reduction)
-        if routed_expert_backend not in ROUTED_EXPERT_BACKENDS:
-            raise ValueError(f"Unknown routed expert backend {routed_expert_backend!r}")
-        self.routed_expert_backend = routed_expert_backend
-        self.routed_forward_reduction = routed_forward_reduction
         if not isinstance(weights, Nvfp4ExpertWeights):
             raise TypeError("Expected Nvfp4ExpertWeights")
         if (
@@ -54,7 +40,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         ) != (128, 2688, 1856, 6):
             raise ValueError("EP4 reduction requires Lightning expert geometry")
         if weights.up_proj.device.type != "cuda":
-            raise ValueError("Humming deployment requires CUDA checkpoint storage")
+            raise ValueError("Routed deployment requires CUDA checkpoint storage")
         self.weights = weights
         self.config = model_config
         self._ready = False
@@ -77,7 +63,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
 
     @torch.no_grad()
     def _install(self):
-        from .kernels import CuteDslRoutedExperts, HummingRoutedExperts
+        from .kernels import CuteDslRoutedExperts
 
         self._ready = False
         self._validate_checkpoint()
@@ -90,17 +76,9 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             tuple(getattr(w, f"_{projection}_{s}") for s in ("packed", "scale", "global"))
             for projection in ("up_proj", "down_proj")
         )
-        if self.routed_expert_backend == "flashinfer_cutedsl":
-            self._experts = CuteDslRoutedExperts(
-                *stacks, num_experts=self.config.n_routed_experts, offset=w.offset
-            )
-        else:
-            self._experts = HummingRoutedExperts(
-                *stacks,
-                num_experts=self.config.n_routed_experts,
-                offset=w.offset,
-                layer_name=w.prefix,
-            )
+        self._experts = CuteDslRoutedExperts(
+            *stacks, num_experts=self.config.n_routed_experts, offset=w.offset
+        )
         self._deployed_versions = w._versions()
         self._ready = True
 
@@ -131,8 +109,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             x, self.weights.up_proj, self.weights.down_proj, routing_weights, ids, self
         )
 
-    def _visible(self, x, ids, routing_weights, *, return_fc1=False,
-                 return_activated=False):
+    def _visible(self, x, ids, routing_weights, *, return_fc1=False):
         self._check_inputs(x, ids, routing_weights)
         if x.shape[0] == 0:
             if return_fc1:
@@ -141,9 +118,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         from .nvfp4_ep4 import ep4_routed_experts
 
         return ep4_routed_experts(
-            self._experts, x, routing_weights, ids,
-            self.routed_forward_reduction, return_fc1=return_fc1,
-            return_activated=return_activated,
+            self._experts, x, routing_weights, ids, return_fc1=return_fc1
         )
 
     def _check_inputs(self, x, ids, routing_weights):

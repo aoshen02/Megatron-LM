@@ -1,26 +1,12 @@
-"""Pinned EP4 BI reductions for the unsharded Lightning trainer.
-
-EP4 serving reduction orders (AG/RS and FlashInfer one-sided), not arbitrary
-collective-version parity. Reuses existing expert and ATen primitives.
-"""
+"""The rollout's EP4 combine (FlashInfer one-sided) for the Lightning trainer."""
 
 import torch
 
-EP4_REDUCTION = "ep4-agrs-bf16-r0-r1r2r3-v1"
-EP4_ONESIDED_REDUCTION = "ep4-fi-onesided-fp32-top6-first-rank-v1"
 
-
-def validate_reduction(recipe):
-    if recipe not in (None, EP4_REDUCTION, EP4_ONESIDED_REDUCTION):
-        raise ValueError("Unknown routed forward reduction recipe")
-
-
-def reduce_ep4_parts(parts, ids, recipe):
-    """Combine rounded rank partials using the selected inference arithmetic."""
-    validate_reduction(recipe)
+def reduce_ep4_parts(parts, ids):
+    """Combine the four BF16 rank partials as the FlashInfer one-sided combine."""
     if (
-        recipe is None
-        or len(parts) != 4
+        len(parts) != 4
         or ids.ndim != 2
         or ids.shape[1] != 6
         or any(
@@ -30,8 +16,6 @@ def reduce_ep4_parts(parts, ids, recipe):
         or parts[0].shape[0] != ids.shape[0]
     ):
         raise ValueError("Require four BF16 rank partials and six routes per row")
-    if recipe == EP4_REDUCTION:
-        return parts[0] + ((parts[1] + parts[2]) + parts[3])
     owners = ids // 32
     stacked = torch.stack(parts)
     rows = torch.arange(ids.shape[0], device=ids.device)
@@ -50,46 +34,21 @@ def reduce_ep4_parts(parts, ids, recipe):
     return total.to(torch.bfloat16)
 
 
-def ep4_routed_experts(
-    experts, x, topk_weights, topk_ids, recipe, *, return_fc1=False,
-    return_activated=False,
-):
-    """Run all 128 experts locally (Humming or CuTe-DSL) with an EP4 serving combine.
+def ep4_routed_experts(experts, x, topk_weights, topk_ids, *, return_fc1=False):
+    """Run all 128 experts locally with the rollout's EP4 combine.
 
-    Forms the four BF16 rank partials an EP4 deployment computes (each rank's
-    ``moe_fused_mul_sum`` over its 32 experts) and combines them in the
-    selected serving order. ``return_fc1`` also returns the visible FC1 and
-    expert outputs per route (token-major, slot-minor); ``return_activated``
-    also the activation GEMM2 consumed, or None where it is recomputable
-    (Humming applies ReLU2 to the visible FC1).
+    The four BF16 rank partials are the CuTe-DSL kernel's own per-rank top-k
+    combine (``moe_unpermute``) over each rank's 32 experts. ``return_fc1``
+    also returns, per route (token-major, slot-minor), the visible FC1, the
+    expert output and the activation GEMM2 consumed.
     """
-    validate_reduction(recipe)
-    if recipe is None:
-        raise ValueError("An explicit EP4 reduction recipe is required")
     if experts.num_experts != 128 or experts.global_num_experts != 128:
         raise RuntimeError("EP4 reduction requires full128 indexed experts")
     rows, topk = topk_ids.shape
     if x.dtype != torch.bfloat16 or x.shape != (rows, 2688) or topk != 6:
         raise ValueError("Expected BF16 Lightning top6 geometry")
-    if hasattr(experts, "ep_partials"):
-        # CuTe-DSL: the rank partials come from the serving kernel's own
-        # per-rank top-k combine (moe_unpermute).
-        result = experts.ep_partials(x, topk_weights, topk_ids, return_fc1=return_fc1)
-        parts, fc1, per_route, activated = (
-            result if return_fc1 else (result, None, None, None)
-        )
-        out = reduce_ep4_parts(parts, topk_ids, recipe)
-        if not return_fc1:
-            return out
-        return (out, fc1, per_route, activated) if return_activated else (out, fc1, per_route)
-    fc1, per_route = experts.routes(x, topk_ids)
-    parts = []
-    for rank in range(4):
-        mapping = torch.full((128,), -1, dtype=torch.int32, device=x.device)
-        mapping[rank * 32 : (rank + 1) * 32] = torch.arange(32, device=x.device)
-        parts.append(experts.rank_partial(per_route, topk_weights, topk_ids, mapping))
-    out = reduce_ep4_parts(parts, topk_ids, recipe)
+    result = experts.ep_partials(x, topk_weights, topk_ids, return_fc1=return_fc1)
     if not return_fc1:
-        return out
-    saved = (out, fc1, per_route.view(-1, x.shape[1]))
-    return (*saved, None) if return_activated else saved
+        return reduce_ep4_parts(result, topk_ids)
+    parts, fc1, per_route, activated = result
+    return reduce_ep4_parts(parts, topk_ids), fc1, per_route, activated

@@ -110,9 +110,7 @@ def sum_route_grads(per_route):
 class RoutedExpertsVJP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, up, down, routes, ids, owner):
-        out, fc1, visible, activated = owner._visible(
-            x, ids, routes, return_fc1=True, return_activated=True
-        )
+        out, fc1, visible, activated = owner._visible(x, ids, routes, return_fc1=True)
         ctx.owner, ctx.versions = owner, owner.weights._versions()
         ctx.save_for_backward(x, fc1, visible, up, down, routes, ids, activated)
         return out

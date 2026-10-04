@@ -72,11 +72,6 @@ def validate_proxy_config(config, impl):
         raise ValueError("Quantized proxy requires TP/ETP/CP/VPP1")
     if (p.pp, p.ep) not in ((1, 1), (4, 1), (1, 4)):
         raise ValueError("Quantized Nemotron supports PP1/EP1, PP4/EP1 or PP1/EP4")
-    if impl.routed_forward_reduction is None:
-        raise ValueError(
-            "Quantized Nemotron requires routed_forward_reduction (the rollout's "
-            "EP4 combine); without it the six routes would be summed directly"
-        )
     if not full_depth and (
         config.num_hidden_layers not in (4, 5)
         or not {
@@ -173,9 +168,6 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
     from .quantization import CheckpointProjectionFactory, Nvfp4TrainingLinear
 
     _check_runtime(ps)
-    from .kernels import seed_device_capability
-
-    seed_device_capability(torch.device("cuda", torch.cuda.current_device()))
     recipe = config.quantization_config
     factory = CheckpointProjectionFactory(impl.hf_path, recipe["quantized_layers"])
 
@@ -197,9 +189,7 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
         return Nvfp4RoutedDeployment(
             weights,
             config,
-            routed_forward_reduction=impl.routed_forward_reduction,
             ep_group=ps.ep_group if ps.ep_size > 1 else None,
-            routed_expert_backend=impl.routed_expert_backend,
         )
 
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)
