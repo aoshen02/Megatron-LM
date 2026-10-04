@@ -22,9 +22,12 @@ from megatron.lite.primitive.protocols import (
     default_placement_fn,
 )
 
+# Each rank writes its DistributedOptimizer buckets in place (Megatron-LM's
+# default). "fully_reshardable" first gathers the parameter state into new FP32
+# host buffers, at least three times the size of the rank's optimizer state,
+# which a CPU-offloaded optimizer cannot afford. Checkpoints of either type load.
 _DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "distrib_optim_sharding_type": "dp_reshardable",
     "chained_optim_avoid_prefix": True,
 }
 
@@ -102,19 +105,10 @@ def load_dist_opt_checkpoint(
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
-    metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
         load_sd.update(model_sd)
-    if load_optimizer and optimizer is not None:
-        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
-        try:
-            load_sd["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), is_loading=True, metadata=metadata
-            )
-        finally:
-            _restore_state_dict_patches(patches)
     # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
     # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
     # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
@@ -126,6 +120,17 @@ def load_dist_opt_checkpoint(
 
     torch.load = _trusted_torch_load
     try:
+        if load_optimizer and optimizer is not None:
+            metadata = _dist_opt_checkpoint_metadata(
+                optimizer, dist_checkpointing.load_content_metadata(checkpoint_dir)
+            )
+            patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
+            try:
+                load_sd["optimizer"] = optimizer.sharded_state_dict(
+                    _single_or_all_model_state(model_sd), is_loading=True, metadata=metadata
+                )
+            finally:
+                _restore_state_dict_patches(patches)
         state_dict = dist_checkpointing.load(
             load_sd, checkpoint_dir, validate_access_integrity=False
         )
@@ -263,12 +268,20 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
     yield from visit(optimizer)
 
 
-def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
-    dist_opts = tuple(_iter_distributed_optimizers(optimizer))
-    return {
-        **_DISTOPT_METADATA,
-        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
-    }
+def _dist_opt_checkpoint_metadata(
+    optimizer: Any, saved: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Save metadata, or with ``saved`` (a checkpoint's) the metadata to load it."""
+
+    key = "distrib_optim_sharding_type"
+    sharding_type = (saved or {}).get(key, _DISTOPT_METADATA[key])
+    metadata = {**_DISTOPT_METADATA, key: sharding_type}
+    if sharding_type == "fully_reshardable":
+        dist_opts = tuple(_iter_distributed_optimizers(optimizer))
+        metadata["distrib_optim_fully_reshardable_mem_efficient"] = bool(dist_opts) and all(
+            getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts
+        )
+    return metadata
 
 
 def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:

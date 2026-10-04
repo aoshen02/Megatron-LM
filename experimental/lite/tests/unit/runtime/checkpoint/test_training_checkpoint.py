@@ -28,8 +28,14 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
+def test_dist_opt_checkpoint_saves_buckets_in_place() -> None:
+    """dp_reshardable writes the optimizer's own buffers; nothing is gathered."""
+    assert _dist_opt_checkpoint_metadata(SimpleNamespace()) == DISTOPT_METADATA
+
+
 @pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
 def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
+    """A fully_reshardable checkpoint loads through the gloo exchange only if every group has one."""
     opts = [
         SimpleNamespace(
             data_parallel_group_gloo=group,
@@ -40,7 +46,11 @@ def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None
         )
         for group in groups
     ]
-    metadata = _dist_opt_checkpoint_metadata(SimpleNamespace(chained_optimizers=opts))
+    metadata = _dist_opt_checkpoint_metadata(
+        SimpleNamespace(chained_optimizers=opts),
+        {**DISTOPT_METADATA, "distrib_optim_sharding_type": "fully_reshardable"},
+    )
+    assert metadata["distrib_optim_sharding_type"] == "fully_reshardable"
     assert metadata["distrib_optim_fully_reshardable_mem_efficient"] is expected
 
 
@@ -82,13 +92,14 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
 
 
 class FakeDistOpt:
-    def __init__(self):
+    def __init__(self, metadata=None):
+        self.metadata = metadata or DISTOPT_METADATA
         self.save_model_sd = None
         self.load_model_sd = None
         self.loaded_state = None
 
     def sharded_state_dict(self, model_sd, is_loading: bool = False, metadata=None):
-        assert metadata == DISTOPT_METADATA
+        assert metadata == self.metadata
         if is_loading:
             self.load_model_sd = model_sd
         else:
@@ -114,8 +125,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "distrib_optim_sharding_type": "dp_reshardable",
     "chained_optim_avoid_prefix": True,
 }
 
@@ -260,10 +270,29 @@ def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
     assert _single_or_all_model_state(vpp_sd) is vpp_sd
 
 
-def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize(
+    "saved",
+    [
+        DISTOPT_METADATA,
+        {
+            "distrib_optim_sharding_type": "fully_reshardable",
+            "distrib_optim_fully_reshardable_mem_efficient": True,
+            "chained_optim_avoid_prefix": True,
+        },
+    ],
+)
+def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path, saved) -> None:
+    """The optimizer state is read in the sharding type the checkpoint was saved with."""
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
-    optimizer = FakeDistOpt()
+    expected_metadata = {
+        **DISTOPT_METADATA,
+        "distrib_optim_sharding_type": saved["distrib_optim_sharding_type"],
+    }
+    if saved["distrib_optim_sharding_type"] == "fully_reshardable":
+        # This optimizer has no gloo group, whatever the saving run had.
+        expected_metadata["distrib_optim_fully_reshardable_mem_efficient"] = False
+    optimizer = FakeDistOpt(expected_metadata)
     attach_model_sharded_state_dict([model], ParallelState())
     expected_weight = torch.full_like(wrapped_module.weight, 3.0)
     expected_bias = torch.full_like(wrapped_module.bias, -2.0)
@@ -281,6 +310,10 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
         }
 
     monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load_content_metadata",
+        lambda checkpoint_dir: saved,
+    )
 
     step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
 
