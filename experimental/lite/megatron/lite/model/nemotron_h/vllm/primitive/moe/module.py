@@ -64,15 +64,10 @@ class Router(nn.Module):
         )
 
     def forward(self, x):
-        from vllm.model_executor.determinism import batch_invariant
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
             grouped_topk,
         )
 
-        # torch.mm(out_dtype=fp32) is M-invariant only once the process has
-        # run init_batch_invariance (build_model does, before any forward).
-        if not batch_invariant._batch_invariant_MODE:
-            raise RuntimeError("Router GEMM before init_batch_invariance()")
         config = self.config
         logits = visible_linear(
             lambda x: torch.mm(x, self.weight.T, out_dtype=torch.float32),
@@ -147,8 +142,6 @@ class MoE(nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        if config.n_shared_experts != 1:
-            raise ValueError("Nemotron MoE requires the single shared expert contract")
         self.gate = Router(config, device=device, dtype=dtype)
         weights = Nvfp4ExpertWeights(
             projection_factory.root,

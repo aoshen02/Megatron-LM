@@ -483,8 +483,4 @@ def load_hf_weights(model, path):
                     raise ValueError(
                         f"HF shape mismatch for {name}: {value.shape} != {target.shape}"
                     )
-                if target.is_meta:
-                    raise ValueError(
-                        "Materialize model parameters before loading weights"
-                    )
                 target.copy_(value)

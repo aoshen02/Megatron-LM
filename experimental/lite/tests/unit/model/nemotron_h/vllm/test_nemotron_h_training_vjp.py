@@ -330,7 +330,6 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
     output (FP8 P@V) would put dQ/dK about 3x the BF16 noise floor.
     """
     from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
-    from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
@@ -499,12 +498,8 @@ def _lightning_router():
 
 @pytest.mark.gpus(1)
 @pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
-def test_router_vjp_within_bf16_noise_floor(kind, monkeypatch):
+def test_router_vjp_within_bf16_noise_floor(kind):
     """Lightning router: 128 experts, top-6 sigmoid, renormalized, fixed ids."""
-    from vllm.model_executor.determinism import batch_invariant
-
-    # The VJP is measured against FP64; batch-invariant GEMM tiling is not.
-    monkeypatch.setattr(batch_invariant, "_batch_invariant_MODE", True)
     torch.manual_seed(0)
     router = _lightning_router()
     with torch.no_grad():
@@ -621,7 +616,6 @@ def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
 def test_fp8_attention_vjp_is_run_to_run_bitwise(monkeypatch):
     """full_determinism: the FlashAttention backward accumulates dQ in a fixed order."""
     from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
-    from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(7)

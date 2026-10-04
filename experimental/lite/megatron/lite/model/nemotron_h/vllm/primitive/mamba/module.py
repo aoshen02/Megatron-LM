@@ -181,9 +181,6 @@ class MambaMixer(torch.nn.Module):
 
     def forward(self, hidden, meta: SSMMeta):
         c = self.config
-        meta.validate_tokens(hidden.shape[0])
-        if meta.chunk_size != c.chunk_size:
-            raise ValueError("SSM metadata chunk size differs from model config")
         projected = projection(hidden, self.in_proj)
         gate, xbc, dt = projected.split(
             (c.mamba_inner_size, c.mamba_conv_dim, c.mamba_num_heads), dim=-1

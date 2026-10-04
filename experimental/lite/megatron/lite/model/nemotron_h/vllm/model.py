@@ -9,17 +9,12 @@ from megatron.lite.model.nemotron_h.checkpoint import load_fp8_kv_scales
 from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Attention
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     CheckpointProjectionFactory,
-    Fp8TrainingLinear,
-    Nvfp4TrainingLinear,
     RMSNorm,
     projection,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import (
     MambaMixer,
     SSMMeta,
-)
-from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
-    Nvfp4RoutedDeployment,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.moe.module import MoE
 
@@ -90,17 +85,6 @@ class NemotronHModel(nn.Module):
         start, end = layer_range or (0, config.num_hidden_layers)
         if not 0 <= start < end <= config.num_hidden_layers:
             raise ValueError("Invalid contiguous layer range")
-        if ps.pp_size > 1 and layer_range is None:
-            raise ValueError("PP requires an explicit layer assignment from runtime")
-        attention_layers = {
-            i
-            for i in range(start, end)
-            if config.layers_block_type[i] == "full_attention"
-        }
-        if set(fp8_kv_scales) != attention_layers:
-            raise ValueError(
-                "FP8 KV scales must cover exactly the local attention layers"
-            )
         self.pre_process = start == 0
         self.post_process = end == config.num_hidden_layers
         if config.tie_word_embeddings:
@@ -176,34 +160,6 @@ class NemotronHModel(nn.Module):
         return projection(hidden, self.lm_head) if return_logits else hidden
 
 
-def stage_quantization_contract(config, layer_range):
-    """Select stage-owned recipe entries without discarding unknown prefixes."""
-    start, end = layer_range
-    if not 0 <= start < end <= config.num_hidden_layers:
-        raise ValueError("Invalid quantized stage layer range")
-    prefixes = set()
-    for prefix in config.quantization_config["quantized_layers"]:
-        if prefix == "lm_head":
-            if end == config.num_hidden_layers:
-                prefixes.add(prefix)
-            continue
-        parts = prefix.split(".")
-        if (
-            len(parts) < 5
-            or parts[:2] != ["backbone", "layers"]
-            or not parts[2].isdigit()
-            or parts[3] != "mixer"
-            or not 0 <= int(parts[2]) < config.num_hidden_layers
-        ):
-            raise ValueError(f"Unknown quantized stage prefix: {prefix}")
-        if start <= int(parts[2]) < end:
-            prefixes.add(prefix)
-    attention_ids = [
-        i for i in range(start, end) if config.layers_block_type[i] == "full_attention"
-    ]
-    return prefixes, attention_ids
-
-
 def build_stage(config, impl, ps, *, layer_range):
     """Construct one pipeline stage from the checkpoint, before optimizer binding."""
     from vllm.utils.torch_utils import set_default_torch_dtype
@@ -211,7 +167,11 @@ def build_stage(config, impl, ps, *, layer_range):
     factory = CheckpointProjectionFactory(
         impl.hf_path, config.quantization_config["quantized_layers"]
     )
-    expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)
+    attention_ids = [
+        i
+        for i in range(*layer_range)
+        if config.layers_block_type[i] == "full_attention"
+    ]
     kv = load_fp8_kv_scales(impl.hf_path, attention_ids, device="cuda")
     with set_default_torch_dtype(torch.bfloat16):
         model = NemotronHModel(
@@ -222,21 +182,6 @@ def build_stage(config, impl, ps, *, layer_range):
             dtype=torch.bfloat16,
             projection_factory=factory,
             fp8_kv_scales=kv,
-        )
-    covered = set()
-    for name, module in model.named_modules():
-        prefix = name if name == "lm_head" else "backbone." + name
-        if isinstance(module, Fp8TrainingLinear | Nvfp4TrainingLinear):
-            covered.add(prefix)
-        if isinstance(module, Nvfp4RoutedDeployment):
-            covered.update(
-                f"{prefix}.{e}.{projection}"
-                for e in range(config.n_routed_experts)
-                for projection in ("up_proj", "down_proj")
-            )
-    if covered != expected_prefixes:
-        raise ValueError(
-            "Quantized construction did not cover every stage recipe prefix"
         )
     model._hf_root = str(Path(impl.hf_path).resolve())
     model._bf16_master_root = str(Path(impl.bf16_master_path).resolve())

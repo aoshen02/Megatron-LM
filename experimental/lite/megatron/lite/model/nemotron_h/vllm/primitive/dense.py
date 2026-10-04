@@ -280,8 +280,6 @@ class _Holder(torch.nn.Module):
 
 def _modelopt_global_scale(weight_scale, weight_scale_2):
     """ModelOpt KNvfp4Static.process: one FP32 global scale per matrix."""
-    if torch.isnan(weight_scale.float()).any():
-        raise RuntimeError("NVFP4 weight_scale was never loaded (NaN)")
     if weight_scale_2.dtype != torch.float32 or weight_scale_2.numel() != 1:
         raise ValueError("Expected one FP32 NVFP4 global scale")
     return weight_scale_2.max().to(torch.float32)
@@ -418,13 +416,6 @@ class CheckpointProjectionFactory:
         dtype=torch.bfloat16,
     ):
         from safetensors import safe_open
-
-        if not isinstance(prefix, str) or not prefix or prefix.endswith("."):
-            raise ValueError("Expected an explicit HF module prefix")
-        if dtype != torch.bfloat16 or in_features <= 0 or out_features <= 0:
-            raise ValueError(
-                "Expected positive projection geometry and BF16 activations"
-            )
 
         def tensor_info(suffix):
             name = f"{prefix}.{suffix}"
@@ -634,14 +625,8 @@ class Fp8TrainingLinear(torch.nn.Module):
 
     def forward(self, x):
         self._check_fresh()
-        if (
-            x.dtype != torch.bfloat16
-            or x.ndim < 2
-            or x.shape[-1] != self.weight.shape[-1]
-            or not x.is_cuda
-            or x.device != self.weight.device
-        ):
-            raise ValueError("Expected CUDA BF16 activations with checkpoint K/device")
+        if x.dtype != torch.bfloat16 or x.shape[-1] != self.weight.shape[-1]:
+            raise ValueError("Expected BF16 activations with checkpoint K")
         return visible_linear(self._visible, x, self.weight)
 
 

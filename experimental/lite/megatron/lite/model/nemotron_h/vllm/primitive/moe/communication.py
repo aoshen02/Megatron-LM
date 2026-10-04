@@ -186,11 +186,8 @@ def _forward(experts, group, x, ids, weights, *, save=True):
     return out, state
 
 
-# One Function, not DS4's scatter / grouped / gather Functions: a received row
-# is a (token, rank) pair holding several of the token's routes, and the source
-# rank must add every route's input gradient in slot order with BF16 rounding
-# (as the single-rank VJP). An autograd boundary at the dispatch would sum a
-# row's routes on the expert rank first.
+# One Function so the source rank adds each route's input gradient in slot order
+# with BF16 rounding; a boundary at the dispatch would sum a row's routes first.
 class EPRoutedExpertsVJP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, up, down, routes, ids, owner):

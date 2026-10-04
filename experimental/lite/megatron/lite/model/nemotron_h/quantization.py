@@ -93,7 +93,6 @@ def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
         expected = tensors["weight"].view(torch.uint8)
         changed = int((codes != expected).sum())
     elif algorithm == "W4A16_NVFP4":
-        QuantizedWeight(algorithm, tensors).initial_master()  # validates the layout
         global_scale = tensors["weight_scale_2"].float()
         scale = tensors["weight_scale"]
         values = nvfp4_encode_values(master, scale, global_scale)

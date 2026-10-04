@@ -34,11 +34,9 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         from vllm import _custom_ops as ops
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
-        if len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != q.shape[0]:
-            raise ValueError("Expected complete zero-origin packed boundaries")
         lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
-        if any(length <= 0 or length > MAX_SEQ_LEN for length in lengths):
-            raise ValueError(f"Expected nonempty sequences no longer than {MAX_SEQ_LEN}")
+        if any(length > MAX_SEQ_LEN for length in lengths):
+            raise ValueError(f"Expected sequences no longer than {MAX_SEQ_LEN}")
         # Each sequence owns the 6768-token pages it fills; the rest of its
         # MAX_SEQ_LEN-wide table row repeats its last page, never read.
         width = -(-MAX_SEQ_LEN // 6768)

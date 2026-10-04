@@ -86,10 +86,6 @@ class CuteDslRoutedExperts:
         check_flashinfer_w4a16()
         tensors = {}
         for stem, (packed, scale, global_scale) in (("w1", up), ("w2", down)):
-            if torch.isnan(scale.float()).any():
-                raise RuntimeError(f"NVFP4 {stem} weight_scale was never loaded (NaN)")
-            if global_scale.dtype != torch.float32 or global_scale.numel() != len(packed):
-                raise ValueError("Expected one FP32 NVFP4 global scale per expert")
             tensors[stem] = packed.detach().clone()
             with torch.cuda.device(packed.device):
                 tensors[f"{stem}_sf"] = prepare_w4a16_scales(scale.detach())
@@ -305,20 +301,6 @@ class Nvfp4ExpertWeights(torch.nn.Module):
         super().__init__()
         if tp_size != 1 or num_experts % ep_size or not 0 <= ep_rank < ep_size:
             raise ValueError("NVFP4 experts require TP1 and EP dividing the experts")
-        if (
-            not isinstance(prefix, str)
-            or not prefix.startswith("backbone.layers.")
-            or not prefix.endswith(".mixer.experts")
-        ):
-            raise ValueError("Expected explicit HF routed-experts prefix")
-        if (
-            min(num_experts, hidden_size, intermediate_size) <= 0
-            or hidden_size % 16
-            or intermediate_size % 16
-        ):
-            raise ValueError(
-                "Both expert contraction dimensions must be positive multiples of 16"
-            )
         self.prefix, self.num_experts = prefix, num_experts
         self.num_local = num_experts // ep_size
         self.offset = ep_rank * self.num_local
@@ -633,23 +615,9 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
 
     def __init__(self, weights, model_config, *, ep_group=None):
         super().__init__()
-        if not isinstance(weights, Nvfp4ExpertWeights):
-            raise TypeError("Expected Nvfp4ExpertWeights")
-        if (
-            model_config.n_routed_experts != weights.num_experts
-            or weights._geometry["up_proj"]
-            != (model_config.moe_intermediate_size, model_config.hidden_size)
-            or model_config.mlp_hidden_act != "relu2"
-            or model_config.mlp_bias
-        ):
-            raise ValueError("Expected matching bias-free ReLU2 expert geometry")
-        if not 1 <= model_config.num_experts_per_tok <= weights.num_experts:
-            raise ValueError("Invalid top-k expert count")
+        if model_config.mlp_hidden_act != "relu2" or model_config.mlp_bias:
+            raise ValueError("Expected bias-free ReLU2 experts")
         self.ep_group = ep_group
-        if (weights.num_local != weights.num_experts) != (ep_group is not None):
-            raise ValueError("EP experts need the EP group, and only they")
-        if weights.up_proj.device.type != "cuda":
-            raise ValueError("Routed deployment requires CUDA checkpoint storage")
         self.weights = weights
         self.config = model_config
         self._ready = False

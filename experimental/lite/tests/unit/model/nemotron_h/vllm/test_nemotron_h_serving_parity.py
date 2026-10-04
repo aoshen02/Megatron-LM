@@ -567,7 +567,7 @@ def _flashinfer_combine_worker(rank, port, nccl_env):
         max_num_tokens=max_tokens, top_k=6, num_experts=128, hidden_size=hidden,
         mnnvl_config=MnnvlConfig(comm_backend=TorchDistBackend(dist.group.WORLD)),
     )
-    for rows in ((513, 7, 64, 1), (1024, 1024, 300, 1))[0:2]:
+    for rows in ((513, 7, 64, 1), (1024, 1024, 300, 1)):
         mine = rows[rank]
         g = torch.Generator(device="cuda").manual_seed(10 + rank)
         ids = _route_ids(mine, g)
