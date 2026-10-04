@@ -22,7 +22,7 @@ def _needs_native_reload(vllm_config) -> bool:
     return isinstance(quant_config, ModelOptMixedPrecisionConfig)
 
 
-def _incomplete_layers(model) -> list[str]:
+def _incomplete_layers(model, loaded: set[str]) -> list[str]:
     """Layers still missing a checkpoint tensor once every bucket has arrived.
 
     Finalize would otherwise process them from uninitialized storage or keep
@@ -42,6 +42,9 @@ def _incomplete_layers(model) -> list[str]:
         info = LAYERWISE_INFO.get(layer)
         if info is None or not info.can_load():
             continue
+        # Parameters only, unlike vLLM's load_numel_total: the layers pending
+        # here are attention layers, whose buffers are runtime copies of the
+        # k/v scales. A padded layer would be reported, failing closed.
         expected = sum(
             get_tensor_load_numel(tensor)
             for name, tensor in get_layer_params_buffers(layer)[0].items()
@@ -49,6 +52,13 @@ def _incomplete_layers(model) -> list[str]:
         )
         if info.load_numel != expected:
             incomplete.append(prefix)
+    # Loaded in place, outside layerwise accounting (e.g. the router's
+    # e_score_correction_bias); the other SKIP_LOAD_TENSORS are runtime buffers.
+    incomplete += [
+        name
+        for name, _ in model.named_parameters()
+        if name.rpartition(".")[2] in SKIP_LOAD_TENSORS and name not in loaded
+    ]
     return incomplete
 
 
@@ -92,7 +102,7 @@ class MLiteVLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
             zmq_handle=self._get_zmq_handle(), device=self.device, use_shm=use_shm
         )
 
-        received = set()
+        received, loaded = set(), set()
         error = None
 
         def load(weights, is_last):
@@ -107,7 +117,9 @@ class MLiteVLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
                 received.update(names)
                 # vLLM buffers loader arguments until a layer is complete,
                 # while the receiver reuses its bucket once this returns.
-                model.load_weights([(n, t.clone()) for n, t in weights])
+                loaded.update(
+                    model.load_weights([(n, t.clone()) for n, t in weights])
+                )
             except Exception as e:
                 error = e
 
@@ -117,7 +129,7 @@ class MLiteVLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
             receiver.receive_weights(on_bucket_received=load)
             if error is not None:
                 raise error
-            if incomplete := _incomplete_layers(model):
+            if incomplete := _incomplete_layers(model, loaded):
                 raise RuntimeError(f"MLite refit left layers incomplete: {incomplete}")
             finalize_layerwise_processing(model, vllm_config.model_config)
         self._refit_failed = False
