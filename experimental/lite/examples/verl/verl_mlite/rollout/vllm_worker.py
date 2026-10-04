@@ -93,20 +93,30 @@ class MLiteVLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
         )
 
         received = set()
+        error = None
 
         def load(weights, is_last):
-            names = [name for name, _ in weights]
-            if len(set(names)) != len(names) or not received.isdisjoint(names):
-                raise RuntimeError("MLite refit received a tensor twice")
-            received.update(names)
-            # vLLM buffers loader arguments until a layer is complete, while
-            # the receiver reuses its bucket once this callback returns.
-            model.load_weights([(name, tensor.clone()) for name, tensor in weights])
+            nonlocal error
+            if error is not None:
+                return
+            # Raising here would skip the ack and leave the sender blocked.
+            try:
+                names = [name for name, _ in weights]
+                if len(set(names)) != len(names) or not received.isdisjoint(names):
+                    raise RuntimeError("MLite refit received a tensor twice")
+                received.update(names)
+                # vLLM buffers loader arguments until a layer is complete,
+                # while the receiver reuses its bucket once this returns.
+                model.load_weights([(n, t.clone()) for n, t in weights])
+            except Exception as e:
+                error = e
 
         self._refit_failed = True
         with set_current_vllm_config(vllm_config):
             initialize_layerwise_reload(model)
             receiver.receive_weights(on_bucket_received=load)
+            if error is not None:
+                raise error
             if incomplete := _incomplete_layers(model):
                 raise RuntimeError(f"MLite refit left layers incomplete: {incomplete}")
             finalize_layerwise_processing(model, vllm_config.model_config)
