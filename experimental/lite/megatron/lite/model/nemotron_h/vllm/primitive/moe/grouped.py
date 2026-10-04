@@ -1,10 +1,4 @@
-"""FlashInfer CuTe-DSL W4A16 routed experts with a BF16-master grouped backward.
-
-The backward mirrors the DeepSeek-V4 aligned actor's grouped MoE: the
-visible FC1 and expert outputs are saved in forward, the route gradient
-comes from the visible expert output and the dgrad/wgrad GEMMs run as
-Transformer Engine grouped BF16 GEMMs.
-"""
+"""FlashInfer CuTe-DSL W4A16 routed experts with a BF16-master grouped backward."""
 
 import json
 from pathlib import Path
@@ -22,8 +16,7 @@ from megatron.lite.model.nemotron_h.vllm.primitive.dense import require_batch_in
 
 
 # FlashInfer private W4A16 helpers the actor calls, and the launcher whose
-# stage order it mirrors (flashinfer-python 0.7.0.post1,
-# flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py :49/:59/:195/:358).
+# stage order it mirrors (flashinfer-python 0.7.0.post1).
 FLASHINFER_W4A16_SIGNATURES = {
     "_get_workspace": (
         "x", "top_k", "num_experts", "num_local_experts", "intermediate_size",
@@ -73,23 +66,11 @@ def check_flashinfer_w4a16():
 class CuteDslRoutedExperts:
     """FlashInfer CuTe-DSL W4A16 ReLU2 experts (vLLM ``flashinfer_cutedsl``, BI).
 
-    Serving runs ``launch_w4a16_moe`` (``CuteDslFusedMoEW4A16Runner``) with
-    the batch-invariant tactic on each EP rank's 32 experts. This class runs
-    the same stages in the same order over the ``num_local`` experts it holds
-    (``offset`` onwards of ``num_experts``): ``moe_sort`` -> ``moe_permute``
-    -> GEMM1 with the fused ReLU2 epilogue -> GEMM2 -> ``moe_unpermute``.
-    Slots of experts held elsewhere get no permuted row, as on a serving
-    rank. Every routed row is one expert tile's full-K FP32 accumulation, so
-    its output does not depend on which other rows or experts share the
-    launch.
-
-    With ``return_fc1`` GEMM1 also runs with the identity epilogue (the
-    variant GEMM2 uses): same kernel, tactic, tiles and K order, writing
-    ``bf16(alpha * acc)``, the visible FC1 pre-activation for the VJP.
-
-    Uses FlashInfer's ``_get_workspace`` and ``_run_grouped_gemm``
-    (``flashinfer/fused_moe/cute_dsl/blackwell/moe_w4a16.py``); construction
-    checks their signatures and source (``check_flashinfer_w4a16``).
+    Runs ``launch_w4a16_moe``'s stages in serving order over the ``num_local``
+    experts held from ``offset``: ``moe_sort`` -> ``moe_permute`` -> GEMM1
+    with the fused ReLU2 epilogue -> GEMM2 -> ``moe_unpermute``. With
+    ``return_fc1`` GEMM1 also runs with the identity epilogue (same kernel,
+    tactic and K order), giving the visible FC1 pre-activation for the VJP.
     """
 
     TOP_K = 6
@@ -172,8 +153,6 @@ class CuteDslRoutedExperts:
         )
         from flashinfer.tllm_enums import ActivationType
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Routed experts are eager only")
         rows, topk = ids.shape
         if (
             topk != self.TOP_K
@@ -303,18 +282,10 @@ def _is_dtensor(tensor):
 class Nvfp4ExpertWeights(torch.nn.Module):
     """BF16 masters and NVFP4 deployment bytes of this EP rank's experts.
 
-    EP rank ``r`` owns the contiguous experts ``[r * E / EP, (r + 1) * E / EP)``,
-    stored at local indices.
-
+    EP rank ``r`` owns the contiguous experts ``[r * E / EP, (r + 1) * E / EP)``.
     The deployment bytes are the checkpoint's until the first
-    ``refresh_quantized`` with ``recompute_scales`` (after the first optimizer
-    update); from then on every refresh requantizes the masters with the
-    checkpoint's rule (``quantization.requantize``).
-
-    No forward, backward, routing, kernel packing, or deployment is implemented.
-    Ordinary optimizer mutations are version-checked. Runtime updates through
-    ``.data`` must call refresh_quantized explicitly (or mark_dirty before export)
-    because they can bypass PyTorch's version counter.
+    ``refresh_quantized(recompute_scales=True)``; from then on every refresh
+    requantizes the masters (``quantization.requantize``).
     """
 
     def __init__(
@@ -452,23 +423,13 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                     (self.num_local, rows, columns // 2),
                     torch.uint8,
                 ),
+                (
+                    getattr(self, f"_{projection}_scale"),
+                    (self.num_local, rows, columns // 16),
+                    torch.float8_e4m3fn,
+                ),
+                (getattr(self, f"_{projection}_global"), (self.num_local,), torch.float32),
             ]
-            for suffix in ("scale",):
-                specs.append(
-                    (
-                        getattr(self, f"_{projection}_{suffix}"),
-                        (self.num_local, rows, columns // 16),
-                        torch.float8_e4m3fn,
-                    )
-                )
-            for suffix in ("global",):
-                specs.append(
-                    (
-                        getattr(self, f"_{projection}_{suffix}"),
-                        (self.num_local,),
-                        torch.float32,
-                    )
-                )
             if not isinstance(master, torch.nn.Parameter):
                 raise RuntimeError("Expert master must remain a Parameter")
             for tensor, shape, dtype in specs:
@@ -496,10 +457,6 @@ class Nvfp4ExpertWeights(torch.nn.Module):
                 ].reshape(self._global_shapes[projection][expert]),
             },
         )
-
-    def mark_dirty(self):
-        """Invalidate before non-versioned runtime writes; refresh before export."""
-        self._dirty = True
 
     @torch.no_grad()
     def refresh_quantized(self, recompute_scales=False):
@@ -561,11 +518,8 @@ def _te_grouped_gemm(lhs, rhs, out, *, layout, m_splits, single_output=False):
 def routed_vjp(x, fc1, visible, up, down, routes, ids, dy, activated=None, *, per_route=False):
     """ReLU2 routed experts: ``y = sum_s routes[:, s] * down(relu(up(x))**2)``.
 
-    Per-input contract (as DeepSeek-V4's grouped MoE): the route-weight
-    gradient is ``<dy, visible expert output>``, exact because the weights
-    only scale the visible outputs; the input and expert-weight gradients are
-    Transformer Engine ``high_precision`` BF16 GEMMs on the masters from the
-    visible FC1 output.
+    The route-weight gradient is ``<dy, visible expert output>``; the input and
+    expert-weight gradients are TE BF16 grouped GEMMs on the masters.
 
     Args:
         x: BF16 tokens, ``[M, K]``.
@@ -659,20 +613,10 @@ class RoutedExpertsVJP(torch.autograd.Function):
 
 
 def ep4_routed_experts(experts, x, topk_weights, topk_ids, *, return_fc1=False):
-    """Run all 128 experts locally with the rollout's EP4 combine.
-
-    The four BF16 rank partials are the CuTe-DSL kernel's own per-rank top-k
-    combine (``moe_unpermute``) over each rank's 32 experts. ``return_fc1``
-    also returns, per route (token-major, slot-minor), the visible FC1, the
-    expert output and the activation GEMM2 consumed.
-    """
+    """Run all 128 experts locally with the rollout's EP4 combine of the four
+    per-rank ``moe_unpermute`` partials."""
     from megatron.lite.model.nemotron_h.vllm.primitive.moe.communication import reduce_ep4_parts
 
-    if experts.num_experts != 128 or experts.global_num_experts != 128:
-        raise RuntimeError("EP4 reduction requires full128 indexed experts")
-    rows, topk = topk_ids.shape
-    if x.dtype != torch.bfloat16 or x.shape != (rows, 2688) or topk != 6:
-        raise ValueError("Expected BF16 Lightning top6 geometry")
     result = experts.ep_partials(x, topk_weights, topk_ids, return_fc1=return_fc1)
     if not return_fc1:
         return reduce_ep4_parts(result, topk_ids)
@@ -681,13 +625,10 @@ def ep4_routed_experts(experts, x, topk_weights, topk_ids, *, return_fc1=False):
 
 
 class Nvfp4RoutedDeployment(torch.nn.Module):
-    """Own a frozen W4A16 deployment alongside BF16 expert masters.
+    """W4A16 routed-expert deployment over BF16 expert masters.
 
-    Inputs are fixed expert IDs and continuous routing weights; this adapter does
-    not route, normalize scores, apply routed_scaling_factor, or add shared output.
-    No Graph/compile/concurrent-host dispatch support is claimed. Training runs
-    the rollout's EP4 combine so the forward can keep its visible FC1 output
-    for ``routed_vjp``.
+    Takes fixed expert ids and routing weights; excludes routed_scaling_factor
+    and the shared expert.
     """
 
     def __init__(self, weights, model_config, *, ep_group=None):
@@ -707,22 +648,12 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         self.ep_group = ep_group
         if (weights.num_local != weights.num_experts) != (ep_group is not None):
             raise ValueError("EP experts need the EP group, and only they")
-        if (
-            weights.num_experts, model_config.hidden_size,
-            model_config.moe_intermediate_size, model_config.num_experts_per_tok,
-        ) != (128, 2688, 1856, 6):
-            raise ValueError("EP4 reduction requires Lightning expert geometry")
         if weights.up_proj.device.type != "cuda":
             raise ValueError("Routed deployment requires CUDA checkpoint storage")
         self.weights = weights
         self.config = model_config
         self._ready = False
         self._install()
-
-    def _apply(self, fn, recurse=True):
-        raise RuntimeError(
-            "Construct deployment on its final device; do not convert its recipe"
-        )
 
     def _validate_checkpoint(self):
         self.weights._validate_storage()
@@ -738,10 +669,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     def _install(self):
         self._ready = False
         self._validate_checkpoint()
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "Deployment construction cannot run during Graph capture"
-            )
         w = self.weights
         stacks = tuple(
             tuple(getattr(w, f"_{projection}_{s}") for s in ("packed", "scale", "global"))
@@ -756,8 +683,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
         """Call after every optimizer/runtime update, including .data writes."""
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Deployment refresh cannot run during Graph capture")
         self._ready = False
         self.weights.refresh_quantized(recompute_scales=recompute_scales)
         self._install()
@@ -791,7 +716,6 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         )
 
     def _check_inputs(self, x, ids, routing_weights):
-        self._validate_checkpoint()
         if not self._ready or self.weights._versions() != self._deployed_versions:
             raise RuntimeError("Refresh deployment before routed forward")
         c, device = self.config, self.weights.up_proj.device
@@ -811,10 +735,3 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
             raise ValueError(
                 "Expected contiguous BF16 X, int32 IDs and FP32 route weights"
             )
-        if (
-            not torch.isfinite(x).all()
-            or not torch.isfinite(routing_weights).all()
-            or (ids < 0).any()
-            or (ids >= c.n_routed_experts).any()
-        ):
-            raise ValueError("Nonfinite input or out-of-range expert IDs")

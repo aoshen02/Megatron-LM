@@ -1,17 +1,10 @@
-"""EP routed experts over normal DeepEP, as in the DeepSeek-V4 aligned actor.
+"""EP routed experts over normal DeepEP.
 
-Each source token is sent once to every EP rank that owns one of its routes,
-as one row per (token, rank) pair. DeepEP therefore never sums: every combine
-row has a single contributor and the transport is lossless in both
-directions. The expert rank computes its local routes and its BF16 partial
-as a serving rank does (the CuTe-DSL launch over its 32 experts and that
-launch's own ``moe_unpermute``), the partial returns to the
-source rank, and the source rank reduces the partials in the serving order
-(``reduce_ep4_parts``). The backward sends the output gradient over
-the same rows and runs ``routed_vjp`` on the local experts; the input
-gradient of every route returns unsummed, and the source rank adds a token's
-routes in slot order with BF16 rounding after each add (DS4's deterministic
-scatter backward), as the single-rank VJP does.
+Each token is sent once to every EP rank owning one of its routes, one row per
+(token, rank), so DeepEP never sums. The expert rank forms its BF16 partial as
+a serving rank does and the source rank reduces the partials in serving order
+(``reduce_ep4_parts``). In backward every route's input gradient returns
+unsummed and the source rank adds them in slot order with BF16 rounding.
 """
 
 import contextlib
@@ -58,11 +51,9 @@ def reduce_ep4_parts(parts, ids):
         duplicate = (owners[:, :slot] == rank[:, None]).any(dim=1)
         value = stacked[rank, rows]
         slots.append(torch.where(duplicate[:, None], 0, value).float())
-    # FlashInfer 0.7.0 one-sided combine (csrc/nv_internal/tensorrt_llm/kernels/
-    # communicationKernels/moeAlltoAllKernels.cu): dispatch sends each token once
-    # per target rank, from the first top-k slot naming it (:495); combine loads
-    # that rank's partial for the first slot and FP32 zero for duplicates
-    # (:971); TOP_K=6 sums ((s0+s1)+(s2+s3))+(s4+s5) in FP32 (:1104-1115).
+    # FlashInfer 0.7.0 one-sided combine (moeAlltoAllKernels.cu): each rank's
+    # partial at its first top-k slot, FP32 zero for duplicates, summed as
+    # ((s0+s1)+(s2+s3))+(s4+s5) in FP32.
     total = ((slots[0] + slots[1]) + (slots[2] + slots[3])) + (slots[4] + slots[5])
     return total.to(torch.bfloat16)
 
