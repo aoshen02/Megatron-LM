@@ -26,6 +26,7 @@ from megatron.lite.primitive.ckpt.local_stage import (
     NodeLocalStagingFileSystem as _NodeLocalStagingFileSystem,
     local_stage_root,
     publish_staged_file as _publish_staged_file,
+    run_on_all_ranks,
 )
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
@@ -66,11 +67,10 @@ def save_training_checkpoint(
     if _supports_dist_opt_distckpt(model, optimizer):
         ckpt_path = os.path.join(path, f"step_{step}")
         os.makedirs(ckpt_path, exist_ok=True)
+        _save_rank_files(None, ckpt_path, save_optimizer=False, save_rng=save_rng)
         _save_dist_opt_checkpoint(
             model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
         )
-        if save_rng:
-            _save_rng_sidecar(ckpt_path)
         log_rank0(f"Saved dist_opt checkpoint at step {step} to {ckpt_path}")
         return
     if config is None or ps is None:
@@ -94,17 +94,26 @@ def save_training_checkpoint(
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
+    _save_rank_files(optimizer, ckpt_path, save_optimizer=save_optimizer, save_rng=save_rng)
     storage_writer = _staged_dcp_writer(ckpt_path)
     dcp.save(
         state_dict,
         checkpoint_id=ckpt_path,
         storage_writer=storage_writer,
     )
-    if save_optimizer:
-        _save_optimizer_checkpoint(optimizer, ckpt_path)
-    if save_rng:
-        _save_rng_sidecar(ckpt_path)
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
+
+
+def _save_rank_files(optimizer, ckpt_path: str, *, save_optimizer: bool, save_rng: bool) -> None:
+    """Write the per-rank sidecars before the checkpoint's collective .metadata commit."""
+
+    def save() -> None:
+        if save_optimizer:
+            _save_optimizer_checkpoint(optimizer, ckpt_path)
+        if save_rng:
+            _save_rng_sidecar(ckpt_path)
+
+    run_on_all_ranks(save, "saving per-rank checkpoint files")
 
 
 def load_training_checkpoint(
