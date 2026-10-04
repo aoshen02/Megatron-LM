@@ -159,17 +159,15 @@ def build_dist_opt_stack(
         # distinguish `hasattr(param,'allreduce')` from `getattr(..., True)`.
         wrapped_chunks = list(model_chunks)
     else:
-        # With a single data-parallel (and expert-data-parallel) replica the
-        # gradient reduce has nothing to communicate, so overlapping it only
-        # adds Core's per-bucket readiness bookkeeping, which requires every
-        # parameter's grad hook to fire the same number of times in each
-        # step's last microbatch.
-        reduces_grads = ps.dp_size * ps.cp_size > 1 or ps.expert_dp_size > 1
         ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
-            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
+            # No overlapped gradient reduce, as DS4's megatron_wrap: the
+            # microbatch loop never enters DDP no_sync, so an overlapped
+            # bucket fires its reduce-scatter once its grad hooks reach the
+            # first step's count; a step with more microbatches then reduces
+            # partial gradients, one with fewer never issues the reduce.
+            # finish_grad_sync reduces the accumulated main_grads instead.
             use_distributed_optimizer=True,
-            overlap_grad_reduce=reduces_grads,
+            overlap_grad_reduce=False,
             overlap_param_gather=True,
             grad_reduce_in_fp32=True,
         )
