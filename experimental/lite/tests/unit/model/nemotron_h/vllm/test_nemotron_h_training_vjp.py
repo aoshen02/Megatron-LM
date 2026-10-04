@@ -963,3 +963,155 @@ def test_routed_vjp_on_the_cutedsl_deployment_at_updated_weights(monkeypatch):
         for name, actual, reference in zip(("dx", "d_up", "d_down"), got, expected):
             error = ((actual.float() - reference).norm() / reference.norm()).item()
             assert error < 1e-2, (snapshot, name, error)
+
+
+_EP4_PREFIX = "backbone.layers.0.mixer.experts"
+_EP4_GEOMETRY = {"num_experts": 8, "hidden_size": 64, "intermediate_size": 32}
+
+
+class _ExpertBlock(torch.nn.Module):
+    """A dense parameter and this rank's routed expert bank, under the names
+    the Nemotron classifier and placements see (``*.mixer.experts.*``)."""
+
+    def __init__(self, experts):
+        super().__init__()
+        self.norm = torch.nn.Parameter(torch.linspace(0.5, 1.5, 64, device="cuda"))
+        self.mixer = torch.nn.Module()
+        self.mixer.experts = experts
+
+
+def _write_expert_checkpoint(root):
+    import json
+
+    from safetensors.torch import save_file
+
+    g = torch.Generator(device="cuda").manual_seed(21)
+    stored, recipes = {}, {}
+    rows = {"up_proj": (32, 64), "down_proj": (64, 32)}
+    for expert in range(_EP4_GEOMETRY["num_experts"]):
+        for projection, shape in rows.items():
+            name = f"{_EP4_PREFIX}.{expert}.{projection}"
+            master = (torch.randn(shape, generator=g, device="cuda") * 0.02).bfloat16()
+            for suffix, tensor in requantize("W4A16_NVFP4", master).items():
+                stored[f"{name}.{suffix}"] = tensor.contiguous().cpu()
+            recipes[name] = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+    save_file(stored, str(root / "model.safetensors"))
+    index = {name: "model.safetensors" for name in stored}
+    (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
+    return recipes
+
+
+def _ep4_checkpoint_worker(rank, port, nccl_env, root, recipes, ckpt):
+    import os
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import Nvfp4ExpertWeights
+    from megatron.lite.model.nemotron_h.vllm.protocol import (
+        EXPERT_CLASSIFIER,
+        PLACEMENT_FN,
+        _post_optimizer_step,
+    )
+    from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+    from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_training_optimizer
+    from megatron.lite.primitive.parallel.state import init_parallel
+
+    # As the serving-parity EP4 workers: the image's gcp NCCL plugins find no
+    # NIC in a test container; spcx falls back to sockets.
+    for name in [k for k in os.environ if "NCCL" in k]:
+        del os.environ[name]
+    os.environ.update(nccl_env)
+    if os.environ.get("NCCL_NET_PLUGIN") == "gcp":
+        for name in ("NCCL_ENV_PLUGIN", "NCCL_PROFILER_PLUGIN", "NCCL_TUNER_CONFIG_PATH"):
+            os.environ.pop(name, None)
+        os.environ["NCCL_NET_PLUGIN"] = "spcx"
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4
+    )
+    config = SimpleNamespace(tp=1, ep=4, etp=1, cp=1, pp=1)
+    ps = init_parallel(config)
+
+    def build():
+        experts = Nvfp4ExpertWeights(
+            root, _EP4_PREFIX, recipes, **_EP4_GEOMETRY,
+            ep_size=ps.ep_size, ep_rank=ps.ep_rank, device="cuda",
+        )
+        model = torch.nn.Module()
+        model.layers = torch.nn.ModuleList([_ExpertBlock(experts)])
+        optimizer = build_fsdp2_training_optimizer(
+            [model], None, ps, unit_modules=(_ExpertBlock,), expert_classifier=EXPERT_CLASSIFIER
+        )
+        experts.bind_master()
+        _post_optimizer_step([model])
+        return model, experts, optimizer
+
+    def snapshot(experts, optimizer):
+        masters = {p: experts._masters[p].to_local().clone() for p in ("up_proj", "down_proj")}
+        moments = [
+            {k: v.to_local().clone() if hasattr(v, "to_local") else v.clone() for k, v in s.items()}
+            for s in (
+                optimizer.optimizer.state[p]
+                for group in optimizer.param_groups
+                for p in group["params"]
+            )
+        ]
+        exported = {
+            k: v.reshape(-1).view(torch.uint8).cpu() for k, v in experts.export_quantized().items()
+        }
+        return masters, moments, exported
+
+    model, experts, optimizer = build()
+    for parameter in model.parameters():
+        parameter.grad = parameter.detach() * 0.5 + 0.01
+    optimizer.step()
+    _post_optimizer_step([model])
+    saved = snapshot(experts, optimizer)
+    hooks = {"get_placements": PLACEMENT_FN, "is_expert": EXPERT_CLASSIFIER}
+    save_training_checkpoint(model, optimizer, 1, ckpt, config, ps, **hooks, save_rng=False)
+
+    model, experts, optimizer = build()
+    assert not torch.equal(experts._masters["up_proj"].to_local(), saved[0]["up_proj"])
+    load_training_checkpoint(model, optimizer, ckpt, config, ps, **hooks, load_rng=False)
+    _post_optimizer_step([model])
+    masters, moments, exported = snapshot(experts, optimizer)
+    for projection, value in saved[0].items():
+        assert torch.equal(masters[projection], value), (rank, projection)
+    assert len(moments) == len(saved[1])
+    for actual, expected in zip(moments, saved[1]):
+        assert actual.keys() == expected.keys()
+        for key, value in expected.items():
+            assert torch.equal(actual[key], value), (rank, key)
+    assert exported.keys() == saved[2].keys()
+    for name, value in saved[2].items():
+        assert torch.equal(exported[name], value), (rank, name)
+    dist.destroy_process_group()
+
+
+@cuda
+@pytest.mark.gpus(4)
+def test_ep4_fsdp2_checkpoint_restores_each_ranks_expert_bank(tmp_path):
+    """EP4 + FSDP2 wraps each rank's 32-expert bank on its own expert-DP mesh,
+    so every rank's bank has the same DTensor shape and offset. A save and
+    load must still restore each rank's own masters, Adam state and
+    requantized deployment bytes (ISEEKYAN/Megatron-LM#235), not one bank on
+    all ranks."""
+    import socket
+
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < 4:
+        pytest.skip("requires four GPUs")
+    root = tmp_path / "hf"
+    root.mkdir()
+    recipes = _write_expert_checkpoint(root)
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    nccl_env = {k: v for k, v in __import__("os").environ.items() if "NCCL" in k}
+    mp.spawn(
+        _ep4_checkpoint_worker,
+        args=(port, nccl_env, root, recipes, str(tmp_path / "ckpt")),
+        nprocs=4,
+        join=True,
+    )
