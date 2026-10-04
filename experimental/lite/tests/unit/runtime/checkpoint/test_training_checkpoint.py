@@ -730,7 +730,9 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path, sa
         lambda checkpoint_dir: saved,
     )
 
-    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
+    step = dcp.load_training_checkpoint(
+        model, optimizer, str(tmp_path / "step_5"), use_dcp=True, load_rng=False
+    )
 
     assert step == 5
     assert not model.wrapper_load_called
