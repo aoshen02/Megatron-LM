@@ -36,8 +36,9 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
     hf_path: str | None = None
-    # BF16 release the hf_path checkpoint was quantized from; when set, the
-    # masters start from it and theta0 deploys their requantization.
+    # BF16 release the hf_path checkpoint was quantized from: the masters
+    # start from it and theta0 deploys their requantization, so a restored
+    # checkpoint's deployment is requant(master) too.
     bf16_master_path: str | None = None
     # Activation recompute (DS4's ``impl_cfg.recompute``): "full" re-runs each
     # block's forward in backward. The kernels are deterministic, so the
@@ -227,7 +228,6 @@ def build_model(model_cfg, *, impl_cfg):
         "model_cfg": model_cfg,
         "optimizer_backend": impl_cfg.optimizer or "none",
         "post_optimizer_step_hook": partial(_refresh_quantized, chunks, release_grads=fsdp2),
-        "post_checkpoint_load_hook": partial(_restore_quantized, chunks),
     }
     if optimizer is not None:
         extras["post_model_load_hook"] = partial(_refresh_after_model_load, chunks)
@@ -316,13 +316,6 @@ def _refresh_quantized(chunks, *, release_grads=False):
         for chunk in chunks:
             for parameter in chunk.parameters():
                 parameter.grad = None
-
-
-def _restore_quantized(chunks):
-    # A training checkpoint restores the masters with the deployment bytes
-    # that were serving when it was saved; requantizing would replace them
-    # (checkpoint bytes before the first update) without any update.
-    refresh_quantized_projections(chunks, restore=True)
 
 
 def _refresh_after_model_load(chunks):

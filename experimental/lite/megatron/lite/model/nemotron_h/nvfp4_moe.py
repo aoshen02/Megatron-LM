@@ -83,14 +83,12 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         self._ready = True
 
     @torch.no_grad()
-    def refresh_deployment(self, recompute_scales=False, restore=False):
+    def refresh_deployment(self, recompute_scales=False):
         """Call after every optimizer/runtime update, including .data writes."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Deployment refresh cannot run during Graph capture")
         self._ready = False
-        self.weights.refresh_quantized(
-            recompute_scales=recompute_scales, restore=restore
-        )
+        self.weights.refresh_quantized(recompute_scales=recompute_scales)
         self._install()
 
     def forward(self, x, ids, routing_weights):

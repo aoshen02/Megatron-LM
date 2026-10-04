@@ -112,16 +112,12 @@ class NemotronExport:
 
 
 @torch.no_grad()
-def refresh_quantized_projections(chunks, *, recompute_scales=False, restore=False):
+def refresh_quantized_projections(chunks, *, recompute_scales=False):
     """Refresh explicitly after updates, including updates bypassing _version.
 
     ``recompute_scales`` (set by the post-optimizer hook) switches every module
     from checkpoint scales to scales recomputed from its master, for good.
-    ``restore`` reinstalls the deployment bytes a training checkpoint restored
-    (the bytes last deployed when it was saved) without requantizing.
     """
-    if recompute_scales and restore:
-        raise ValueError("A restore reinstalls the saved bytes; it does not requantize")
     from .fp8_training import Fp8TrainingLinear
     from .nvfp4_experts import Nvfp4ExpertWeights
     from .nvfp4_moe import Nvfp4RoutedDeployment
@@ -147,13 +143,9 @@ def refresh_quantized_projections(chunks, *, recompute_scales=False, restore=Fal
     for module in modules:
         if isinstance(module, Nvfp4ExpertWeights):
             if module not in owned_weights:
-                module.refresh_quantized(
-                    recompute_scales=recompute_scales, restore=restore
-                )
+                module.refresh_quantized(recompute_scales=recompute_scales)
         else:
-            module.refresh_deployment(
-                recompute_scales=recompute_scales, restore=restore
-            )
+            module.refresh_deployment(recompute_scales=recompute_scales)
 
 
 def hf_tensor_views(model):
@@ -435,11 +427,10 @@ def _check_theta0_agreement(masters, root, index):
 def load_hf_weights(model, path):
     """Load ordinary tensors and verify preconstructed quantized projections.
 
-    Quantized projections must already own the checkpoint's deployment values
-    before optimizer binding. This initial loader does not restore different
-    quantized weights or optimizer state into an existing training model.
-    With a BF16 master source (``model._bf16_master_root``), the masters come
-    from that release and the deployments are their requantization instead.
+    The masters come from the BF16 release (``model._bf16_master_root``) and
+    the deployments are their requantization; the checkpoint provides the
+    static activation scales. This initial loader does not restore optimizer
+    state into an existing training model.
     """
     from safetensors import safe_open
 
@@ -450,9 +441,7 @@ def load_hf_weights(model, path):
     index = json.loads((root / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
-    master_root = getattr(model, "_bf16_master_root", None)
-    if master_root is not None:
-        _load_bf16_masters(model, root, master_root)
+    _load_bf16_masters(model, root, model._bf16_master_root)
     quantized = {}
     for name, module in model.named_modules():
         if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
@@ -467,24 +456,6 @@ def load_hf_weights(model, path):
             name.removeprefix(weights.prefix + "."): value
             for name, value in weights.export_quantized().items()
         }
-    from .quantization import check_reversible
-
-    if master_root is None:
-        for name, module in model.named_modules():
-            if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
-                algorithm = (
-                    "FP8" if isinstance(module, Fp8TrainingLinear) else "W4A16_NVFP4"
-                )
-                check_reversible(algorithm, module.weight, module._tensors(), name)
-        for weights in _routed_checkpoint_owners(model).values():
-            for projection in ("up_proj", "down_proj"):
-                for expert in range(weights.num_local):
-                    check_reversible(
-                        "W4A16_NVFP4",
-                        getattr(weights, projection)[expert],
-                        weights._checkpoint(projection, expert).tensors,
-                        f"{weights.prefix}.{weights.offset + expert}.{projection}",
-                    )
     for prefix, tensors in quantized.items():
         for suffix, deployed in tensors.items():
             name = f"{prefix}.{suffix}"
@@ -496,7 +467,7 @@ def load_hf_weights(model, path):
                 stored = handle.get_tensor(name)
             # A requantized deployment keeps only the checkpoint's static
             # activation scale; the weight bytes are requant(master).
-            if master_root is not None and suffix != "input_scale":
+            if suffix != "input_scale":
                 if stored.shape != deployed.shape or stored.dtype != deployed.dtype:
                     raise ValueError(f"Requantized deployment geometry differs: {name}")
                 continue

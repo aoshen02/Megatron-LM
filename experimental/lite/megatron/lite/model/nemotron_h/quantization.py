@@ -328,13 +328,10 @@ class Nvfp4TrainingLinear(torch.nn.Module):
             raise RuntimeError("Refresh deployment after updating master weights")
 
     @torch.no_grad()
-    def refresh_deployment(self, recompute_scales=False, restore=False):
-        """Reinstall; once the master has been updated, requantize it first.
-
-        ``restore`` reinstalls the bytes a training checkpoint restored.
-        """
+    def refresh_deployment(self, recompute_scales=False):
+        """Reinstall; once the master has been updated, requantize it first."""
         self._requantized |= recompute_scales
-        if self._requantized and not restore:
+        if self._requantized:
             tensors = requantize("W4A16_NVFP4", full_master(self._master))
             self._packed = tensors["weight"]
             self.weight_scale.copy_(tensors["weight_scale"])
