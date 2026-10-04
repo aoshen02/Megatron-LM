@@ -126,13 +126,15 @@ def _gated_rms_norm_vjp(grad_output, x, gate, weight, group_size, eps):
     return grad_x, grad_gate, grad_weight
 
 
-_compiled_rms_norm_vjp = torch.compile(_rms_norm_vjp, fullgraph=True, dynamic=False)
-_compiled_residual_rms_norm_vjp = torch.compile(
-    _residual_rms_norm_vjp, fullgraph=True, dynamic=False
-)
-_compiled_gated_rms_norm_vjp = torch.compile(
-    _gated_rms_norm_vjp, fullgraph=True, dynamic=False
-)
+# These compile on their first call inside backward, on the autograd engine's
+# device thread. Inductor config overrides are thread-local, so that thread
+# does not see the deterministic mode torch.use_deterministic_algorithms set
+# on the main thread; its first compile would autotune reductions by timing
+# (dynamic RBLOCK scaling) and pick the reduction order nondeterministically.
+_VJP_COMPILE = dict(fullgraph=True, dynamic=False, options={"deterministic": True})
+_compiled_rms_norm_vjp = torch.compile(_rms_norm_vjp, **_VJP_COMPILE)
+_compiled_residual_rms_norm_vjp = torch.compile(_residual_rms_norm_vjp, **_VJP_COMPILE)
+_compiled_gated_rms_norm_vjp = torch.compile(_gated_rms_norm_vjp, **_VJP_COMPILE)
 
 
 class _RMSNormVJP(torch.autograd.Function):
