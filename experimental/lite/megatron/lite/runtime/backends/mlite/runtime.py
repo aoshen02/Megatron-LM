@@ -413,12 +413,9 @@ class MegatronLiteRuntime(RuntimeBase):
             **kwargs,
         )
         if load_model:
-            post_load_hook = handle._extras.get(
-                "post_checkpoint_load_hook",
-                handle._extras.get("post_optimizer_step_hook"),
-            )
-            if callable(post_load_hook):
-                post_load_hook()
+            post_update_hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
         return step
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
@@ -458,8 +455,6 @@ class MegatronLiteRuntime(RuntimeBase):
             load_optimizer,
             offload_model_to_cpu,
             offload_optimizer,
-            release_grad_buffers,
-            restore_grad_buffers,
         )
 
         # A model+gradient transfer is the training context boundary.  On its
@@ -471,8 +466,6 @@ class MegatronLiteRuntime(RuntimeBase):
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
-            elif grad:
-                release_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
@@ -493,8 +486,6 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            elif grad:
-                restore_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):

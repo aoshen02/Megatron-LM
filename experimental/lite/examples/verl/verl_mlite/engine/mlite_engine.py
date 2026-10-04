@@ -131,46 +131,40 @@ class _MegatronLiteLRScheduler:
         return [group["lr"] for group in self.optimizer.param_groups]
 
     def _apply(self) -> None:
+        lr = self._get_lr()
         wd = self._get_wd()
         for param_group in self.optimizer.param_groups:
-            # As Megatron Core: per-group max_lr/min_lr overrides; lr_mult is a
-            # legacy field Megatron Core no longer applies.
-            if param_group.get("lr_mult", 1.0) != 1.0:
-                raise ValueError("lr_mult is not supported; override max_lr/min_lr")
-            param_group["lr"] = self._get_lr(
-                param_group.get("max_lr", self.max_lr),
-                param_group.get("min_lr", self.min_lr),
-            )
+            param_group["lr"] = lr
             if param_group.get("weight_decay", None) is not None:
                 param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
-    def _get_lr(self, max_lr: float, min_lr: float) -> float:
+    def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
             ratio = self.num_steps / self.lr_warmup_steps
-            return self.init_lr + (max_lr - self.init_lr) * ratio
+            return self.init_lr + (self.max_lr - self.init_lr) * ratio
 
         if self.lr_decay_style == "constant":
-            return max_lr
+            return self.max_lr
 
         if self.lr_decay_style == "inverse-square-root":
             warmup = max(self.lr_warmup_steps, 1)
             step = max(self.num_steps, 1)
-            return max(min_lr, max_lr * math.sqrt(warmup) / math.sqrt(step))
+            return max(self.min_lr, self.max_lr * math.sqrt(warmup) / math.sqrt(step))
 
         if self.lr_decay_style == "wsd":
-            return self._get_wsd_lr(max_lr, min_lr)
+            return self._get_wsd_lr()
 
         decay_span = max(self.lr_decay_steps - self.lr_warmup_steps, 1)
         ratio = min(max((self.num_steps - self.lr_warmup_steps) / decay_span, 0.0), 1.0)
-        return self._decay(max_lr, min_lr, ratio, self.lr_decay_style)
+        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_decay_style)
 
-    def _get_wsd_lr(self, max_lr: float, min_lr: float) -> float:
+    def _get_wsd_lr(self) -> float:
         decay_steps = self.wsd_decay_steps or 0
         decay_start = max(self.lr_decay_steps - decay_steps, self.lr_warmup_steps)
         if decay_steps <= 0 or self.num_steps <= decay_start:
-            return max_lr
+            return self.max_lr
         ratio = min((self.num_steps - decay_start) / max(decay_steps, 1), 1.0)
-        return self._decay(max_lr, min_lr, ratio, self.lr_wsd_decay_style)
+        return self._decay(self.max_lr, self.min_lr, ratio, self.lr_wsd_decay_style)
 
     def _get_wd(self) -> float:
         if self.wd_incr_style == "constant":
@@ -447,7 +441,6 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
-        grad = grad or self.engine_config.grad_offload
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
@@ -584,13 +577,9 @@ class MegatronLiteEngine(BaseEngine):
                 load_model=True,
                 load_optimizer=True,
             )
-            # A restore reinstalls the saved deployment; it is not an update.
-            extras = self.handle._extras
-            post_load_hook = extras.get(
-                "post_checkpoint_load_hook", extras.get("post_optimizer_step_hook")
-            )
-            if callable(post_load_hook):
-                post_load_hook()
+            post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
                 state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
