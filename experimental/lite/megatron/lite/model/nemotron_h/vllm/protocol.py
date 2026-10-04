@@ -318,8 +318,8 @@ def build_model(model_cfg, *, impl_cfg):
     init_batch_invariance()
     if impl_cfg.deterministic:
         # mamba_ssm's SSD backward reduces dA/dD/ddt_bias with atomics unless
-        # its deterministic mode is on (verl's full_determinism does not set
-        # torch.use_deterministic_algorithms, which it would otherwise follow).
+        # its deterministic mode is on; set it here rather than rely on the
+        # caller's torch.use_deterministic_algorithms.
         from mamba_ssm.utils.determinism import set_deterministic_mode
 
         set_deterministic_mode(True)
