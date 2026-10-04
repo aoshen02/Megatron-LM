@@ -139,16 +139,18 @@ class _NodeLocalDistSaveStrategy(TorchDistSaveShardedStrategy):
         request = super()._get_save_and_finalize_callbacks(
             writer, save_state_dict_ret, async_strategy
         )
-        if len(request.async_fn_args) < 2:
-            return request
-
+        # A rank without write buckets still joins every collective below.
+        write_buckets = request.async_fn_args[1] if request.async_fn_args else []
         staged_files: list[tuple[Path, Path]] = []
-        write_buckets = request.async_fn_args[1]
-        for index, (destination, storage_key, payload) in enumerate(write_buckets):
-            destination = Path(destination)
-            stage_path = allocate_stage_path(self._stage_root, destination.name)
-            write_buckets[index] = (str(stage_path), storage_key, payload)
-            staged_files.append((stage_path, destination))
+
+        def allocate() -> None:
+            for index, (destination, storage_key, payload) in enumerate(write_buckets):
+                destination = Path(destination)
+                stage_path = allocate_stage_path(self._stage_root, destination.name)
+                write_buckets[index] = (str(stage_path), storage_key, payload)
+                staged_files.append((stage_path, destination))
+
+        run_on_all_ranks(allocate, "allocating checkpoint staging files")
 
         original_finalize_fns = tuple(request.finalize_fns)
 
