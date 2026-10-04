@@ -292,7 +292,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     and prev.shape == param.shape
                 ):
                     # A copy that is an FP32 master is overwritten from the master
-                    # after the rebuild (_update_fp32_params_by_new_state).
+                    # after the rebuild (_update_fp32_params_by_new_state). The skip
+                    # relies on the master having been loaded in place into prev;
+                    # otherwise prev is copied here and overwritten later anyway.
                     if not (to_fp32 and id(prev) in master_ids):
                         prev.copy_(param.detach())
                     param = prev
