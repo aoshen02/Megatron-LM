@@ -90,8 +90,8 @@ def test_flashinfer_w4a16_launcher_source_is_the_reviewed_one():
 
 
 # The direct kernel calls must reproduce the vLLM layer objects bit for bit.
-# The oracle builds those objects (ReplicatedLinear + ModelOpt, FusedMoE with
-# the CuTe-DSL backend) on the same checkpoint bytes, as serving does.
+# The oracle builds those objects (ReplicatedLinear + ModelOpt, and FusedMoE
+# for its weight loaders) on the same checkpoint bytes, as serving does.
 ORACLE_ROWS = (1, 7, 64, 513, 8192)
 LIGHTNING_MOE = dict(experts=128, hidden=2688, intermediate=1856, topk=6)
 
@@ -139,7 +139,8 @@ def vllm_oracle_runtime():
         parallel_config=ParallelConfig(distributed_executor_backend="mp"),
         compilation_config=CompilationConfig(custom_ops=["none", "+quant_fp8"]),
     )
-    config.kernel_config.moe_backend = "flashinfer_cutedsl"
+    # Only the FusedMoE weight loaders are exercised; any NVFP4 backend loads.
+    config.kernel_config.moe_backend = "humming"
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
