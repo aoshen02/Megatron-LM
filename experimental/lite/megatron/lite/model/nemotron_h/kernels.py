@@ -488,12 +488,13 @@ class CuteDslRoutedExperts:
 
     Serving runs ``launch_w4a16_moe`` (``CuteDslFusedMoEW4A16Runner``) with
     the batch-invariant tactic on each EP rank's 32 experts. This class runs
-    the same stages in the same order, once over all 128 experts:
-    ``moe_sort`` -> ``moe_permute`` -> GEMM1 with the fused ReLU2 epilogue ->
-    GEMM2 -> per-rank ``moe_unpermute`` (slots of other ranks masked, which is
-    what a rank's sort produces for them). Every routed row is one expert
-    tile's full-K FP32 accumulation, so its output does not depend on which
-    other rows or experts share the launch.
+    the same stages in the same order over the ``num_local`` experts it holds
+    (``offset`` onwards of ``num_experts``): ``moe_sort`` -> ``moe_permute``
+    -> GEMM1 with the fused ReLU2 epilogue -> GEMM2 -> ``moe_unpermute``.
+    Slots of experts held elsewhere get no permuted row, as on a serving
+    rank. Every routed row is one expert tile's full-K FP32 accumulation, so
+    its output does not depend on which other rows or experts share the
+    launch.
 
     With ``return_fc1`` GEMM1 also runs with the identity epilogue (the
     variant GEMM2 uses): same kernel, tactic, tiles and K order, writing
@@ -506,7 +507,7 @@ class CuteDslRoutedExperts:
 
     TOP_K = 6
 
-    def __init__(self, up, down, *, num_experts):
+    def __init__(self, up, down, *, num_experts, offset=0):
         """``up``/``down`` are ``(packed, scale, global)`` checkpoint stacks."""
         from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_w4a16_moe import (  # noqa: E501
             BATCH_INVARIANT_TACTIC,
@@ -527,9 +528,11 @@ class CuteDslRoutedExperts:
             # Serving passes weight_scale_2 as the GEMM alpha.
             tensors[f"{stem}_alpha"] = global_scale.detach().reshape(-1).clone()
         self.tensors = tensors
-        self.num_experts = self.global_num_experts = num_experts
-        if len(up[0]) != num_experts:
-            raise ValueError("CuTe-DSL routed experts hold every expert")
+        self.num_experts = len(up[0])
+        self.global_num_experts = num_experts
+        self.offset = offset
+        if not 0 <= offset <= num_experts - self.num_experts:
+            raise ValueError("Local experts out of range")
         self.intermediate = up[0].shape[1]
         self.hidden = down[0].shape[1]
         self.tactic = BATCH_INVARIANT_TACTIC
@@ -566,17 +569,18 @@ class CuteDslRoutedExperts:
             tactic=self.tactic,
         )
 
-    def ep_partials(self, x, routes, ids, *, ranks=4, return_fc1=False):
-        """BF16 EP-rank partials; with ``return_fc1`` also, per route
-        (token-major, slot-minor), the visible FC1 pre-activation
-        ``[M*topk, I]``, expert output ``[M*topk, H]`` and the fused GEMM1
-        activation GEMM2 consumed ``[M*topk, I]``."""
+    def _launch(self, x, routes, ids, *, return_fc1):
+        """Run the launcher's stages up to GEMM2.
+
+        Returns the permuted GEMM2 output, ``expanded_idx_to_permuted_idx``
+        ``[M, topk]`` (-1 for slots of other experts), the permuted visible
+        FC1 (or None) and the permuted fused activation.
+        """
         from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _get_workspace
         from flashinfer.fused_moe.cute_dsl.moe_utils import (
             get_max_num_permuted_tokens,
             moe_permute,
             moe_sort,
-            moe_unpermute,
             normalize_cute_dsl_moe_activation_type,
         )
         from flashinfer.tllm_enums import ActivationType
@@ -590,31 +594,32 @@ class CuteDslRoutedExperts:
             or x.shape != (rows, self.hidden)
             or ids.dtype != torch.int32
             or routes.dtype != torch.float32
-            or self.num_experts % ranks
+            or routes.shape != ids.shape
         ):
             raise ValueError("Expected BF16 tokens, int32 ids, FP32 routes, top-6")
         relu2, _ = normalize_cute_dsl_moe_activation_type(ActivationType.Relu2)
         tile = self.tactic[0][1]
-        experts = self.num_experts
-        workspace = _get_workspace(x, topk, experts, experts, self.intermediate, tile)
+        local = self.num_experts
+        workspace = _get_workspace(
+            x, topk, self.global_num_experts, local, self.intermediate, tile
+        )
         (t2e, t2lim, e2p, p2e, _, live) = moe_sort(
             token_selected_experts=ids,
             token_final_scales=routes,
-            num_experts=experts,
+            num_experts=self.global_num_experts,
             top_k=topk,
-            local_expert_offset=0,
-            num_local_experts=experts,
+            local_expert_offset=self.offset,
+            num_local_experts=local,
             tile_tokens_dim=tile,
             enable_pdl=True,
             **workspace.moe_sort_buffers,
         )
-        slots = get_max_num_permuted_tokens(rows, topk, experts, tile)
+        slots = get_max_num_permuted_tokens(rows, topk, local, tile)
         meta = {
             "tile_idx_to_expert_idx": t2e[: slots // tile],
             "tile_idx_to_mn_limit": t2lim[: slots // tile],
             "num_non_exiting_tiles": live,
         }
-        e2p = e2p[:rows]
         hidden = workspace.hidden_workspace[:slots]
         moe_permute(
             input=x,
@@ -634,20 +639,63 @@ class CuteDslRoutedExperts:
             self._gemm("w1", hidden, fc1, meta, None)
         self._gemm("w1", hidden, activated, meta, relu2)
         self._gemm("w2", activated, hidden, meta, None)
-        owner = ids // (experts // ranks)
-        parts = []
-        for rank in range(ranks):
-            part = torch.empty_like(x)
-            moe_unpermute(
-                permuted_input=hidden,
-                output=part,
-                expanded_idx_to_permuted_idx=torch.where(owner == rank, e2p, -1),
-                topk_scales=routes,
-                num_tokens=rows,
-                top_k=topk,
-                enable_pdl=True,
-            )
-            parts.append(part)
+        return hidden, e2p[:rows], fc1, activated
+
+    def _unpermute(self, hidden, e2p, routes):
+        from flashinfer.fused_moe.cute_dsl.moe_utils import moe_unpermute
+
+        rows, topk = e2p.shape
+        part = hidden.new_empty(rows, self.hidden)
+        moe_unpermute(
+            permuted_input=hidden,
+            output=part,
+            expanded_idx_to_permuted_idx=e2p,
+            topk_scales=routes,
+            num_tokens=rows,
+            top_k=topk,
+            enable_pdl=True,
+        )
+        return part
+
+    def rank_partial(self, x, routes, ids, *, save=False):
+        """This EP rank's BF16 partial over the slots of its own experts.
+
+        With ``save`` also returns, for those slots only (token-major,
+        slot-minor), the visible FC1 pre-activation ``[S, I]``, expert output
+        ``[S, H]`` and fused GEMM1 activation GEMM2 consumed ``[S, I]``.
+        """
+        rows = ids.shape[0]
+        if rows == 0:
+            part = x.new_empty(0, self.hidden)
+            if not save:
+                return part
+            return part, x.new_empty(0, self.intermediate), part, x.new_empty(0, self.intermediate)
+        hidden, e2p, fc1, activated = self._launch(x, routes, ids, return_fc1=save)
+        part = self._unpermute(hidden, e2p, routes)
+        if not save:
+            return part
+        index = e2p.reshape(-1)
+        index = index.index_select(0, (index >= 0).nonzero().squeeze(1)).long()
+        return (
+            part,
+            fc1.index_select(0, index),
+            hidden.index_select(0, index),
+            activated.index_select(0, index),
+        )
+
+    def ep_partials(self, x, routes, ids, *, ranks=4, return_fc1=False):
+        """BF16 EP-rank partials of a deployment holding every expert; with
+        ``return_fc1`` also, per route (token-major, slot-minor), the visible
+        FC1 pre-activation ``[M*topk, I]``, expert output ``[M*topk, H]`` and
+        the fused GEMM1 activation GEMM2 consumed ``[M*topk, I]``."""
+        if self.num_experts != self.global_num_experts or self.num_experts % ranks:
+            raise ValueError("EP partials need every expert on this deployment")
+        hidden, e2p, fc1, activated = self._launch(x, routes, ids, return_fc1=return_fc1)
+        owner = ids // (self.num_experts // ranks)
+        parts = [
+            self._unpermute(hidden, torch.where(owner == rank, e2p, -1), routes)
+            for rank in range(ranks)
+        ]
         if not return_fc1:
             return parts
         index = e2p.reshape(-1).long()

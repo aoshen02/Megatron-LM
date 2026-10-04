@@ -1125,12 +1125,15 @@ def _gather_rows(tensor):
     return torch.cat(out), sum(sizes[: dist.get_rank()])
 
 
-def _ep4_deepep_worker(rank, port, nccl_env):
+def _ep4_deepep_worker(rank, port, nccl_env, backend):
     from types import SimpleNamespace
 
     import torch.distributed as dist
     from megatron.lite.model.nemotron_h import ep
-    from megatron.lite.model.nemotron_h.kernels import HummingRoutedExperts
+    from megatron.lite.model.nemotron_h.kernels import (
+        CuteDslRoutedExperts,
+        HummingRoutedExperts,
+    )
     from megatron.lite.model.nemotron_h.nvfp4_ep4 import (
         EP4_ONESIDED_REDUCTION,
         ep4_routed_experts,
@@ -1151,16 +1154,23 @@ def _ep4_deepep_worker(rank, port, nccl_env):
         for stem, master in (("w13", up), ("w2", down)):
             parts = [requantize("W4A16_NVFP4", master[e]) for e in range(128)]
             stacks[stem] = tuple(
-                torch.stack([q[name] for q in parts])
+                torch.stack([q[name] for q in parts]).float()
+                if name == "weight_scale_2" and backend == "flashinfer_cutedsl"
+                else torch.stack([q[name] for q in parts])
                 for name in ("weight", "weight_scale", "weight_scale_2")
             )
-        full = HummingRoutedExperts(
-            stacks["w13"], stacks["w2"], num_experts=128, offset=0, layer_name="experts"
-        )
-        local = HummingRoutedExperts(
-            *(tuple(t[mine_experts] for t in stacks[s]) for s in ("w13", "w2")),
-            num_experts=128, offset=rank * 32, layer_name="experts",
-        )
+        mine_stacks = [tuple(t[mine_experts] for t in stacks[s]) for s in ("w13", "w2")]
+        if backend == "flashinfer_cutedsl":
+            full = CuteDslRoutedExperts(stacks["w13"], stacks["w2"], num_experts=128)
+            local = CuteDslRoutedExperts(*mine_stacks, num_experts=128, offset=rank * 32)
+        else:
+            full = HummingRoutedExperts(
+                stacks["w13"], stacks["w2"], num_experts=128, offset=0,
+                layer_name="experts",
+            )
+            local = HummingRoutedExperts(
+                *mine_stacks, num_experts=128, offset=rank * 32, layer_name="experts"
+            )
         up_local = up[mine_experts].clone().requires_grad_()
         down_local = down[mine_experts].clone().requires_grad_()
         owner = SimpleNamespace(
@@ -1210,9 +1220,15 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
     all_ids, _ = _gather_rows(ids)
     all_w, _ = _gather_rows(weights)
     all_dy, _ = _gather_rows(dy)
-    fc1, visible = full.routes(all_x, all_ids)
+    if hasattr(full, "ep_partials"):
+        _, fc1, visible, activated = full.ep_partials(
+            all_x, all_w, all_ids, return_fc1=True
+        )
+    else:
+        fc1, visible = full.routes(all_x, all_ids)
+        activated = None
     dx, d_up, d_down, d_w = routed_vjp(
-        all_x, fc1, visible.view(-1, 2688), up, down, all_w, all_ids, all_dy
+        all_x, fc1, visible.view(-1, 2688), up, down, all_w, all_ids, all_dy, activated
     )
     mine_rows = slice(start, start + rows)
     expect = (dx[mine_rows], d_up[mine_experts], d_down[mine_experts], d_w[mine_rows])
@@ -1231,11 +1247,14 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
 
 @cuda
 @pytest.mark.gpus(4, min_architecture="blackwell")
-def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise():
+@pytest.mark.parametrize("backend", ["humming", "flashinfer_cutedsl"])
+def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise(backend):
     """Real EP4 over DeepEP: forward equals the single-rank EP4 serving
-    reduction bitwise; backward is deterministic and matches the EP1 VJP."""
+    reduction bitwise; backward is deterministic and matches the EP1 VJP.
+    With CuTe-DSL each rank launches over its own 32 experts, as a serving
+    rank does."""
     pytest.importorskip("deep_ep")
-    _spawn_ep4(_ep4_deepep_worker)
+    _spawn_ep4(_ep4_deepep_worker, backend)
 
 
 def _flashinfer_combine_worker(rank, port, nccl_env):

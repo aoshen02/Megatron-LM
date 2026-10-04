@@ -3,8 +3,10 @@
 Each source token is sent once to every EP rank that owns one of its routes,
 as one row per (token, rank) pair. DeepEP therefore never sums: every combine
 row has a single contributor and the transport is lossless in both
-directions. The expert rank computes its local Humming routes and its BF16
-partial (``moe_fused_mul_sum`` over its slots), the partial returns to the
+directions. The expert rank computes its local routes and its BF16 partial
+as a serving rank of the rollout's backend does (Humming:
+``moe_fused_mul_sum`` over its slots; CuTe-DSL: the launch over its 32
+experts and that launch's own ``moe_unpermute``), the partial returns to the
 source rank, and the source rank reduces the partials in the serving order
 (``nvfp4_ep4.reduce_ep4_parts``). The backward sends the output gradient over
 the same rows and runs ``routed_vjp`` on the local experts; the input
@@ -19,6 +21,7 @@ import socket
 import torch
 import torch.distributed as dist
 
+from .kernels import CuteDslRoutedExperts
 from .nvfp4_ep4 import reduce_ep4_parts
 from .nvfp4_moe_vjp import routed_vjp, sum_route_grads
 
@@ -140,14 +143,23 @@ def _forward(experts, group, x, ids, weights, recipe, *, save=True):
         recv_x, recv_idx, recv_w, handle = _dispatch(
             buffer, plan, x, weights, experts.global_num_experts
         )
-        tokens = torch.tensor([x.shape[0]], device=x.device)
-        dist.all_reduce(tokens, group=group)
         global_ids = _expert_ids(experts, recv_idx)
-        fc1, down = experts.routes(recv_x, global_ids, global_tokens=int(tokens.item()))
-        if recv_x.shape[0]:
-            partial = experts.rank_partial(down, recv_w, global_ids, experts.expert_map)
+        cutedsl = isinstance(experts, CuteDslRoutedExperts)
+        if cutedsl:
+            # The serving rank's launch over its own experts; its top-k
+            # combine (moe_unpermute) forms the partial.
+            result = experts.rank_partial(recv_x, recv_w, global_ids, save=save)
+            partial, fc1, visible, activated = result if save else (result, None, None, None)
         else:
-            partial = recv_x.new_empty(0, recv_x.shape[1])
+            tokens = torch.tensor([x.shape[0]], device=x.device)
+            dist.all_reduce(tokens, group=group)
+            fc1, down = experts.routes(
+                recv_x, global_ids, global_tokens=int(tokens.item())
+            )
+            if recv_x.shape[0]:
+                partial = experts.rank_partial(down, recv_w, global_ids, experts.expert_map)
+            else:
+                partial = recv_x.new_empty(0, recv_x.shape[1])
         returned, _ = _combine(buffer, partial, handle)
     parts = x.new_zeros(plan.ep_size, x.shape[0], x.shape[1])
     for r, rows, token in plan.per_rank():
@@ -158,9 +170,12 @@ def _forward(experts, group, x, ids, weights, recipe, *, save=True):
     # Keep the visible FC1 and expert outputs of this rank's routes only; a
     # received row carries all topk slots, most of them other ranks'.
     owned = (recv_idx.reshape(-1) >= 0).nonzero().squeeze(1)
-    fc1 = fc1.index_select(0, owned)
-    visible = down.reshape(-1, x.shape[1]).index_select(0, owned)
-    return out, (plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible)
+    if not cutedsl:
+        fc1 = fc1.index_select(0, owned)
+        visible = down.reshape(-1, x.shape[1]).index_select(0, owned)
+        activated = None
+    state = (plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible, activated)
+    return out, state
 
 
 class EPRoutedExpertsVJP(torch.autograd.Function):
@@ -181,17 +196,23 @@ class EPRoutedExpertsVJP(torch.autograd.Function):
             raise RuntimeError("Expert masters changed before backward")
         up, down = ctx.saved_tensors
         # Kept (not cleared) so a retained graph can run backward again.
-        plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible = ctx.state
+        plan, buffer, handle, recv_x, recv_idx, recv_w, owned, fc1, visible, activated = (
+            ctx.state
+        )
         m, k = ctx.x_shape
         topk = plan.ids.shape[1]
         slots = recv_x.shape[0] * topk
         fc1 = fc1.new_zeros(slots, fc1.shape[1]).index_copy_(0, owned, fc1)
         visible = visible.new_zeros(slots, k).index_copy_(0, owned, visible)
+        if activated is not None:
+            activated = activated.new_zeros(slots, activated.shape[1]).index_copy_(
+                0, owned, activated
+            )
         rows_dy = dy.to(torch.bfloat16).index_select(0, plan.token).contiguous()
         with _deepep_memory():
             recv_dy, *_ = buffer.dispatch(rows_dy, handle=handle)
             dx_routes, d_up, d_down, dw_rows = routed_vjp(
-                recv_x, fc1, visible, up, down, recv_w, recv_idx, recv_dy,
+                recv_x, fc1, visible, up, down, recv_w, recv_idx, recv_dy, activated,
                 per_route=True,
             )
             returned_dx, returned_dw = _combine(

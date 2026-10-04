@@ -110,9 +110,12 @@ rejects checkpoints without a `quantization_config`.
   mamba_ssm / causal_conv1d backwards for Mamba2, the deterministic
   FlashAttention varlen backward from the visible output and LSE for
   attention, and DS4's chunked selected log-probabilities.
-- **Parallelism.** TP/EP/CP 1 with PP1 or PP4; the validated topology is PP4
-  with `dist_opt`. The routed experts emulate the rollout's EP4 reduction on
-  one rank.
+- **Parallelism.** TP/CP 1 with PP4/EP1 or PP1/EP4 (`dist_opt` or
+  `fsdp2`). With EP1 the routed experts emulate the rollout's EP4 reduction
+  on one rank. With EP4 each rank holds 32 experts and runs them as a
+  serving rank does (CuTe-DSL: one launch over its 32 experts and its own
+  `moe_unpermute`); tokens and partials move over normal-mode DeepEP and the
+  source rank reduces the partials in the serving order (`ep.py`).
 
 ### FP8 projections with a ModelOpt-calibrated scale
 

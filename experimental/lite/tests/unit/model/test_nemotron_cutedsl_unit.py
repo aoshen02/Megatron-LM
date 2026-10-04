@@ -158,7 +158,21 @@ def test_cutedsl_rank_partials_equal_the_serving_runner_bitwise(rows, monkeypatc
     )
     for rank in range(4):
         assert torch.equal(parts[rank], _serving_rank(stacks, x, ids, routes, rank)), rank
-    full = experts.ep_partials(x, routes, ids, ranks=1)[0]
+    # An EP rank's own deployment (its 32 experts, as under EP4 training):
+    # the same partial, and the saved per-route tensors of its slots.
+    for rank in range(4):
+        s = slice(rank * 32, (rank + 1) * 32)
+        local = CuteDslRoutedExperts(
+            *(tuple(t[s] for t in stack) for stack in stacks),
+            num_experts=128, offset=rank * 32,
+        )
+        part, *saved = local.rank_partial(x, routes, ids, save=True)
+        assert torch.equal(part, parts[rank]), rank
+        assert torch.equal(local.rank_partial(x, routes, ids), part), rank
+        mine = ((ids // 32) == rank).reshape(-1)
+        for got, ref in zip(saved, (fc1, visible, activated), strict=True):
+            assert torch.equal(got, ref[mine]), rank
+    full =experts.ep_partials(x, routes, ids, ranks=1)[0]
     assert torch.equal(full, _serving_rank(stacks, x, ids, routes, 0, ranks=1))
     # The saved per-route output is the one the partials combine: where a
     # rank owns a single slot of a token, its partial is that slot's output

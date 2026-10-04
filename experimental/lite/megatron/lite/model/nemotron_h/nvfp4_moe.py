@@ -10,7 +10,7 @@ ROUTED_EXPERT_BACKENDS = ("humming", "flashinfer_cutedsl")
 
 
 class Nvfp4RoutedDeployment(torch.nn.Module):
-    """Own a frozen W4A16 Humming deployment alongside BF16 expert masters.
+    """Own a frozen W4A16 deployment alongside BF16 expert masters.
 
     Inputs are fixed expert IDs and continuous routing weights; this adapter does
     not route, normalize scores, apply routed_scaling_factor, or add shared output.
@@ -92,7 +92,7 @@ class Nvfp4RoutedDeployment(torch.nn.Module):
         )
         if self.routed_expert_backend == "flashinfer_cutedsl":
             self._experts = CuteDslRoutedExperts(
-                *stacks, num_experts=self.config.n_routed_experts
+                *stacks, num_experts=self.config.n_routed_experts, offset=w.offset
             )
         else:
             self._experts = HummingRoutedExperts(
