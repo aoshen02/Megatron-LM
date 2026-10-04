@@ -13,20 +13,18 @@ from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     Nvfp4TrainingLinear,
     RMSNorm,
     projection,
-    projection_layer,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import (
     MambaMixer,
     SSMMeta,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
-    Nvfp4ExpertWeights,
     Nvfp4RoutedDeployment,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.moe.module import MoE
 
 
-class Block(nn.Module):
+class NemotronHLayer(nn.Module):
     def __init__(
         self,
         config,
@@ -37,7 +35,6 @@ class Block(nn.Module):
         dtype=torch.bfloat16,
         fp8_kv_scales,
         projection_factory,
-        routed_factory,
     ):
         super().__init__()
         self.norm = RMSNorm(
@@ -54,8 +51,6 @@ class Block(nn.Module):
         kwargs = {}
         if self.kind == "full_attention":
             kwargs["fp8_kv_scales"] = fp8_kv_scales
-        elif self.kind == "moe":
-            kwargs["routed_factory"] = routed_factory
         self.mixer = types[self.kind](
             config,
             ps,
@@ -75,13 +70,9 @@ class Block(nn.Module):
         return hidden, residual
 
 
-class NemotronModel(nn.Module):
-    """A contiguous pipeline stage with explicit hidden/residual boundary state.
-
-    Intermediate stages return both streams as [tokens, 1, 2*hidden]. No broadcast
-    or pipeline scheduler is implemented here; the mlite runtime must transport
-    this payload and supply it through set_input_tensor.
-    """
+class NemotronHModel(nn.Module):
+    """A contiguous pipeline stage; intermediate stages return the hidden and
+    residual streams as [tokens, 1, 2*hidden]."""
 
     def __init__(
         self,
@@ -93,7 +84,6 @@ class NemotronModel(nn.Module):
         dtype=torch.bfloat16,
         fp8_kv_scales,
         projection_factory,
-        routed_factory,
     ):
         super().__init__()
         self.config, self.ps = config, ps
@@ -125,14 +115,13 @@ class NemotronModel(nn.Module):
         )
         self.layers = nn.ModuleDict(
             {
-                str(i): Block(
+                str(i): NemotronHLayer(
                     config,
                     ps,
                     i,
                     device=device,
                     dtype=dtype,
                     projection_factory=projection_factory,
-                    routed_factory=routed_factory,
                     fp8_kv_scales=fp8_kv_scales.get(i),
                 )
                 for i in range(start, end)
@@ -149,8 +138,7 @@ class NemotronModel(nn.Module):
             else None
         )
         self.lm_head = (
-            projection_layer(
-                projection_factory,
+            projection_factory(
                 "lm_head",
                 config.hidden_size,
                 config.vocab_size,
@@ -220,41 +208,19 @@ def build_stage(config, impl, ps, *, layer_range):
     """Construct one pipeline stage from the checkpoint, before optimizer binding."""
     from vllm.utils.torch_utils import set_default_torch_dtype
 
-    recipe = config.quantization_config
-    factory = CheckpointProjectionFactory(impl.hf_path, recipe["quantized_layers"])
-
-    def routed_factory(prefix, model_cfg, parallel, *, device, dtype):
-        if dtype != torch.bfloat16 or parallel is not ps or model_cfg is not config:
-            raise ValueError("Unexpected routed factory configuration")
-        weights = Nvfp4ExpertWeights(
-            impl.hf_path,
-            prefix,
-            recipe["quantized_layers"],
-            num_experts=config.n_routed_experts,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            tp_size=ps.tp_size,
-            ep_size=ps.ep_size,
-            ep_rank=ps.ep_rank,
-            device=device,
-        )
-        return Nvfp4RoutedDeployment(
-            weights,
-            config,
-            ep_group=ps.ep_group if ps.ep_size > 1 else None,
-        )
-
+    factory = CheckpointProjectionFactory(
+        impl.hf_path, config.quantization_config["quantized_layers"]
+    )
     expected_prefixes, attention_ids = stage_quantization_contract(config, layer_range)
     kv = load_fp8_kv_scales(impl.hf_path, attention_ids, device="cuda")
     with set_default_torch_dtype(torch.bfloat16):
-        model = NemotronModel(
+        model = NemotronHModel(
             config,
             ps,
             layer_range=layer_range,
             device="cuda",
             dtype=torch.bfloat16,
             projection_factory=factory,
-            routed_factory=routed_factory,
             fp8_kv_scales=kv,
         )
     covered = set()

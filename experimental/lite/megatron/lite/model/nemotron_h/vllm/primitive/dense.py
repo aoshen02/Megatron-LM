@@ -18,10 +18,7 @@ from megatron.lite.model.nemotron_h.quantization import (
 
 
 def native_linear_vjp(grad_output, value, weight):
-    """BF16 dgrad/wgrad on the master weight (TE ``high_precision`` semantics).
-
-    Same arithmetic as the DeepSeek-V4 aligned actor (NVIDIA/Megatron-LM#7050).
-    """
+    """BF16 dgrad/wgrad on the master weight (TE ``high_precision`` semantics)."""
     from transformer_engine.pytorch.cpp_extensions import general_gemm
 
     x2d = value.reshape(-1, value.shape[-1]).contiguous()
@@ -282,11 +279,7 @@ class _Holder(torch.nn.Module):
 
 
 def _modelopt_global_scale(weight_scale, weight_scale_2):
-    """ModelOpt KNvfp4Static.process: one FP32 global scale per matrix.
-
-    Fails like serving on unloaded (NaN) group scales; Nemotron's checkpoint
-    has one FP32 global scale per matrix.
-    """
+    """ModelOpt KNvfp4Static.process: one FP32 global scale per matrix."""
     if torch.isnan(weight_scale.float()).any():
         raise RuntimeError("NVFP4 weight_scale was never loaded (NaN)")
     if weight_scale_2.dtype != torch.float32 or weight_scale_2.numel() != 1:
@@ -398,22 +391,6 @@ class CuteDslNvfp4Linear:
         return out.view(*x.shape[:-1], self.out_features)
 
 
-def scaled_fp8_quant(x, scale):
-    """Static per-tensor FP8 quantization (vLLM ``QuantFP8`` on CUDA)."""
-    from vllm import _custom_ops as ops
-
-    return ops.scaled_fp8_quant(x, scale)
-
-
-def projection_layer(factory, prefix, in_features, out_features, **kwargs):
-    """Construct from the checkpoint before optimizer binding."""
-    if not callable(factory) or not prefix:
-        raise ValueError(
-            "A callable projection factory and explicit HF prefix are required"
-        )
-    return factory(prefix, in_features, out_features, **kwargs)
-
-
 class CheckpointProjectionFactory:
     """Strict checkpoint-aware projection construction, never module replacement.
 
@@ -422,7 +399,6 @@ class CheckpointProjectionFactory:
     """
 
     def __init__(self, root, quantized_layers):
-        import json
         from pathlib import Path
 
         self.root = Path(root)
@@ -512,10 +488,8 @@ class CheckpointProjectionFactory:
 class Nvfp4TrainingLinear(torch.nn.Module):
     """Inference-visible W4A16 linear over a BF16 master weight.
 
-    The deployment starts from the checkpoint bytes. After an optimizer update,
-    ``refresh_deployment(recompute_scales=True)`` requantizes the master with
-    the checkpoint's own rule. Backward is the BF16 master-weight VJP.
-    Refresh outside Graph capture; deployment pointers are not stable.
+    The deployment starts from the checkpoint bytes and is requantized from the
+    master after ``refresh_deployment(recompute_scales=True)``.
     """
 
     def __init__(self, checkpoint, deployment_factory, *, device):
@@ -580,11 +554,8 @@ class Nvfp4TrainingLinear(torch.nn.Module):
 class Fp8TrainingLinear(torch.nn.Module):
     """Static FP8 W/A forward over a BF16 master weight.
 
-    The deployment starts from the checkpoint bytes (or, with a BF16 master
-    source, from the master's requantization); after an optimizer update the
-    weight is requantized per tensor (scale = amax / 448) and the calibrated
-    input scale is kept. Backward is the BF16 master-weight VJP on the BF16
-    input. Refresh outside Graph capture.
+    Requantization replaces the weight and its scale (amax / 448) and keeps
+    the calibrated input scale.
     """
 
     def __init__(self, checkpoint, *, device):
@@ -618,7 +589,6 @@ class Fp8TrainingLinear(torch.nn.Module):
         self._deployed_version = master_version(self._master)
 
     def bind_master(self):
-        """Track the parameter the optimizer updates (its FSDP2 shard once wrapped)."""
         self.__dict__["_master"] = self._parameters["weight"]
 
     def _tensors(self):
@@ -635,8 +605,6 @@ class Fp8TrainingLinear(torch.nn.Module):
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
         """Once the master has been updated, requantize it."""
-        if self._master.is_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("Refresh deployment outside CUDA Graph capture")
         self._requantized |= recompute_scales
         if self._requantized:
             tensors = requantize("FP8", full_master(self._master))
@@ -665,10 +633,6 @@ class Fp8TrainingLinear(torch.nn.Module):
         return output.reshape(*x.shape[:-1], self._packed.shape[0])
 
     def forward(self, x):
-        import vllm.envs as envs
-
-        if not envs.VLLM_BATCH_INVARIANT:
-            raise RuntimeError("FP8 aligned training requires batch invariance")
         self._check_fresh()
         if (
             x.dtype != torch.bfloat16
@@ -682,11 +646,8 @@ class Fp8TrainingLinear(torch.nn.Module):
 
 
 def build_quantized_projection(checkpoint, prefix, *, device):
-    """Construct a training projection before binding optimizer parameters.
-
-    NVFP4 deployments use the serving kernels: the shared expert's FlashInfer
-    CuTe-DSL GEMM, Humming everywhere else.
-    """
+    """NVFP4 uses the serving kernels: CuTe-DSL for the shared expert, Humming
+    elsewhere."""
     if checkpoint.algorithm == "FP8":
         return Fp8TrainingLinear(checkpoint, device=device)
     if checkpoint.algorithm != "W4A16_NVFP4":

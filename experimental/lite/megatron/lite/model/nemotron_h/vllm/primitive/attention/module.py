@@ -6,43 +6,22 @@ from torch import nn
 from megatron.lite.model.nemotron_h.vllm.primitive.attention.backward import (
     _Fp8AttentionVJP,
 )
-from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
-    projection,
-    projection_layer,
-    scaled_fp8_quant,
-)
+from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 
 
 class Fa4Fp8KVAttention(torch.nn.Module):
-    """Serving FA4 over the static FP8 KV cache, with a FlashAttention VJP.
-
-    Replays vLLM's ``FlashAttnFixedSplitBackend``: FP8 query and
-    KV-cache quantization with fixed scales, serving's 6768-token pages and
-    the fixed split-KV schedule. The VJP is the FlashAttention varlen
-    backward on the dequantized Q/K/V with a recomputed BF16 output and LSE
-    (an identity straight-through estimator for the quantization). Supports TP1
-    causal packed sequences starting at zero, without prefix sharing or
-    sliding windows.
+    """Serving FA4 (``FlashAttnFixedSplitBackend``) over the static FP8 KV
+    cache: FP8 query and KV quantization with fixed scales, 6768-token pages
+    and the fixed split-KV schedule. Causal packed sequences starting at zero.
     """
 
     def __init__(self, num_heads, num_kv_heads, head_dim, k_scale, v_scale):
         super().__init__()
-        for name, value in (("k_scale", k_scale), ("v_scale", v_scale)):
-            if (
-                value.dtype != torch.float32
-                or value.numel() != 1
-                or not torch.isfinite(value).all()
-                or not (value > 0).all()
-            ):
-                raise ValueError("Expected fixed positive FP32 KV scales")
-            if value.requires_grad:
-                raise ValueError("Trainable KV scales are not supported")
-            self.register_buffer(name, value.detach().clone())
+        self.register_buffer("k_scale", k_scale.detach().clone())
+        self.register_buffer("v_scale", v_scale.detach().clone())
         self.scale = head_dim**-0.5
         self.heads = (num_heads, num_kv_heads, head_dim)
-        if self.heads != (32, 2, 128):
-            raise ValueError("Aligned FA4 requires Nemotron Q32/KV2/D128")
 
     def _visible(self, q, k, v, boundaries):
         """Return the serving output, its LSE and the dequantized Q/K/V."""
@@ -52,6 +31,7 @@ class Fa4Fp8KVAttention(torch.nn.Module):
             SEQLEN_K_PER_SPLIT,
         )
         from vllm.v1.attention.backends.fa_utils import reshape_and_cache_flash
+        from vllm import _custom_ops as ops
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
         if len(boundaries) < 2 or boundaries[0] != 0 or boundaries[-1] != q.shape[0]:
@@ -59,9 +39,8 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
         if any(length <= 0 or length > MAX_SEQ_LEN for length in lengths):
             raise ValueError(f"Expected nonempty sequences no longer than {MAX_SEQ_LEN}")
-        # Serving's page geometry (6768-token pages, a table row wide enough
-        # for MAX_SEQ_LEN); each sequence owns only the pages it fills, and
-        # the rest of its row repeats its last page, which is never read.
+        # Each sequence owns the 6768-token pages it fills; the rest of its
+        # MAX_SEQ_LEN-wide table row repeats its last page, never read.
         width = -(-MAX_SEQ_LEN // 6768)
         owned = [-(-length // 6768) for length in lengths]
         first = [sum(owned[:index]) for index in range(len(owned))]
@@ -85,13 +64,11 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         cache = torch.zeros(
             sum(owned), 2, 6768, 256, dtype=torch.uint8, device=q.device
         )
-        # Serving loads scale parameters under the BF16 model default dtype,
-        # then copies their rounded values into FP32 runtime buffers. Keep the
-        # original checkpoint buffers unchanged for export.
+        # Serving rounds the KV scales to BF16 at load.
         ks = self.k_scale.to(torch.bfloat16).float()
         vs = self.v_scale.to(torch.bfloat16).float()
         qs = torch.ones_like(ks)
-        quantized_q, _ = scaled_fp8_quant(q.flatten(1), qs)
+        quantized_q, _ = ops.scaled_fp8_quant(q.flatten(1), qs)
         quantized_q = quantized_q.view(q.shape)
         key_cache, value_cache = cache.transpose(1, 2).split(128, dim=-1)
         reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "fp8_e4m3", ks, vs)
@@ -129,10 +106,6 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         return output, lse, q_ref, k_ref, v_ref
 
     def forward(self, q, k, v, meta):
-        import vllm.envs as envs
-
-        if not envs.VLLM_BATCH_INVARIANT:
-            raise RuntimeError("Aligned FP8 attention requires batch invariance")
         meta.validate_tokens(q.shape[0])
         hq, hkv, dim = self.heads
         if (
@@ -168,12 +141,8 @@ class Attention(nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        if ps.tp_size != 1:
-            raise ValueError("Nemotron attention currently requires TP1")
         if config.attention_bias:
             raise ValueError("Expected bias-free Nemotron attention")
-        if ps.cp_size != 1:
-            raise ValueError("FP8 KV training attention currently requires CP1")
         self.head_dim = config.head_dim
         k_scale, v_scale = fp8_kv_scales
         self.kv_attention = Fa4Fp8KVAttention(
@@ -191,8 +160,7 @@ class Attention(nn.Module):
             setattr(
                 self,
                 name,
-                projection_layer(
-                    projection_factory,
+                projection_factory(
                     f"{hf_prefix}.{name}",
                     config.hidden_size,
                     heads * config.head_dim,
@@ -201,8 +169,7 @@ class Attention(nn.Module):
                     dtype=dtype,
                 ),
             )
-        self.o_proj = projection_layer(
-            projection_factory,
+        self.o_proj = projection_factory(
             f"{hf_prefix}.o_proj",
             config.num_attention_heads * config.head_dim,
             config.hidden_size,

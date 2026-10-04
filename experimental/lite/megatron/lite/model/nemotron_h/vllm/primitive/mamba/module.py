@@ -7,7 +7,6 @@ import torch
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     GatedRMSNorm,
     projection,
-    projection_layer,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.backward import (
     _PackedConvVJP,
@@ -142,16 +141,11 @@ class MambaMixer(torch.nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        if parallel_state.tp_size != 1:
-            raise NotImplementedError("Nemotron alignment currently targets TP1")
         if config.mamba_hidden_act != "silu":
             raise ValueError("Mamba visible convolution requires SiLU")
-        if parallel_state.cp_size != 1:
-            raise NotImplementedError("Nemotron Mamba currently requires CP1")
         self.config = config
         factory = dict(device=device, dtype=dtype)
-        self.in_proj = projection_layer(
-            projection_factory,
+        self.in_proj = projection_factory(
             f"{hf_prefix}.in_proj",
             config.hidden_size,
             config.mamba_in_proj_size,
@@ -177,8 +171,7 @@ class MambaMixer(torch.nn.Module):
             config.layer_norm_epsilon,
             **factory,
         )
-        self.out_proj = projection_layer(
-            projection_factory,
+        self.out_proj = projection_factory(
             f"{hf_prefix}.out_proj",
             config.mamba_inner_size,
             config.hidden_size,

@@ -9,17 +9,19 @@ import torch
 
 from megatron.lite.model.nemotron_h.checkpoint import (
     NemotronExport,
+    is_expert,
     load_hf_weights as _load_weights,
     refresh_quantized_projections,
 )
 from megatron.lite.model.nemotron_h.config import NemotronHConfig
-from megatron.lite.model.nemotron_h.vllm.model import Block, build_stage
+from megatron.lite.model.nemotron_h.vllm.model import NemotronHLayer, build_stage
 from megatron.lite.model.nemotron_h.vllm.primitive.logprob import (
     aligned_selected_log_probs,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.parallel import init_parallel
 from megatron.lite.primitive.parallel.cp import contiguous_slice_for_cp
 from megatron.lite.primitive.parallel.thd import (
@@ -43,14 +45,8 @@ class ImplConfig:
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
     hf_path: str | None = None
-    # BF16 release the hf_path checkpoint was quantized from: the masters
-    # start from it and theta0 deploys their requantization, so a restored
-    # checkpoint's deployment is requant(master) too.
+    # BF16 release hf_path was quantized from; theta0 deploys requant(master).
     bf16_master_path: str | None = None
-    # Activation recompute (DS4's ``impl_cfg.recompute``): "full" re-runs each
-    # block's forward in backward. The kernels are deterministic, so the
-    # recomputed visible tensors (and the replayed EP dispatch) are the
-    # forward's, bit for bit.
     recompute: str | list[str] | None = None
 
 
@@ -68,10 +64,6 @@ def build_model_config(source, **overrides):
     return config
 
 
-def is_expert(name):
-    return ".mixer.experts." in name
-
-
 EXPERT_CLASSIFIER = is_expert
 
 
@@ -87,11 +79,8 @@ def PLACEMENT_FN(name):
 
 
 def _post_optimizer_step(chunks, *, release_grads=False):
-    # Post-optimizer hook: the checkpoint bytes are only valid for the initial
-    # weights (DeepSeek-V4 invalidates its bound scales after an update too).
-    # dist_opt overlaps the parameter all-gather with the next forward; with
-    # dense DP > 1 the export and requantization below would read other
-    # ranks' stale shards, so gather now (MCore's explicit param sync).
+    # dist_opt overlaps the parameter all-gather with the next forward; the
+    # requantization below needs every rank's updated shard now.
     for chunk in chunks:
         start_param_sync = getattr(chunk, "start_param_sync", None)
         if callable(start_param_sync):
@@ -159,6 +148,8 @@ def _validate_full_depth(config, source):
 
 def _validate_contract(config, impl):
     p = impl.parallel
+    if not config.quantization_config:
+        raise ValueError("Nemotron impl=vllm requires a ModelOpt MIXED_PRECISION checkpoint")
     if not impl.hf_path:
         raise ValueError("Quantized Nemotron requires an explicit hf_path")
     if impl.optimizer_config is None:
@@ -180,8 +171,6 @@ def _validate_contract(config, impl):
     ) != {"dynamic": False, "num_bits": 8, "type": "float"}:
         raise ValueError("Expected checkpoint mixed precision and static FP8 KV")
     source = json.loads((Path(impl.hf_path) / "config.json").read_text())
-    if source.get("quantization_config") != recipe:
-        raise ValueError("Checkpoint metadata disagrees with requested recipe")
     _validate_full_depth(config, source)
     if not impl.bf16_master_path:
         raise ValueError("Quantized Nemotron requires impl_cfg.bf16_master_path")
@@ -229,12 +218,6 @@ def _token_mean_loss(log_probs, local_mask, full_mask, cp_size):
     return -(log_probs * local_mask).sum() * cp_size / full_mask.sum().clamp_min(1)
 
 
-def _base(module):
-    while hasattr(module, "module"):
-        module = module.module
-    return module
-
-
 def _forward_step(model, batch):
     ps = parallel_state_from_model(model)
     loss_mask = batch.loss_mask
@@ -272,7 +255,7 @@ def _forward_step(model, batch):
     calculate_entropy = context is not None and context.calculate_entropy
     log_probs, entropy = aligned_selected_log_probs(
         output,
-        _base(model).lm_head,
+        unwrap_model(model).lm_head,
         labels.clamp_min(0),
         1.0 if context is None else context.temperature,
         LOGPROB_CHUNK_SIZE,
@@ -301,23 +284,16 @@ def unpack_forward_output(model, batch, output):
 
 
 def _build_fsdp2(chunks, impl_cfg, ps):
-    """DS4's deferred FSDP2 wrap (``build_training_backend``) after the HF load.
-
-    As DS4's aligned actor: FP32 shards (no separate master), FP32 parameters
-    replicated, BF16 compute. Dense blocks are sharded over DP x CP, each
-    MoE layer's experts over expert DP. The quantized layers then track the
-    FP32 shards their optimizer updates and requantize from the gathered
-    matrix (``quantization.full_master``), the BF16 matrix the unsharded
-    forward sees, so NVFP4 global and FP8 tensor scales come from the full
-    matrix and the forward and the export read the same bytes.
-    """
+    """DS4's deferred FSDP2 wrap after the HF load: FP32 shards, FP32
+    parameters replicated, BF16 compute. The quantized layers requantize from
+    the gathered BF16 matrix the unsharded forward sees."""
     from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
     optimizer = build_fsdp2_training_optimizer(
         chunks,
         impl_cfg.optimizer_config,
         ps,
-        unit_modules=(Block,),
+        unit_modules=(NemotronHLayer,),
         expert_classifier=is_expert,
         replicated_param_classifier=lambda _name, param: param.dtype == torch.float32,
         deterministic=impl_cfg.deterministic,
@@ -336,11 +312,6 @@ def _build_fsdp2(chunks, impl_cfg, ps):
 
 
 def build_model(model_cfg, *, impl_cfg):
-    if model_cfg.quantization_config is None:
-        raise ValueError(
-            "Nemotron impl=vllm requires a ModelOpt MIXED_PRECISION checkpoint "
-            "(NVFP4 experts/linears, FP8 Mamba projections and KV cache)"
-        )
     _validate_contract(model_cfg, impl_cfg)
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
@@ -394,10 +365,7 @@ def build_model(model_cfg, *, impl_cfg):
         # DDP may rebind storage; never replace the Parameter objects.
         refresh_quantized_projections(chunks)
         for chunk in chunks:
-            current = chunk
-            while hasattr(current, "module"):
-                current = current.module
-            _load_weights(current, impl_cfg.hf_path)
+            _load_weights(unwrap_model(chunk), impl_cfg.hf_path)
     elif impl_cfg.optimizer not in (None, "fsdp2"):
         raise ValueError(f"Nemotron optimizers are dist_opt and fsdp2, not {impl_cfg.optimizer}")
     fsdp2 = impl_cfg.optimizer == "fsdp2"
@@ -421,8 +389,7 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def load_hf_weights(chunk, hf_path, model_cfg, ps):
-    while hasattr(chunk, "module"):
-        chunk = chunk.module
+    chunk = unwrap_model(chunk)
     if str(Path(hf_path).resolve()) != chunk._hf_root:
         raise ValueError("Load from the checkpoint the model was constructed from")
     _load_weights(chunk, hf_path)

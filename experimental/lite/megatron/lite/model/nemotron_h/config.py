@@ -67,10 +67,6 @@ class NemotronHConfig:
     def mamba_in_proj_size(self) -> int:
         return self.mamba_inner_size + self.mamba_conv_dim + self.mamba_num_heads
 
-    @property
-    def attention_qkv_size(self) -> int:
-        return (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim
-
     def __post_init__(self):
         if not self.layers_block_type or set(self.layers_block_type) - {
             "linear_attention",

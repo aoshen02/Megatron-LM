@@ -5,8 +5,11 @@ from torch import nn
 
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     projection,
-    projection_layer,
     visible_linear,
+)
+from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
+    Nvfp4ExpertWeights,
+    Nvfp4RoutedDeployment,
 )
 
 
@@ -108,8 +111,7 @@ class SharedExperts(nn.Module):
         hf_prefix,
     ):
         super().__init__()
-        self.up_proj = projection_layer(
-            projection_factory,
+        self.up_proj = projection_factory(
             f"{hf_prefix}.up_proj",
             config.hidden_size,
             config.moe_shared_expert_intermediate_size,
@@ -117,8 +119,7 @@ class SharedExperts(nn.Module):
             device=device,
             dtype=dtype,
         )
-        self.down_proj = projection_layer(
-            projection_factory,
+        self.down_proj = projection_factory(
             f"{hf_prefix}.down_proj",
             config.moe_shared_expert_intermediate_size,
             config.hidden_size,
@@ -133,12 +134,7 @@ class SharedExperts(nn.Module):
 
 
 class MoE(nn.Module):
-    """Compose routing, unscaled routed output, and the shared expert.
-
-    routed_factory(prefix, config, ps, *, device, dtype) returns the routed
-    nn.Module accepting (x, ids, routing_weights). Its output must exclude
-    routed_scaling_factor and shared output, which are combined here.
-    """
+    """Routing, the routed experts and the shared expert."""
 
     def __init__(
         self,
@@ -149,24 +145,26 @@ class MoE(nn.Module):
         dtype=torch.bfloat16,
         projection_factory,
         hf_prefix,
-        routed_factory,
     ):
         super().__init__()
         if config.n_shared_experts != 1:
             raise ValueError("Nemotron MoE requires the single shared expert contract")
-        if (
-            not callable(routed_factory)
-            or not isinstance(hf_prefix, str)
-            or not hf_prefix
-            or hf_prefix.endswith(".")
-        ):
-            raise ValueError("Routed factory requires an explicit HF mixer prefix")
         self.gate = Router(config, device=device, dtype=dtype)
-        self.experts = routed_factory(
-            f"{hf_prefix}.experts", config, ps, device=device, dtype=dtype
+        weights = Nvfp4ExpertWeights(
+            projection_factory.root,
+            f"{hf_prefix}.experts",
+            projection_factory.recipes,
+            num_experts=config.n_routed_experts,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            tp_size=ps.tp_size,
+            ep_size=ps.ep_size,
+            ep_rank=ps.ep_rank,
+            device=device,
         )
-        if not isinstance(self.experts, nn.Module):
-            raise TypeError("Routed factory must return an nn.Module")
+        self.experts = Nvfp4RoutedDeployment(
+            weights, config, ep_group=ps.ep_group if ps.ep_size > 1 else None
+        )
         self.shared_experts = SharedExperts(
             config,
             device=device,
