@@ -307,7 +307,7 @@ def test_checkpoint_load_redeploys_the_saved_bytes(monkeypatch, tmp_path):
         monkeypatch.setattr(mlite_engine.dist, "is_initialized", lambda: False)
         engine = mlite_engine.MegatronLiteEngine.__new__(mlite_engine.MegatronLiteEngine)
         engine.runtime, engine.module = object(), restored
-        engine.engine_config = SimpleNamespace(param_offload=False)
+        engine.engine_config = SimpleNamespace(param_offload=False, optimizer_offload=False)
         engine.handle = SimpleNamespace(
             _extras={"post_optimizer_step_hook": partial(_post_optimizer_step, [restored])},
             _optimizer=None,
