@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -389,6 +390,100 @@ def test_dist_opt_local_stage_saves_checkpoint_end_to_end(
         assert not list(stage_root.rglob("*.stage"))
     finally:
         torch.distributed.destroy_process_group()
+
+
+def _save_with_failing_publish(rank, world, tmp_path, kind, results) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+    from megatron.lite.primitive.ckpt import distckpt, local_stage
+
+    stage_root = tmp_path / "stage"
+    os.environ["MLITE_DCP_LOCAL_STAGE_DIR"] = str(stage_root)
+    torch.cuda.synchronize = lambda *args, **kwargs: None
+    torch.cuda.current_device = lambda: torch.device("cpu")
+    publish = local_stage.publish_staged_file
+    failing_file = "__1_0.distcp" if kind == "dist_opt" else "optimizer_rank_1.pt"
+
+    def publish_or_fail(source, destination):
+        if destination.name == failing_file:
+            raise OSError("simulated publish failure")
+        publish(source, destination)
+
+    local_stage.publish_staged_file = publish_or_fail
+    distckpt.publish_staged_file = publish_or_fail
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'dist-init'}", rank=rank, world_size=world
+    )
+    try:
+        if kind == "dist_opt":
+            state = {
+                "w": ShardedTensor.from_rank_offsets(
+                    "w", torch.full((2, 4), float(rank)), (0, rank, world)
+                )
+            }
+            dist_checkpointing.save(
+                state,
+                str(tmp_path / "ckpt"),
+                sharded_strategy=distckpt._NodeLocalDistSaveStrategy(stage_root),
+                validate_access_integrity=False,
+            )
+        else:
+            mesh = init_device_mesh("cpu", (world,))
+            dcp._build_meshes = lambda config: (mesh, mesh)
+            model = torch.nn.Linear(4, 2)
+            dcp.save_training_checkpoint(
+                model,
+                torch.optim.AdamW(model.parameters()),
+                1,
+                str(tmp_path / "ckpt"),
+                config=object(),
+                ps=SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0),
+                get_placements=lambda name: [Replicate()],
+                save_rng=False,
+            )
+        results.put((rank, None))
+    except Exception as exc:
+        results.put((rank, str(exc)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("kind", ["dist_opt", "fsdp2"])
+def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metadata(
+    tmp_path, kind
+) -> None:
+    """A rank that cannot publish must not leave other ranks hanging or a committed checkpoint."""
+    import multiprocessing
+
+    world = 2
+    (tmp_path / "ckpt").mkdir()
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_save_with_failing_publish, args=(rank, world, tmp_path, kind, results)
+        )
+        for rank in range(world)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        errors = dict(results.get(timeout=120) for _ in workers)
+    finally:
+        for worker in workers:
+            worker.join(timeout=30)
+            if worker.is_alive():
+                worker.terminate()
+
+    assert "simulated publish failure" in errors[1]
+    assert "failed on another rank" in errors[0]
+    checkpoint = tmp_path / "ckpt" / ("step_1" if kind == "fsdp2" else "")
+    assert not (checkpoint / ".metadata").exists()
+    assert not (checkpoint / "metadata.json").exists()
+    assert not list((tmp_path / "stage").rglob("*.stage"))
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
