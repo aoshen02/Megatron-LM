@@ -674,6 +674,74 @@ class TestDistributedOptimizer:
             loaded_steps = {state['step'].item() for state in optimizer_b.optimizer.state.values()}
             assert loaded_steps == {3}
 
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"), reason="dp_reshardable requires PyTorch 2.6a0 or later"
+    )
+    def test_hdo_dp_reshardable_load_restores_state_in_place(self, tmp_path_dist_ckpt):
+        """A fresh HDO restores FP32 masters and moments into its own host copies."""
+        tp_pp = (4, 1)
+        optimizer_config_kwargs = {
+            'optimizer_cpu_offload': True,
+            'optimizer_offload_fraction': 1.0,
+            'overlap_cpu_optimizer_d2h_h2d': False,
+            'lr': 1.0e-4,
+        }
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def host_state(optimizer):
+            hdo = optimizer.optimizer
+            return [
+                {k: hdo.state[p][k].clone() for k in ('master_param', 'exp_avg', 'exp_avg_sq')}
+                for group in hdo.param_groups
+                for p in group['params']
+            ]
+
+        Utils.initialize_model_parallel(*tp_pp, order='tp-pp-dp')
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_hdo_dp_reshardable_load_in_place', sync=True
+        ) as ckpt_dir:
+            model_a, optimizer_a = setup_model_and_optimizer(
+                seed=2,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            step_hybrid_device_optimizer(optimizer_a, num_steps=3)
+            save(
+                optimizer_a.sharded_state_dict(
+                    model_a[0].sharded_state_dict(), metadata=metadata
+                ),
+                ckpt_dir,
+            )
+
+            model_b, optimizer_b = setup_model_and_optimizer(
+                seed=3,
+                tp=tp_pp[0],
+                pp=tp_pp[1],
+                initialize_optimizer_state=False,
+                optimizer_config_kwargs=optimizer_config_kwargs,
+            )
+            load_template = optimizer_b.sharded_state_dict(
+                model_b[0].sharded_state_dict(), metadata=metadata, is_loading=True
+            )
+            copies = dict(optimizer_b.optimizer.gpu_params_map_cpu_copy)
+            optimizer_b.load_state_dict(load(load_template, ckpt_dir))
+
+            hdo_b = optimizer_b.optimizer
+            assert all(hdo_b.gpu_params_map_cpu_copy[p] is c for p, c in copies.items())
+            for p in hdo_b.param_to_fp32_param:
+                assert hdo_b.state[p]['master_param'] is hdo_b.param_to_fp32_param[p]
+            for a, b in zip(host_state(optimizer_a), host_state(optimizer_b), strict=True):
+                for k in a:
+                    assert torch.equal(a[k], b[k]), k
+
+            step_hybrid_device_optimizer(optimizer_a, num_steps=1)
+            step_hybrid_device_optimizer(optimizer_b, num_steps=1)
+            for a, b in zip(host_state(optimizer_a), host_state(optimizer_b), strict=True):
+                for k in a:
+                    assert torch.equal(a[k], b[k]), k
+
     @pytest.mark.parametrize(
         ("source_offload", "destination_offload"), [(False, True), (True, False)]
     )
