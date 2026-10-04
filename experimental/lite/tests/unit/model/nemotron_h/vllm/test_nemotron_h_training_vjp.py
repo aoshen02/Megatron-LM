@@ -600,16 +600,21 @@ def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
     upstream = upstream_gradient(kind, log_probs)
     actual = torch.autograd.grad(log_probs, inputs, upstream)
 
-    def old_vjp(dtype):
-        inputs = [t.detach().to(dtype).requires_grad_() for t in leaves]
+    def old_vjp(dtype, device="cuda"):
+        # The FP64 reference runs on the CPU: batch invariance replaces the CUDA
+        # matmul/log_softmax kernels, which have no FP64 variant.
+        inputs = [t.detach().to(device, dtype).requires_grad_() for t in leaves]
         logits = torch.nn.functional.linear(*inputs)
         if temperature != 1.0:
             logits = logits / temperature
         logits = logits.to(torch.promote_types(dtype, torch.float32))
-        selected = logits.log_softmax(-1).gather(-1, labels[:, None])
-        return torch.autograd.grad(selected[:, 0], inputs, upstream.to(selected.dtype))
+        selected = logits.log_softmax(-1).gather(-1, labels[:, None].to(device))
+        grads = torch.autograd.grad(
+            selected[:, 0], inputs, upstream.to(device, selected.dtype)
+        )
+        return [g.cuda() for g in grads]
 
-    old, reference = old_vjp(torch.bfloat16), old_vjp(torch.float64)
+    old, reference = old_vjp(torch.bfloat16), old_vjp(torch.float64, "cpu")
     assert_within_noise_floor(("dhidden", "dweight"), actual, old, reference, kind)
 
 
