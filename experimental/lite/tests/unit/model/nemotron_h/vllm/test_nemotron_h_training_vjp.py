@@ -46,7 +46,6 @@ def assert_within_noise_floor(names, actual, old, reference, kind, ratio=2.0):
         r = r.double()
         new_error = ((a.double() - r).norm() / r.norm()).item()
         old_error = ((b.double() - r).norm() / r.norm()).item()
-        print(f"{kind:6} {name:8} new={new_error:.3e} old={old_error:.3e}")
         assert new_error <= ratio * old_error + 1e-5, (name, new_error, old_error)
 
 
