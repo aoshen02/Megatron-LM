@@ -183,6 +183,7 @@ def load_training_checkpoint(
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
+        _check_rank_files(ckpt_path, optimizer=False, rng=load_rng)
         step = _load_dist_opt_checkpoint(
             model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
         )
@@ -208,6 +209,7 @@ def load_training_checkpoint(
             key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
             state_dict[key] = _empty_dcp_tensor_like_param(param, mesh, placements)
 
+    _check_rank_files(ckpt_path, optimizer=load_optimizer and optimizer is not None, rng=load_rng)
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
@@ -226,6 +228,22 @@ def load_training_checkpoint(
         _load_rng_sidecar(ckpt_path)
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
     return step
+
+
+def _check_rank_files(ckpt_path: str, *, optimizer: bool, rng: bool) -> None:
+    """Fail on every rank, before the collective load, if any rank lacks a sidecar."""
+
+    def check() -> None:
+        required = []
+        if optimizer:
+            required.append((_optimizer_checkpoint_path(ckpt_path), "load_optimizer=False"))
+        if rng:
+            required.append((_rng_sidecar_file(ckpt_path), "load_rng=False"))
+        for file, flag in required:
+            if not os.path.exists(file):
+                raise FileNotFoundError(f"checkpoint file {file} is missing; pass {flag}")
+
+    run_on_all_ranks(check, "checking the checkpoint's per-rank files")
 
 
 def _resolve_step_checkpoint_path(path: str) -> str:
@@ -335,11 +353,6 @@ def _load_optimizer_checkpoint(optimizer, path: str) -> None:
         log_rank0("Skipping optimizer checkpoint load because optimizer is None")
         return
     ckpt_path = _optimizer_checkpoint_path(path)
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"optimizer checkpoint {ckpt_path} is missing; pass load_optimizer=False "
-            "to load model state only"
-        )
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
@@ -540,10 +553,6 @@ def _save_rng_sidecar(path: str | os.PathLike[str]) -> None:
 
 def _load_rng_sidecar(path: str | os.PathLike[str]) -> None:
     rng_file = _rng_sidecar_file(path)
-    if not rng_file.exists():
-        raise FileNotFoundError(
-            f"RNG sidecar {rng_file} is missing; pass load_rng=False to skip RNG restore"
-        )
     _restore_rng_state(torch.load(rng_file, map_location="cpu", weights_only=False))
 
 

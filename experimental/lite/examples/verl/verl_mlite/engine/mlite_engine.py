@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.ckpt.local_stage import run_on_all_ranks
 from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
@@ -566,6 +567,18 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
+            scheduler_state = []
+            if self.handle._lr_scheduler is not None:
+                run_on_all_ranks(
+                    lambda: scheduler_state.append(
+                        torch.load(
+                            os.path.join(local_path, _LR_SCHEDULER_STATE),
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    ),
+                    "reading the LR scheduler state",
+                )
             load_training_checkpoint(
                 self.module,
                 self.handle._optimizer,
@@ -580,13 +593,8 @@ class MegatronLiteEngine(BaseEngine):
             post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
             if callable(post_update_hook):
                 post_update_hook()
-            if self.handle._lr_scheduler is not None:
-                state = torch.load(
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
-                    map_location="cpu",
-                    weights_only=False,
-                )
-                self.handle._lr_scheduler.load_state_dict(state)
+            if scheduler_state:
+                self.handle._lr_scheduler.load_state_dict(scheduler_state[0])
             if dist.is_initialized():
                 dist.barrier()
         finally:

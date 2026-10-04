@@ -208,13 +208,17 @@ def test_load_checkpoint_restores_scheduler_and_configured_offload(
 
 
 def test_load_checkpoint_rejects_a_missing_scheduler_state(tmp_path, monkeypatch):
+    """The scheduler state is read before the collective model load."""
     engine, *_ = _initialized_engine()
+    load_calls = []
     monkeypatch.setattr(
-        "verl_mlite.engine.mlite_engine.load_training_checkpoint", lambda *a, **k: None
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        lambda *a, **k: load_calls.append(a),
     )
 
     with pytest.raises(FileNotFoundError, match="lr_scheduler.pt"):
         engine.load_checkpoint(str(tmp_path))
+    assert load_calls == []
 
 
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):

@@ -501,17 +501,14 @@ def _save_with_failing_publish(rank, world, tmp_path, kind, failing_file, result
         dist.destroy_process_group()
 
 
-def _run_two_rank_save(tmp_path, kind, failing_file) -> dict[int, str | None]:
+def _run_two_ranks(target, *args) -> dict[int, str | None]:
     import multiprocessing
 
     world = 2
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     workers = [
-        context.Process(
-            target=_save_with_failing_publish,
-            args=(rank, world, tmp_path, kind, failing_file, results),
-        )
+        context.Process(target=target, args=(rank, world, *args, results))
         for rank in range(world)
     ]
     for worker in workers:
@@ -523,6 +520,10 @@ def _run_two_rank_save(tmp_path, kind, failing_file) -> dict[int, str | None]:
             worker.join(timeout=30)
             if worker.is_alive():
                 worker.terminate()
+
+
+def _run_two_rank_save(tmp_path, kind, failing_file) -> dict[int, str | None]:
+    return _run_two_ranks(_save_with_failing_publish, tmp_path, kind, failing_file)
 
 
 @pytest.mark.parametrize(
@@ -564,13 +565,71 @@ def test_dist_opt_save_with_a_rank_without_shards_commits(tmp_path) -> None:
     assert torch.load(tmp_path / "ckpt" / "lr_scheduler.pt") == {"step": 1}
 
 
-def test_resume_rejects_missing_rank_sidecars(tmp_path) -> None:
-    optimizer = torch.optim.AdamW(torch.nn.Linear(4, 2).parameters())
+def _save_then_resume(rank, world, tmp_path, kind, overwrite, missing_file, loads, results):
+    """Save step 1, overwrite it with the ``overwrite`` save kwargs or drop rank 1's
+    ``missing_file``, then resume once per entry of ``loads``."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
 
-    with pytest.raises(FileNotFoundError, match="optimizer_rank_0.pt"):
-        dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
-    with pytest.raises(FileNotFoundError, match="rng_state_rank_00000.pt"):
-        dcp._load_rng_sidecar(tmp_path)
+    os.environ["MLITE_DCP_LOCAL_STAGE_DIR"] = str(tmp_path / "stage")
+    torch.cuda.synchronize = lambda *args, **kwargs: None
+    torch.cuda.current_device = lambda: torch.device("cpu")
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'dist-init'}", rank=rank, world_size=world
+    )
+    try:
+        model = torch.nn.Linear(4, 2)
+        if kind == "dist_opt":
+            attach_model_sharded_state_dict(
+                [model], ParallelState(dp_size=world, dp_rank=rank, dp_cp_rank=rank)
+            )
+            optimizer = None
+            topology = {}
+        else:
+            mesh = init_device_mesh("cpu", (world,))
+            dcp._build_meshes = lambda config: (mesh, mesh)
+            optimizer = torch.optim.AdamW(model.parameters())
+            topology = {
+                "config": object(),
+                "ps": SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0),
+                "get_placements": lambda name: [Replicate()],
+            }
+        path = str(tmp_path / "ckpt")
+        dcp.save_training_checkpoint(model, optimizer, 1, path, **topology)
+        if overwrite is not None:
+            dcp.save_training_checkpoint(model, optimizer, 1, path, **topology, **overwrite)
+        if missing_file is not None and rank == 1:
+            (tmp_path / "ckpt" / "step_1" / missing_file).unlink()
+        dist.barrier()
+        outcomes = []
+        for load_kwargs in loads:
+            try:
+                dcp.load_training_checkpoint(model, optimizer, path, **topology, **load_kwargs)
+                outcomes.append(None)
+            except Exception as exc:
+                outcomes.append(f"{type(exc).__name__}: {exc}")
+        results.put((rank, outcomes))
+    except Exception as exc:
+        results.put((rank, [f"save failed: {exc}"]))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "kind, missing_file",
+    [
+        ("fsdp2", "optimizer_rank_1.pt"),
+        ("fsdp2", "rng_state_rank_00001.pt"),
+        ("dist_opt", "rng_state_rank_00001.pt"),
+    ],
+)
+def test_resume_with_one_rank_missing_a_sidecar_raises_on_every_rank(
+    tmp_path, kind, missing_file
+) -> None:
+    outcomes = _run_two_ranks(_save_then_resume, tmp_path, kind, None, missing_file, [{}])
+
+    assert missing_file in outcomes[1][0]
+    assert "failed on another rank" in outcomes[0][0]
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
