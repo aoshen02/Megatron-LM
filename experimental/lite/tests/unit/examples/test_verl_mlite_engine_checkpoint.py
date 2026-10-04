@@ -141,10 +141,7 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
     assert save_kwargs["is_expert"] is expert_classifier
     assert save_kwargs["save_model"] is True
     assert save_kwargs["save_optimizer"] is False
-    assert (
-        torch.load(tmp_path / "lr_scheduler.pt", map_location="cpu", weights_only=False)
-        == scheduler.state_dict()
-    )
+    assert save_kwargs["rank0_states"] == {"lr_scheduler.pt": scheduler.state_dict()}
 
 
 def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(tmp_path, monkeypatch):
@@ -208,6 +205,16 @@ def test_load_checkpoint_restores_scheduler_and_configured_offload(
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
+
+
+def test_load_checkpoint_rejects_a_missing_scheduler_state(tmp_path, monkeypatch):
+    engine, *_ = _initialized_engine()
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint", lambda *a, **k: None
+    )
+
+    with pytest.raises(FileNotFoundError, match="lr_scheduler.pt"):
+        engine.load_checkpoint(str(tmp_path))
 
 
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):

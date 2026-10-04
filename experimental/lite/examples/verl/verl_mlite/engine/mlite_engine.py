@@ -475,6 +475,10 @@ class MegatronLiteEngine(BaseEngine):
         if reload_params_for_save:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
+        scheduler = self.handle._lr_scheduler
+        rank0_states = (
+            {_LR_SCHEDULER_STATE: scheduler.state_dict()} if scheduler is not None else None
+        )
         try:
             if save_model or save_optimizer:
                 save_training_checkpoint(
@@ -488,11 +492,7 @@ class MegatronLiteEngine(BaseEngine):
                     is_expert=expert_classifier,
                     save_model=save_model,
                     save_optimizer=save_optimizer,
-                )
-            if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(
-                    self.handle._lr_scheduler.state_dict(),
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    rank0_states=rank0_states,
                 )
             if save_hf_model:
                 self._save_hf_checkpoint(local_path)
@@ -580,9 +580,12 @@ class MegatronLiteEngine(BaseEngine):
             post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
             if callable(post_update_hook):
                 post_update_hook()
-            scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
-            if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
-                state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
+            if self.handle._lr_scheduler is not None:
+                state = torch.load(
+                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    map_location="cpu",
+                    weights_only=False,
+                )
                 self.handle._lr_scheduler.load_state_dict(state)
             if dist.is_initialized():
                 dist.barrier()

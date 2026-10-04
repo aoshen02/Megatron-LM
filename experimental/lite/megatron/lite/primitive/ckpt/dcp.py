@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import random
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -50,8 +50,13 @@ def save_training_checkpoint(
     save_rng: bool = True,
     save_model: bool = True,
     save_optimizer: bool = True,
+    rank0_states: Mapping[str, Any] | None = None,
 ) -> None:
-    """Save training checkpoint using DTensor + DCP for automatic resharding."""
+    """Save training checkpoint using DTensor + DCP for automatic resharding.
+
+    ``rank0_states`` maps file names under ``path`` to states that rank 0 saves
+    before the checkpoint is committed.
+    """
     if path is None and isinstance(step, str):
         path = step
         step = 0
@@ -65,8 +70,11 @@ def save_training_checkpoint(
         return
     if _supports_dist_opt_distckpt(model, optimizer):
         ckpt_path = os.path.join(path, f"step_{step}")
-        os.makedirs(ckpt_path, exist_ok=True)
-        _save_rank_files(None, ckpt_path, save_optimizer=False, save_rng=save_rng)
+        _uncommit_checkpoint_dir(ckpt_path)
+        _save_rank_files(
+            None, path, ckpt_path, save_optimizer=False, save_rng=save_rng,
+            rank0_states=rank0_states,
+        )
         _save_dist_opt_checkpoint(
             model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
         )
@@ -92,8 +100,11 @@ def save_training_checkpoint(
             state_dict[key] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
-    os.makedirs(ckpt_path, exist_ok=True)
-    _save_rank_files(optimizer, ckpt_path, save_optimizer=save_optimizer, save_rng=save_rng)
+    _uncommit_checkpoint_dir(ckpt_path)
+    _save_rank_files(
+        optimizer, path, ckpt_path, save_optimizer=save_optimizer, save_rng=save_rng,
+        rank0_states=rank0_states,
+    )
     storage_writer = _staged_dcp_writer(ckpt_path)
     dcp.save(
         state_dict,
@@ -105,7 +116,31 @@ def save_training_checkpoint(
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
 
 
-def _save_rank_files(optimizer, ckpt_path: str, *, save_optimizer: bool, save_rng: bool) -> None:
+def _is_rank0() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _uncommit_checkpoint_dir(ckpt_path: str) -> None:
+    """Drop an older save's commit markers before any rank overwrites its files."""
+
+    def prepare() -> None:
+        os.makedirs(ckpt_path, exist_ok=True)
+        if _is_rank0():
+            for marker in (".metadata", "metadata.json"):
+                Path(ckpt_path, marker).unlink(missing_ok=True)
+
+    run_on_all_ranks(prepare, "preparing the checkpoint directory")
+
+
+def _save_rank_files(
+    optimizer,
+    path: str,
+    ckpt_path: str,
+    *,
+    save_optimizer: bool,
+    save_rng: bool,
+    rank0_states: Mapping[str, Any] | None,
+) -> None:
     """Write the per-rank sidecars before the checkpoint's collective .metadata commit."""
 
     def save() -> None:
@@ -113,6 +148,9 @@ def _save_rank_files(optimizer, ckpt_path: str, *, save_optimizer: bool, save_rn
             _save_optimizer_checkpoint(optimizer, ckpt_path)
         if save_rng:
             _save_rng_sidecar(ckpt_path)
+        if rank0_states and _is_rank0():
+            for name, state in rank0_states.items():
+                _torch_save_with_optional_staging(state, os.path.join(path, name))
 
     run_on_all_ranks(save, "saving per-rank checkpoint files")
 
@@ -298,8 +336,10 @@ def _load_optimizer_checkpoint(optimizer, path: str) -> None:
         return
     ckpt_path = _optimizer_checkpoint_path(path)
     if not os.path.exists(ckpt_path):
-        log_rank0(f"No optimizer checkpoint found at {ckpt_path}; loading model state only")
-        return
+        raise FileNotFoundError(
+            f"optimizer checkpoint {ckpt_path} is missing; pass load_optimizer=False "
+            "to load model state only"
+        )
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
@@ -501,8 +541,9 @@ def _save_rng_sidecar(path: str | os.PathLike[str]) -> None:
 def _load_rng_sidecar(path: str | os.PathLike[str]) -> None:
     rng_file = _rng_sidecar_file(path)
     if not rng_file.exists():
-        log_rank0(f"RNG sidecar not found at {rng_file}; skipping RNG restore.")
-        return
+        raise FileNotFoundError(
+            f"RNG sidecar {rng_file} is missing; pass load_rng=False to skip RNG restore"
+        )
     _restore_rng_state(torch.load(rng_file, map_location="cpu", weights_only=False))
 
 

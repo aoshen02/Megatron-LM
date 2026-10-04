@@ -429,7 +429,7 @@ def test_dist_opt_local_stage_saves_checkpoint_end_to_end(
         torch.distributed.destroy_process_group()
 
 
-def _save_with_failing_publish(rank, world, tmp_path, kind, results) -> None:
+def _save_with_failing_publish(rank, world, tmp_path, kind, failing_file, results) -> None:
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
 
@@ -442,7 +442,6 @@ def _save_with_failing_publish(rank, world, tmp_path, kind, results) -> None:
     torch.cuda.synchronize = lambda *args, **kwargs: None
     torch.cuda.current_device = lambda: torch.device("cpu")
     publish = local_stage.publish_staged_file
-    failing_file = "__1_0.distcp" if kind == "dist_opt" else "optimizer_rank_1.pt"
 
     def publish_or_fail(source, destination):
         if destination.name == failing_file:
@@ -467,6 +466,20 @@ def _save_with_failing_publish(rank, world, tmp_path, kind, results) -> None:
                 sharded_strategy=distckpt._NodeLocalDistSaveStrategy(stage_root),
                 validate_access_integrity=False,
             )
+        elif kind == "dist_opt_replicated":
+            # Rank 1 holds only a replica, so it has no write buckets.
+            model = torch.nn.Linear(4, 2)
+            attach_model_sharded_state_dict(
+                [model], ParallelState(dp_size=world, dp_rank=rank, dp_cp_rank=rank)
+            )
+            dcp.save_training_checkpoint(
+                model,
+                None,
+                1,
+                str(tmp_path / "ckpt"),
+                save_rng=False,
+                rank0_states={"lr_scheduler.pt": {"step": 1}},
+            )
         else:
             mesh = init_device_mesh("cpu", (world,))
             dcp._build_meshes = lambda config: (mesh, mesh)
@@ -488,39 +501,76 @@ def _save_with_failing_publish(rank, world, tmp_path, kind, results) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("kind", ["dist_opt", "fsdp2"])
-def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metadata(
-    tmp_path, kind
-) -> None:
-    """A rank that cannot publish must not leave other ranks hanging or a committed checkpoint."""
+def _run_two_rank_save(tmp_path, kind, failing_file) -> dict[int, str | None]:
     import multiprocessing
 
     world = 2
-    (tmp_path / "ckpt").mkdir()
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     workers = [
         context.Process(
-            target=_save_with_failing_publish, args=(rank, world, tmp_path, kind, results)
+            target=_save_with_failing_publish,
+            args=(rank, world, tmp_path, kind, failing_file, results),
         )
         for rank in range(world)
     ]
     for worker in workers:
         worker.start()
     try:
-        errors = dict(results.get(timeout=120) for _ in workers)
+        return dict(results.get(timeout=120) for _ in workers)
     finally:
         for worker in workers:
             worker.join(timeout=30)
             if worker.is_alive():
                 worker.terminate()
 
-    assert "simulated publish failure" in errors[1]
-    assert "failed on another rank" in errors[0]
-    checkpoint = tmp_path / "ckpt" / ("step_1" if kind == "fsdp2" else "")
+
+@pytest.mark.parametrize(
+    "kind, failing_file, failing_rank",
+    [
+        ("dist_opt", "__1_0.distcp", 1),
+        ("dist_opt_replicated", "__0_0.distcp", 0),
+        ("fsdp2", "optimizer_rank_1.pt", 1),
+    ],
+)
+def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metadata(
+    tmp_path, kind, failing_file, failing_rank
+) -> None:
+    """A failed publish raises on every rank and leaves no commit marker, even one
+    left by an earlier save into the same directory."""
+    checkpoint = tmp_path / "ckpt" / ("" if kind == "dist_opt" else "step_1")
+    checkpoint.mkdir(parents=True)
+    if kind != "dist_opt":
+        (checkpoint / ".metadata").write_bytes(b"stale")
+        (checkpoint / "metadata.json").write_text("{}")
+
+    errors = _run_two_rank_save(tmp_path, kind, failing_file)
+
+    assert "simulated publish failure" in errors[failing_rank]
+    assert "failed on another rank" in errors[1 - failing_rank]
     assert not (checkpoint / ".metadata").exists()
     assert not (checkpoint / "metadata.json").exists()
     assert not list((tmp_path / "stage").rglob("*.stage"))
+
+
+def test_dist_opt_save_with_a_rank_without_shards_commits(tmp_path) -> None:
+    """A rank with nothing to write still joins the publication collective."""
+    errors = _run_two_rank_save(tmp_path, "dist_opt_replicated", None)
+
+    assert errors == {0: None, 1: None}
+    checkpoint = tmp_path / "ckpt" / "step_1"
+    assert (checkpoint / ".metadata").exists()
+    assert (checkpoint / "metadata.json").exists()
+    assert torch.load(tmp_path / "ckpt" / "lr_scheduler.pt") == {"step": 1}
+
+
+def test_resume_rejects_missing_rank_sidecars(tmp_path) -> None:
+    optimizer = torch.optim.AdamW(torch.nn.Linear(4, 2).parameters())
+
+    with pytest.raises(FileNotFoundError, match="optimizer_rank_0.pt"):
+        dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="rng_state_rank_00000.pt"):
+        dcp._load_rng_sidecar(tmp_path)
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
