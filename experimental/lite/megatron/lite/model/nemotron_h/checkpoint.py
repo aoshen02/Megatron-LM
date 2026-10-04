@@ -5,6 +5,16 @@ from pathlib import Path
 
 import torch
 
+
+def is_expert(name):
+    return ".mixer.experts." in name
+
+
+def hf_name(name):
+    """HF name of a native module or tensor name."""
+    return name if name.split(".")[0] == "lm_head" else f"backbone.{name}"
+
+
 def _routed_checkpoint_owners(model):
     from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
         Nvfp4ExpertWeights,
@@ -71,9 +81,7 @@ class NemotronExport:
     def __init__(self, config):
         self.num_experts = config.n_routed_experts
 
-    @staticmethod
-    def is_expert(name):
-        return ".mixer.experts." in name
+    is_expert = staticmethod(is_expert)
 
     @staticmethod
     def tp_spec(name):
@@ -89,8 +97,7 @@ class NemotronExport:
         quantized = {}
         for name, module in model.named_modules():
             if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
-                prefix = name if name.startswith("lm_head") else f"backbone.{name}"
-                quantized[prefix] = module.export_quantized()
+                quantized[hf_name(name)] = module.export_quantized()
         for name, tensor in hf_tensor_views(model):
             kv_scale = name.endswith((".k_proj.k_scale", ".v_proj.v_scale"))
             if any(name.startswith(prefix + ".") for prefix in quantized) and not kv_scale:
@@ -161,7 +168,7 @@ def hf_tensor_views(model):
             if name.endswith(suffix):
                 name = name.removesuffix(suffix) + f".mixer.{scale}_proj.{scale}_scale"
                 break
-        yield (name if name.startswith("lm_head.") else f"backbone.{name}"), tensor
+        yield hf_name(name), tensor
 
 
 def _read_tensors(root, index, names, device="cpu"):
@@ -185,7 +192,7 @@ def _quantized_masters(model):
 
     for name, module in model.named_modules():
         if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
-            prefix = name if name.split(".")[0] == "lm_head" else f"backbone.{name}"
+            prefix = hf_name(name)
             algorithm = (
                 "FP8" if isinstance(module, Fp8TrainingLinear) else "W4A16_NVFP4"
             )
@@ -303,14 +310,10 @@ def _load_bf16_masters(model, root, master_root):
         model._bf16_master_verified = str(master_root.resolve())
 
 
-# Fail-closed theta0 floors for requant(BF16 master) against the checkpoint:
-# per rank over all NVFP4 tensors, and per tensor. Effective weights (dequantized values) are
-# the contract; codes and block scales are compared on blocks that are not all
-# zero (ModelOpt floors an all-zero block's scale at 2^-9, TE writes 0). Full
-# Lightning model with TE 4over6 MSE, measured on all 5935 NVFP4 tensors:
-# 99.93% values overall, >= 99.88% per layer; per tensor >= 97.87% values,
-# >= 98.07% codes and >= 97.69% block scales. Global scales and FP8 tensors
-# whose checkpoint scale is amax/448 must match exactly.
+# Fail-closed theta0 floors for requant(BF16 master) against the checkpoint,
+# per rank over all NVFP4 tensors and per tensor. Codes and block scales are
+# compared on blocks that are not all zero (ModelOpt floors an all-zero
+# block's scale at 2^-9, TE writes 0).
 THETA0_NVFP4_MIN_VALUES = 0.998
 THETA0_NVFP4_MIN_NONZERO_BLOCKS = 0.997
 THETA0_NVFP4_TENSOR_MIN_VALUES = 0.95
@@ -319,17 +322,13 @@ THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS = 0.95
 
 @torch.no_grad()
 def _check_theta0_agreement(masters, root, index):
-    """Compare the requantized theta0 deployment with the checkpoint and fail closed.
+    """Compare the requantized theta0 deployment with the checkpoint.
 
-    Per tensor class: packed codes, block scales, global scales and the
-    dequantized (effective) weights. NVFP4 aggregates must reach the floors
-    above and every global scale must be equal. FP8
-    tensors whose checkpoint scale is amax/448 must match exactly; the others
-    carry a ModelOpt-calibrated scale the requantization replaces by amax/448.
+    NVFP4 values, codes and block scales must reach the floors above and every
+    global scale must be equal. FP8 tensors whose checkpoint scale is amax/448
+    must match exactly; the others carry a calibrated scale that requantization
+    replaces.
     """
-    import logging
-    import re
-
     from megatron.lite.model.nemotron_h.quantization import QuantizedWeight
 
     suffixes = {
@@ -348,78 +347,61 @@ def _check_theta0_agreement(masters, root, index):
         stored = _read_tensors(root, index, names, master.device)
         stored = {s: stored[f"{prefix}.{s}"] for s in suffixes[algorithm]}
         deployed = {k: deployed_fn()[k] for k in suffixes[algorithm]}
-        kind = re.sub(r"\.\d+\.", ".N.", prefix)
-        kind = f"{'fp8' if algorithm == 'FP8' else 'nvfp4'}:{kind}"
         ours = QuantizedWeight(algorithm, stored).initial_master()
         theirs = QuantizedWeight(algorithm, deployed).initial_master()
         values_same = ours == theirs
-        add((kind, "values"), values_same)
-        if algorithm == "W4A16_NVFP4":
-            agreement = float(values_same.float().mean())
-            if agreement < THETA0_NVFP4_TENSOR_MIN_VALUES:
-                raise RuntimeError(
-                    f"theta0 {prefix} values agreement {agreement:.4%} is below "
-                    f"{THETA0_NVFP4_TENSOR_MIN_VALUES:.2%}"
-                )
-        nonzero = None
-        if algorithm == "W4A16_NVFP4":
-            add(("nvfp4", "values"), values_same)
-            rows = ours.shape[0]
-            nonzero = (ours.reshape(rows, -1, 16) != 0).any(-1) | (
-                theirs.reshape(rows, -1, 16) != 0
-            ).any(-1)
-        for suffix in suffixes[algorithm]:
-            a = stored[suffix]
-            b = deployed[suffix].reshape(a.shape).to(a.dtype)
-            width = torch.uint8 if a.element_size() == 1 else torch.int32
-            same = a.view(width) == b.view(width)
-            add((kind, suffix), same)
-            if nonzero is not None and suffix != "weight_scale_2":
-                # packed codes: 8 bytes per 16-value block
-                mask = nonzero if suffix == "weight_scale" else (
-                    nonzero.repeat_interleave(8, -1)
-                )
-                add((kind, f"{suffix}[nonzero blocks]"), same[mask])
-                add(("nvfp4", f"{suffix}[nonzero blocks]"), same[mask])
-                if same[mask].numel():
-                    agreement = float(same[mask].float().mean())
-                    if agreement < THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:
-                        raise RuntimeError(
-                            f"theta0 {prefix}.{suffix} agreement on nonzero blocks "
-                            f"{agreement:.4%} is below "
-                            f"{THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:.2%}"
-                        )
-            if algorithm == "W4A16_NVFP4" and suffix == "weight_scale_2":
-                add(("nvfp4", suffix), same)
         if algorithm == "FP8":
             amax = master.float().abs().amax()
             standard = torch.equal(
                 (amax / torch.tensor(448.0, device=amax.device)).reshape(()),
                 stored["weight_scale"].float().reshape(()),
             )
-            add(("fp8", "standard_scale_tensors"), torch.tensor([standard]))
             if standard and not bool(values_same.all()):
                 raise RuntimeError(f"{prefix}: amax/448 checkpoint not reproduced")
-    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    log = logging.getLogger(__name__)
-    for (kind, suffix), (equal, total) in sorted(stats.items()):
-        log.warning(
-            "theta0 vs checkpoint rank%d %s.%s: %d/%d equal (%.4f%%)",
-            rank, kind, suffix, equal, total, 100 * equal / max(total, 1),
-        )
+            continue
+        agreement = float(values_same.float().mean())
+        if agreement < THETA0_NVFP4_TENSOR_MIN_VALUES:
+            raise RuntimeError(
+                f"theta0 {prefix} values agreement {agreement:.4%} is below "
+                f"{THETA0_NVFP4_TENSOR_MIN_VALUES:.2%}"
+            )
+        add("values", values_same)
+        rows = ours.shape[0]
+        nonzero = (ours.reshape(rows, -1, 16) != 0).any(-1) | (
+            theirs.reshape(rows, -1, 16) != 0
+        ).any(-1)
+        for suffix in suffixes[algorithm]:
+            a = stored[suffix]
+            b = deployed[suffix].reshape(a.shape).to(a.dtype)
+            width = torch.uint8 if a.element_size() == 1 else torch.int32
+            same = a.view(width) == b.view(width)
+            if suffix == "weight_scale_2":
+                add(suffix, same)
+                continue
+            # packed codes: 8 bytes per 16-value block
+            mask = nonzero if suffix == "weight_scale" else nonzero.repeat_interleave(8, -1)
+            add(suffix, same[mask])
+            if same[mask].numel():
+                agreement = float(same[mask].float().mean())
+                if agreement < THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:
+                    raise RuntimeError(
+                        f"theta0 {prefix}.{suffix} agreement on nonzero blocks "
+                        f"{agreement:.4%} is below "
+                        f"{THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS:.2%}"
+                    )
     floors = {
         "values": THETA0_NVFP4_MIN_VALUES,
-        "weight[nonzero blocks]": THETA0_NVFP4_MIN_NONZERO_BLOCKS,
-        "weight_scale[nonzero blocks]": THETA0_NVFP4_MIN_NONZERO_BLOCKS,
+        "weight": THETA0_NVFP4_MIN_NONZERO_BLOCKS,
+        "weight_scale": THETA0_NVFP4_MIN_NONZERO_BLOCKS,
     }
     for suffix, floor in floors.items():
-        equal, total = stats.get(("nvfp4", suffix), (0, 0))
+        equal, total = stats.get(suffix, (0, 0))
         if total and equal < floor * total:
             raise RuntimeError(
                 f"theta0 NVFP4 {suffix} agreement {equal / total:.4%} is below "
                 f"{floor:.2%}"
             )
-    equal, total = stats.get(("nvfp4", "weight_scale_2"), (0, 0))
+    equal, total = stats.get("weight_scale_2", (0, 0))
     if equal != total:
         raise RuntimeError(f"theta0 NVFP4 global scales differ: {total - equal}")
 
@@ -445,12 +427,7 @@ def load_hf_weights(model, path):
     quantized = {}
     for name, module in model.named_modules():
         if isinstance(module, Nvfp4TrainingLinear | Fp8TrainingLinear):
-            prefix = (
-                name
-                if name.startswith("lm_head.") or name == "lm_head"
-                else f"backbone.{name}"
-            )
-            quantized[prefix] = module.export_quantized()
+            quantized[hf_name(name)] = module.export_quantized()
     for weights in _routed_checkpoint_owners(model).values():
         quantized[weights.prefix] = {
             name.removeprefix(weights.prefix + "."): value

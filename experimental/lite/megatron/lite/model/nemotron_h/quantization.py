@@ -14,9 +14,7 @@ def requantize(algorithm, weight):
     NVFP4: Transformer Engine 4over6 with the 256 E4M3 bound, choosing map4/map6
     by squared error (ModelOpt's static-MSE 4over6), global = amax / 1536. FP8:
     per-tensor scale = amax / 448, codes = E4M3(BF16(w / scale)) as ModelOpt
-    rounds the quotient. From the public BF16 release this reproduces 100% of
-    the NVFP4 global scales and FP8 codes (given their scales) and 99.8% of the
-    NVFP4 bytes (agent_run/results/bf16src).
+    rounds the quotient.
     """
     if weight.dtype != torch.bfloat16 or weight.ndim != 2:
         raise ValueError("Expected a BF16 master matrix")
@@ -86,9 +84,7 @@ def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
     rounding of master / (block scale * global scale) must give the checkpoint
     FP4 values wherever that unit is positive (no product is compared); with
     ``exact_global`` (the master is the original BF16 source) the global scale
-    must also be amax / 1536. Both hold exactly for the Lightning
-    checkpoint and its BF16 release, and for a master dequantized from the
-    checkpoint. Returns the number of changed values (always 0).
+    must also be amax / 1536.
     """
     master = master.detach()
     tensors = {key: value.to(master.device) for key, value in tensors.items()}
@@ -116,7 +112,6 @@ def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
             f"{name} is not its BF16 master on the checkpoint scales: "
             f"{changed} values changed"
         )
-    return changed
 
 
 @dataclass(frozen=True)
@@ -210,13 +205,4 @@ def load_quantized_weight(root, prefix, recipe):
         name = f"{prefix}.{suffix}"
         with safe_open(root / index[name], framework="pt", device="cpu") as handle:
             tensors[suffix] = handle.get_tensor(name)
-    if algorithm == "FP8":
-        scale = tensors["input_scale"]
-        if (
-            scale.dtype != torch.float32
-            or scale.numel() != 1
-            or not torch.isfinite(scale).all()
-            or not (scale > 0).all()
-        ):
-            raise ValueError("Expected a positive FP32 static activation scale")
     return QuantizedWeight(algorithm, tensors)
