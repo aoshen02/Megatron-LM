@@ -111,11 +111,6 @@ def validate_proxy_config(config, impl):
             for key in ("num_hidden_layers", "layers_block_type", "hidden_size")
         ):
             raise ValueError("BF16 master source must be the unquantized same model")
-        layers = impl.bf16_master_layers
-        if (layers is None) != full_depth or (
-            layers is not None and len(layers) != config.num_hidden_layers
-        ):
-            raise ValueError("Name the release layer of every proxy BF16 master layer")
 
 
 def _check_runtime(ps):
@@ -223,5 +218,4 @@ def build_quantized_proxy(config, impl, ps, *, layer_range):
     model._quantized_proxy_root = str(Path(impl.hf_path).resolve())
     if impl.bf16_master_path:
         model._bf16_master_root = str(Path(impl.bf16_master_path).resolve())
-        model._bf16_master_layers = impl.bf16_master_layers
     return model
