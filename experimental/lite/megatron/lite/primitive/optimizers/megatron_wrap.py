@@ -160,12 +160,8 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            # No overlapped gradient reduce, as DS4's megatron_wrap: the
-            # microbatch loop never enters DDP no_sync, so an overlapped
-            # bucket fires its reduce-scatter once its grad hooks reach the
-            # first step's count; a step with more microbatches then reduces
-            # partial gradients, one with fewer never issues the reduce.
-            # finish_grad_sync reduces the accumulated main_grads instead.
+            # The microbatch loop never enters no_sync: an overlapped reduce
+            # would fire on partial gradients.
             use_distributed_optimizer=True,
             overlap_grad_reduce=False,
             overlap_param_gather=True,

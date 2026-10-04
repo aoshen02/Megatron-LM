@@ -25,7 +25,6 @@ from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImp
 from megatron.lite.primitive.ckpt.local_stage import (
     NodeLocalStagingFileSystem as _NodeLocalStagingFileSystem,
     local_stage_root,
-    publish_staged_file as _publish_staged_file,
     run_on_all_ranks,
 )
 from megatron.lite.primitive.parallel import ParallelState

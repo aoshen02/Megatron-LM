@@ -9,10 +9,7 @@ class _Fp8AttentionVJP(torch.autograd.Function):
     The visible output multiplies an FP8-rounded P by V, so it is not the
     softmax(QK^T)V that FlashAttention's backward assumes when it forms
     D = rowsum(dO * O). Backward recomputes the BF16 output and LSE on the
-    dequantized Q/K/V and passes those instead. FA4's FP8 forward is declared
-    forward-only upstream (interface.py rejects requires_grad); the actor calls
-    _flash_attn_fwd/_bwd directly and recomputes a BF16 O/LSE so D matches the
-    P the backward recomputes.
+    dequantized Q/K/V and passes those instead.
     """
 
     @staticmethod

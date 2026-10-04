@@ -8,25 +8,10 @@ from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 def aligned_selected_log_probs(
     hidden, lm_head, labels, temperature, chunk_size, *, calculate_entropy, tp_group
 ):
-    """Rollout-kernel value with an FP32 log-softmax VJP on the same BF16 logits.
+    """Rollout-kernel value with an FP32 log-softmax VJP on the same BF16 logits,
+    one ``chunk_size`` token chunk at a time (DS4's ``aligned_selected_log_probs``).
 
-    Follows the DeepSeek-V4 actor's ``aligned_selected_log_probs``: the LM head
-    and the selected log-probability run one bounded chunk at a time, and the
-    differentiable path is derived from the very logits the visible value saw.
-    With ``temperature != 1`` the logits are cast to FP32 and then divided, as
-    DeepSeek-V4 does and as vLLM's sampler forms its processed logits.
-
-    Args:
-        hidden: Final normalized hidden states, ``[T, H]``.
-        lm_head: The LM head projection module.
-        labels: Target ids, ``[T]``.
-        temperature: Sampling temperature.
-        chunk_size: Tokens per chunk.
-        calculate_entropy: Also return the per-token entropy.
-        tp_group: TP group of the vocabulary-parallel entropy.
-
-    Returns:
-        ``(log_probs[T], entropy[T] or None)``.
+    Returns ``(log_probs[T], entropy[T] or None)``.
     """
     from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 
@@ -39,7 +24,6 @@ def aligned_selected_log_probs(
         ids = labels[start : start + chunk_size, None]
         logits = projection(hidden[start : start + chunk_size], lm_head)
         if temperature != 1.0:
-            # As DS4 and vLLM's sampler: FP32 logits, then the temperature.
             logits = logits.float() / temperature
         with torch.no_grad():
             visible = compute_token_logprobs(logits, ids)

@@ -63,16 +63,11 @@ def _incomplete_layers(model, loaded: set[str]) -> list[str]:
 
 
 class MLiteVLLMColocateWorkerExtension(vLLMColocateWorkerExtension):
-    """Refit ModelOpt checkpoints through vLLM's native layerwise lifecycle.
-
-    As the DeepSeek-V4 refit: restore the checkpoint layout, load every
-    bucket, process each completed layer once and copy the result into the
-    original kernel storage, which captured CUDA graphs keep reading. The
-    actor sends its deployment tensors in checkpoint format.
-
-    DeepSeek-V4 installs this lifecycle under verl's quantized-refit hooks,
-    which verl only enters for FP8 configs; a ModelOpt mixed-precision
-    checkpoint is driven here. Every other config keeps verl's path.
+    """Refit ModelOpt mixed-precision checkpoints through vLLM's native
+    layerwise lifecycle: restore the checkpoint layout, load every bucket,
+    process each completed layer once and copy the result into the original
+    kernel storage. The actor sends its deployment tensors in checkpoint
+    format; every other config keeps verl's path.
     """
 
     @torch.no_grad()
