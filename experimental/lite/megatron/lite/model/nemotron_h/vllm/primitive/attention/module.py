@@ -17,7 +17,7 @@ from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 class Fa4Fp8KVAttention(torch.nn.Module):
     """Serving FA4 over the static FP8 KV cache, with a FlashAttention VJP.
 
-    Replays ``vllm.model_executor.models.nemotron_h_fa4``: FP8 query and
+    Replays vLLM's ``FlashAttnFixedSplitBackend``: FP8 query and
     KV-cache quantization with fixed scales, serving's 6768-token pages and
     the fixed split-KV schedule. The VJP is the FlashAttention varlen
     backward on the dequantized Q/K/V with the visible output and LSE (an
@@ -46,7 +46,7 @@ class Fa4Fp8KVAttention(torch.nn.Module):
 
     def _visible(self, q, k, v, boundaries):
         """Return the serving output, its LSE and the dequantized Q/K/V."""
-        from vllm.model_executor.models.nemotron_h_fa4 import (
+        from vllm.v1.attention.backends.flash_attn_fixed_split import (
             MAX_SEQ_LEN,
             NUM_SPLITS,
             SEQLEN_K_PER_SPLIT,

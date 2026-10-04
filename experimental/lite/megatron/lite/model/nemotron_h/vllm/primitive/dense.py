@@ -211,10 +211,12 @@ class GatedRMSNorm(torch.nn.Module):
         self.group_size, self.eps = group_size, eps
 
     def forward(self, x, gate):
-        from vllm.model_executor.models.nemotron_h_alignment import gated_forward
+        from vllm.model_executor.layers.mamba.mamba_mixer2 import (
+            grouped_gated_rms_norm,
+        )
 
         def visible(x, gate, weight):
-            return gated_forward(x, gate, weight, self.group_size, self.eps)
+            return grouped_gated_rms_norm(x, gate, weight, self.group_size, self.eps)
 
         if not torch.is_grad_enabled():
             return visible(x, gate, self.weight)
@@ -232,19 +234,19 @@ class RMSNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, x, residual=None):
-        from vllm.model_executor.models.nemotron_h_alignment import rms_forward
+        from vllm.model_executor.layers.layernorm import cuda_rms_norm
 
         if residual is None:
 
             def visible(x, weight):
-                return rms_forward(x, weight, self.eps)
+                return cuda_rms_norm(x, weight, self.eps)
 
             if not torch.is_grad_enabled():
                 return visible(x, self.weight)
             return _RMSNormVJP.apply(visible, x, self.weight, self.eps)
 
         def visible(x, residual, weight):
-            return rms_forward(x, weight, self.eps, residual)
+            return cuda_rms_norm(x, weight, self.eps, residual)
 
         if not torch.is_grad_enabled():
             return visible(x, residual, self.weight)
