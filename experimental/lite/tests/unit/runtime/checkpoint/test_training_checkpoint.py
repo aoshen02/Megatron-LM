@@ -616,6 +616,27 @@ def _save_then_resume(rank, world, tmp_path, kind, overwrite, missing_file, load
 
 
 @pytest.mark.parametrize(
+    "kind, overwrite, skip, stale",
+    [
+        ("fsdp2", {"save_optimizer": False}, {"load_optimizer": False}, "optimizer_rank_"),
+        ("fsdp2", {"save_rng": False}, {"load_rng": False}, "rng_state_rank_"),
+        ("dist_opt", {"save_rng": False}, {"load_rng": False}, "rng_state_rank_"),
+    ],
+)
+def test_overwrite_with_fewer_contents_leaves_no_stale_sidecars(
+    tmp_path, kind, overwrite, skip, stale
+) -> None:
+    """Sidecars from an earlier save into the same step directory are removed, so a
+    resume that needs them fails on every rank instead of loading stale state."""
+    outcomes = _run_two_ranks(_save_then_resume, tmp_path, kind, overwrite, None, [{}, skip])
+
+    for rank in (0, 1):
+        assert "FileNotFoundError: checkpoint file" in outcomes[rank][0], outcomes
+        assert outcomes[rank][1] is None, outcomes
+    assert not list((tmp_path / "ckpt" / "step_1").glob(f"{stale}*"))
+
+
+@pytest.mark.parametrize(
     "kind, missing_file",
     [
         ("fsdp2", "optimizer_rank_1.pt"),

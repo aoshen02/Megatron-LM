@@ -121,13 +121,16 @@ def _is_rank0() -> bool:
 
 
 def _uncommit_checkpoint_dir(ckpt_path: str) -> None:
-    """Drop an older save's commit markers before any rank overwrites its files."""
+    """Remove an older save's files, commit markers first, before any rank writes."""
 
     def prepare() -> None:
         os.makedirs(ckpt_path, exist_ok=True)
         if _is_rank0():
             for marker in (".metadata", "metadata.json"):
                 Path(ckpt_path, marker).unlink(missing_ok=True)
+            for entry in Path(ckpt_path).iterdir():
+                if not entry.is_dir():
+                    entry.unlink()
 
     run_on_all_ranks(prepare, "preparing the checkpoint directory")
 
