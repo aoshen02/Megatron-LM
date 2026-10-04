@@ -141,6 +141,43 @@ def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
             dist.destroy_process_group()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_dcp_save_does_not_keep_pinned_staging(monkeypatch, tmp_path) -> None:
+    """DCP stages GPU shards in pinned memory; the save must not leave them cached."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    if dist.is_initialized():
+        pytest.skip("needs to own a single-rank process group")
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cuda", (1,))
+        model = torch.nn.Linear(1024, 1024, device="cuda")
+        monkeypatch.setattr(dcp, "_build_meshes", lambda config: (mesh, mesh))
+        ps = SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0)
+
+        def pinned() -> int:
+            return torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+
+        before = pinned()
+        dcp.save_training_checkpoint(
+            model,
+            None,
+            1,
+            str(tmp_path / "ckpt"),
+            config=object(),
+            ps=ps,
+            get_placements=lambda name: [Replicate()],
+            save_rng=False,
+            save_optimizer=False,
+        )
+        assert pinned() <= before
+    finally:
+        dist.destroy_process_group()
+
+
 def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
