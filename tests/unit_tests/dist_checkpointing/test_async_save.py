@@ -1,4 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import errno
+import io
+import os
 import sys
 from unittest import mock
 
@@ -9,7 +12,10 @@ from torch.distributed.checkpoint import CheckpointException
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
-from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
+from megatron.core.dist_checkpointing.strategies.filesystem_async import (
+    FileSystemWriterAsync,
+    _write_item_checked,
+)
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
@@ -126,6 +132,83 @@ _NVRX_SUBMODULES = [
     'nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async',
     'nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver',
 ]
+
+
+class _FailingLargeWrites(io.BytesIO):
+    """Fails the first ``failures`` writes larger than 1 MiB with ``err``."""
+
+    name = "/ckpt/__0_0.distcp"
+
+    def __init__(self, err, failures):
+        super().__init__()
+        self.err, self.failures = err, failures
+
+    def write(self, data):
+        if memoryview(data).nbytes > (1 << 20) and self.failures > 0:
+            self.failures -= 1
+            raise OSError(self.err, os.strerror(self.err))
+        return super().write(data)
+
+
+def _tensor_write_item(tensor):
+    from torch.distributed.checkpoint.metadata import (
+        ChunkStorageMetadata,
+        MetadataIndex,
+        TensorProperties,
+    )
+    from torch.distributed.checkpoint.planner import TensorWriteData, WriteItem, WriteItemType
+
+    chunk = ChunkStorageMetadata(offsets=torch.Size([0]), sizes=tensor.size())
+    return WriteItem(
+        index=MetadataIndex("decoder.weight"),
+        type=WriteItemType.TENSOR,
+        tensor_data=TensorWriteData(
+            chunk=chunk, properties=TensorProperties.create_from_tensor(tensor), size=tensor.size()
+        ),
+    )
+
+
+def _write_tensor(stream, tensor):
+    from torch.distributed.checkpoint.filesystem import (
+        SerializationFormat,
+        _StorageWriterTransforms,
+    )
+
+    return _write_item_checked(
+        _StorageWriterTransforms(),
+        stream,
+        tensor,
+        _tensor_write_item(tensor),
+        "__0_0.distcp",
+        serialization_format=SerializationFormat.TORCH_SAVE,
+    )
+
+
+class TestWriteItemChecked:
+    def test_failed_write_reports_the_original_error(self):
+        """torch.save alone would surface only "unexpected pos ..."."""
+        stream = _FailingLargeWrites(errno.ENOSPC, failures=1)
+        stream.write(b"x" * 64)
+        with pytest.raises(RuntimeError, match="offset=64 item=.*decoder.weight.*No space"):
+            _write_tensor(stream, torch.randn(1 << 20))
+
+    def test_efault_is_rewritten_once_through_bounce_buffers(self):
+        tensor = torch.randn(1 << 20)
+        stream = _FailingLargeWrites(errno.EFAULT, failures=1)
+        stream.write(b"x" * 64)
+
+        result = _write_tensor(stream, tensor)
+
+        info = result.storage_data
+        assert info.offset == 64 and info.offset + info.length == len(stream.getvalue())
+        restored = torch.load(io.BytesIO(stream.getvalue()[info.offset :]), weights_only=True)
+        assert torch.equal(restored, tensor)
+
+    def test_efault_retry_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("MCORE_DIST_CKPT_EFAULT_RETRY", "0")
+        stream = _FailingLargeWrites(errno.EFAULT, failures=1)
+        with pytest.raises(RuntimeError, match="Bad address"):
+            _write_tensor(stream, torch.randn(1 << 20))
 
 
 class TestHasNvrxAsyncSupport:
