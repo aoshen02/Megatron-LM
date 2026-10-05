@@ -805,6 +805,28 @@ def test_state_eligibility_is_identical_for_d2h_and_cpu_adoption():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_canonical_cpu_buffers_are_pinned_at_their_exact_size():
+    """The caching host allocator would round each buffer up to a power of two."""
+
+    torch.cuda.init()
+    template = torch.empty(3 << 18, dtype=torch.float32)  # 3 MiB
+    cached_before = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+
+    buffer = ChunkedOptimizerStateOffloader._new_cpu_buffer(template)
+
+    assert buffer.is_pinned()
+    assert buffer.shape == template.shape and buffer.dtype == template.dtype
+    assert buffer.untyped_storage().nbytes() == template.nbytes
+    assert torch.cuda.host_memory_stats().get("allocated_bytes.current", 0) == cached_before
+    source = torch.randn(template.shape, device="cuda")
+    buffer.copy_(source, non_blocking=True)
+    restored = torch.empty_like(source)
+    restored.copy_(buffer, non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.equal(restored, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 def test_load_releases_cpu_buffers_from_an_old_state_schema():
     """Replacing checkpoint state must not retain obsolete pinned canonical buffers."""
 

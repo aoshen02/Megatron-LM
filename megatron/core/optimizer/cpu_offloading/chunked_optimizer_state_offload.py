@@ -15,6 +15,8 @@ import collections
 import dataclasses
 import logging
 import math
+import mmap
+import weakref
 from typing import Callable, Dict, Iterable, List, Mapping, Sequence
 
 import torch
@@ -25,6 +27,39 @@ _MASTER_PARAM_KEY = "master_param"
 _NON_OFFLOADABLE_STATE_KEYS = frozenset({_MASTER_PARAM_KEY, "step", "found_inf"})
 
 logger = logging.getLogger(__name__)
+
+
+_EXACT_PIN_MIN_BYTES = 1 << 20
+
+
+def _exact_size_pinned_empty(tensor: torch.Tensor) -> torch.Tensor:
+    """Return an uninitialized pinned CPU tensor of exactly ``tensor``'s size.
+
+    ``torch.empty(..., pin_memory=True)`` goes through the caching host allocator,
+    which rounds every block up to a power of two; per-parameter optimizer-state
+    buffers then cost up to 2x their size (146.9 GiB pinned for 88.2 GiB of state
+    per rank on Nemotron-H). Page-locking a private anonymous mapping in place is
+    exact; it is unregistered and unmapped when the tensor is freed.
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes < _EXACT_PIN_MIN_BYTES:
+        return torch.empty(tensor.size(), dtype=tensor.dtype, device="cpu", pin_memory=True)
+    region = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    buf = torch.frombuffer(region, dtype=tensor.dtype, count=tensor.numel()).view(tensor.size())
+    ptr = buf.data_ptr()
+    cudart = torch.cuda.cudart()
+    err = cudart.cudaHostRegister(ptr, nbytes, 0)
+    if int(err) != 0:
+        raise RuntimeError(f"cudaHostRegister of {nbytes} bytes failed: {err}")
+
+    def unregister() -> None:
+        # Pending async copies may still read the buffer.
+        torch.cuda.synchronize()
+        cudart.cudaHostUnregister(ptr)
+
+    # Runs before the storage drops its reference to ``region``.
+    weakref.finalize(buf, unregister)
+    return buf
 
 
 @dataclasses.dataclass(frozen=True)
@@ -311,9 +346,7 @@ class ChunkedOptimizerStateOffloader:
 
     @staticmethod
     def _new_cpu_buffer(tensor: torch.Tensor) -> torch.Tensor:
-        return torch.empty(
-            tensor.size(), dtype=tensor.dtype, layout=tensor.layout, device="cpu", pin_memory=True
-        )
+        return _exact_size_pinned_empty(tensor)
 
     def _cpu_buffer_for_state(
         self, param: torch.Tensor, key: str, tensor: torch.Tensor
