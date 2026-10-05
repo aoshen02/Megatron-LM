@@ -709,9 +709,7 @@ class TestDistributedOptimizer:
             )
             step_hybrid_device_optimizer(optimizer_a, num_steps=3)
             save(
-                optimizer_a.sharded_state_dict(
-                    model_a[0].sharded_state_dict(), metadata=metadata
-                ),
+                optimizer_a.sharded_state_dict(model_a[0].sharded_state_dict(), metadata=metadata),
                 ckpt_dir,
             )
 

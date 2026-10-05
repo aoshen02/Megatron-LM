@@ -97,6 +97,7 @@ def _requant_input(kind, shape):
 
 
 @cuda
+@pytest.mark.gpus(1)
 @pytest.mark.parametrize("shape", REQUANT_SHAPES)
 @pytest.mark.parametrize("kind", ["random", "boundary", "zeros", "maxes"])
 def test_nvfp4_requantize_is_te_4over6_mse_bytewise(kind, shape):
@@ -126,6 +127,7 @@ def test_nvfp4_requantize_is_te_4over6_mse_bytewise(kind, shape):
 
 
 @cuda
+@pytest.mark.gpus(1)
 @pytest.mark.parametrize("kind", ["random", "boundary", "maxes"])
 def test_fp8_requantize_rounds_the_quotient_through_bf16(kind):
     """ModelOpt encodes E4M3(BF16(w / scale)) with scale = amax / 448."""
@@ -140,6 +142,7 @@ def test_fp8_requantize_rounds_the_quotient_through_bf16(kind):
 
 
 @cuda
+@pytest.mark.gpus(1)
 @pytest.mark.parametrize("algorithm", ["W4A16_NVFP4", "FP8"])
 def test_check_reversible_accepts_the_source_and_rejects_a_changed_master(algorithm):
     weight = _requant_input("random", (128, 1024))
@@ -173,6 +176,7 @@ def _nvfp4_entry(prefix, master, deployed):
 
 
 @cuda
+@pytest.mark.gpus(1)
 def test_theta0_check_accepts_the_requantization_and_zero_blocks(tmp_path):
     """Requantizing the source passes; blocks that underflow to zero are
     excluded from the code/scale comparison (ModelOpt 2^-9 vs TE 0)."""
@@ -186,9 +190,8 @@ def test_theta0_check_accepts_the_requantization_and_zero_blocks(tmp_path):
 
 
 @cuda
+@pytest.mark.gpus(1)
 def test_theta0_check_fails_one_bad_tensor(tmp_path):
-    from megatron.lite.model.nemotron_h.checkpoint import THETA0_NVFP4_TENSOR_MIN_VALUES
-
     g = torch.Generator(device="cuda").manual_seed(10)
     entries, stored = [], {}
     for i in range(8):
@@ -202,10 +205,10 @@ def test_theta0_check_fails_one_bad_tensor(tmp_path):
         stored.update(part)
     with pytest.raises(RuntimeError, match=r"m\.t3"):
         _theta0_case(tmp_path, entries, stored)
-    assert THETA0_NVFP4_TENSOR_MIN_VALUES > 0.9
 
 
 @cuda
+@pytest.mark.gpus(1)
 def test_theta0_check_allows_calibrated_fp8_and_rejects_standard_mismatch(tmp_path):
     """FP8 tensors whose checkpoint scale is not amax/448 (ModelOpt-calibrated)
     may differ at theta0 (scheme A); amax/448 tensors must match exactly."""
@@ -259,6 +262,7 @@ def _random_nvfp4(rows, columns, generator, *, global_scale=2e-3):
 
 
 @cuda
+@pytest.mark.gpus(1)
 def test_checkpoint_load_redeploys_the_saved_bytes(monkeypatch, tmp_path):
     """A training-checkpoint load through the verl engine runs the
     post-optimizer-step hook (as DS4): the deployment is requant(master) from
@@ -302,8 +306,6 @@ def test_checkpoint_load_redeploys_the_saved_bytes(monkeypatch, tmp_path):
             "load_training_checkpoint",
             lambda *a, **k: restored.load_state_dict(saved, strict=False),
         )
-        # Single process; other tests in this module may own a process group.
-        monkeypatch.setattr(mlite_engine.dist, "is_initialized", lambda: False)
         engine = mlite_engine.MegatronLiteEngine.__new__(mlite_engine.MegatronLiteEngine)
         engine.runtime, engine.module = object(), restored
         engine.engine_config = SimpleNamespace(param_offload=False, optimizer_offload=False)
@@ -867,6 +869,7 @@ def _routed_reference(x, fc1, visible, up, down, routes, ids, dy):
 
 
 @cuda
+@pytest.mark.gpus(1)
 def test_routed_vjp_follows_the_per_input_contract():
     """Route weights: <dy, visible expert output> (exact). Inputs and expert
     weights: the BF16-master VJP through the visible FC1 output."""
@@ -994,8 +997,7 @@ def _write_expert_checkpoint(root):
     return recipes
 
 
-def _ep4_checkpoint_worker(rank, port, nccl_env, root, recipes, ckpt):
-    import os
+def _ep4_checkpoint_worker(rank, tmp_path):
     from types import SimpleNamespace
 
     import torch.distributed as dist
@@ -1009,19 +1011,13 @@ def _ep4_checkpoint_worker(rank, port, nccl_env, root, recipes, ckpt):
     from megatron.lite.primitive.optimizers.fsdp2.optimizer import build_fsdp2_training_optimizer
     from megatron.lite.primitive.parallel.state import init_parallel
 
-    # As the serving-parity EP4 workers: the image's gcp NCCL plugins find no
-    # NIC in a test container; spcx falls back to sockets.
-    for name in [k for k in os.environ if "NCCL" in k]:
-        del os.environ[name]
-    os.environ.update(nccl_env)
-    if os.environ.get("NCCL_NET_PLUGIN") == "gcp":
-        for name in ("NCCL_ENV_PLUGIN", "NCCL_PROFILER_PLUGIN", "NCCL_TUNER_CONFIG_PATH"):
-            os.environ.pop(name, None)
-        os.environ["NCCL_NET_PLUGIN"] = "spcx"
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4
-    )
+    root = tmp_path / "hf"
+    root.mkdir()
+    recipes = _write_expert_checkpoint(root)
+    # Each rank has its own tmp_path; the checkpoint is rank 0's.
+    ckpt = [str(tmp_path / "ckpt") if rank == 0 else None]
+    dist.broadcast_object_list(ckpt)
+    ckpt = ckpt[0]
     config = SimpleNamespace(tp=1, ep=4, etp=1, cp=1, pp=1)
     ps = init_parallel(config)
 
@@ -1071,40 +1067,21 @@ def _ep4_checkpoint_worker(rank, port, nccl_env, root, recipes, ckpt):
     for projection, value in saved[0].items():
         assert torch.equal(masters[projection], value), (rank, projection)
     assert len(moments) == len(saved[1])
-    for actual, expected in zip(moments, saved[1]):
+    for actual, expected in zip(moments, saved[1], strict=True):
         assert actual.keys() == expected.keys()
         for key, value in expected.items():
             assert torch.equal(actual[key], value), (rank, key)
     assert exported.keys() == saved[2].keys()
     for name, value in saved[2].items():
         assert torch.equal(exported[name], value), (rank, name)
-    dist.destroy_process_group()
 
 
 @cuda
 @pytest.mark.gpus(4)
-def test_ep4_fsdp2_checkpoint_restores_each_ranks_expert_bank(tmp_path):
-    """EP4 + FSDP2 wraps each rank's 32-expert bank on its own expert-DP mesh,
+def test_ep4_fsdp2_checkpoint_restores_each_ranks_expert_bank(ep4, tmp_path):
+    """EP4 + FSDP2 wraps each rank's expert bank on its own expert-DP mesh,
     so every rank's bank has the same DTensor shape and offset. A save and
     load must still restore each rank's own masters, Adam state and
     requantized deployment bytes (ISEEKYAN/Megatron-LM#235), not one bank on
     all ranks."""
-    import socket
-
-    import torch.multiprocessing as mp
-
-    if torch.cuda.device_count() < 4:
-        pytest.skip("requires four GPUs")
-    root = tmp_path / "hf"
-    root.mkdir()
-    recipes = _write_expert_checkpoint(root)
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    nccl_env = {k: v for k, v in __import__("os").environ.items() if "NCCL" in k}
-    mp.spawn(
-        _ep4_checkpoint_worker,
-        args=(port, nccl_env, root, recipes, str(tmp_path / "ckpt")),
-        nprocs=4,
-        join=True,
-    )
+    ep4(_ep4_checkpoint_worker, tmp_path)

@@ -32,7 +32,7 @@ from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
 def test_dist_opt_checkpoint_saves_buckets_in_place() -> None:
-    """dp_reshardable writes the optimizer's own buffers; nothing is gathered."""
+    """The distributed-optimizer checkpoint defaults to dp_reshardable."""
     assert _dist_opt_checkpoint_metadata(SimpleNamespace()) == DISTOPT_METADATA
 
 
@@ -72,10 +72,9 @@ def _assert_state_equal(actual, expected) -> None:
         assert actual == expected
 
 
+@pytest.mark.gpus(2)
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
-    import os
-
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import DTensor
@@ -141,14 +140,14 @@ def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
             dist.destroy_process_group()
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_dcp_save_does_not_keep_pinned_staging(monkeypatch, tmp_path) -> None:
     """DCP stages GPU shards in pinned memory; the save must not leave them cached."""
     import torch.distributed as dist
     from torch.distributed.device_mesh import init_device_mesh
 
-    if dist.is_initialized():
-        pytest.skip("needs to own a single-rank process group")
+    assert not dist.is_initialized(), "needs to own a single-rank process group"
     dist.init_process_group(
         "cpu:gloo,cuda:nccl", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
     )
@@ -357,6 +356,7 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_dist_opt_save_stages_main_model_replicas_in_pageable_host_memory() -> None:
     """GPU model state is written from pageable copies, not cached pinned buffers."""
@@ -400,8 +400,9 @@ def test_dist_opt_checkpoint_uses_local_stage_strategy(monkeypatch, tmp_path) ->
 def test_dist_opt_local_stage_saves_checkpoint_end_to_end(
     monkeypatch, tmp_path
 ) -> None:
-    if torch.distributed.is_initialized():
-        pytest.skip("requires ownership of the default process group")
+    assert not torch.distributed.is_initialized(), (
+        "requires ownership of the default process group"
+    )
     torch.distributed.init_process_group(
         "gloo",
         init_method=f"file://{tmp_path / 'dist-init'}",
@@ -522,10 +523,6 @@ def _run_two_ranks(target, *args) -> dict[int, str | None]:
                 worker.terminate()
 
 
-def _run_two_rank_save(tmp_path, kind, failing_file) -> dict[int, str | None]:
-    return _run_two_ranks(_save_with_failing_publish, tmp_path, kind, failing_file)
-
-
 @pytest.mark.parametrize(
     "kind, failing_file, failing_rank",
     [
@@ -545,7 +542,7 @@ def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metad
         (checkpoint / ".metadata").write_bytes(b"stale")
         (checkpoint / "metadata.json").write_text("{}")
 
-    errors = _run_two_rank_save(tmp_path, kind, failing_file)
+    errors = _run_two_ranks(_save_with_failing_publish, tmp_path, kind, failing_file)
 
     assert "simulated publish failure" in errors[failing_rank]
     assert "failed on another rank" in errors[1 - failing_rank]
@@ -556,7 +553,7 @@ def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metad
 
 def test_dist_opt_save_with_a_rank_without_shards_commits(tmp_path) -> None:
     """A rank with nothing to write still joins the publication collective."""
-    errors = _run_two_rank_save(tmp_path, "dist_opt_replicated", None)
+    errors = _run_two_ranks(_save_with_failing_publish, tmp_path, "dist_opt_replicated", None)
 
     assert errors == {0: None, 1: None}
     checkpoint = tmp_path / "ckpt" / "step_1"

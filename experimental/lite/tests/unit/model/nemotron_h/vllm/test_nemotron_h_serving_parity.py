@@ -52,7 +52,7 @@ def _random_nvfp4(rows, columns, generator, *, global_scale=2e-3):
 
 
 @pytest.fixture(scope="module")
-def vllm_oracle_runtime():
+def vllm_oracle_runtime(tmp_path_factory):
     import os
 
     import torch.distributed as dist
@@ -63,6 +63,8 @@ def vllm_oracle_runtime():
         set_current_vllm_config,
     )
     from vllm.distributed.parallel_state import (
+        destroy_distributed_environment,
+        destroy_model_parallel,
         ensure_model_parallel_initialized,
         init_distributed_environment,
     )
@@ -72,14 +74,13 @@ def vllm_oracle_runtime():
     )
 
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    for name, value in (
-        ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0"),
-        ("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29517"),
-    ):
+    for name, value in (("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0")):
         os.environ.setdefault(name, value)
     torch.cuda.set_device(0)
-    if not dist.is_initialized():
-        dist.init_process_group("nccl")
+    assert not dist.is_initialized(), "the vLLM oracle owns the default process group"
+    # A file store: under torchrun a tcp:// init would wait for the agent's store.
+    store = tmp_path_factory.mktemp("vllm_oracle") / "pg"
+    dist.init_process_group("nccl", init_method=f"file://{store}", rank=0, world_size=1)
     config = VllmConfig(
         parallel_config=ParallelConfig(distributed_executor_backend="mp"),
         compilation_config=CompilationConfig(custom_ops=["none", "+quant_fp8"]),
@@ -95,7 +96,9 @@ def vllm_oracle_runtime():
         if not is_workspace_manager_initialized():
             init_workspace_manager(torch.device("cuda", 0))
     # The direct kernels run outside any current vLLM config.
-    return config
+    yield config
+    destroy_model_parallel()
+    destroy_distributed_environment()
 
 
 def _oracle_quant_config(prefixes):
@@ -346,7 +349,7 @@ def test_cutedsl_rank_partials_equal_the_serving_runner_bitwise(rows, monkeypatc
         mine = ((ids // 32) == rank).reshape(-1)
         for got, ref in zip(saved, (fc1, visible, activated), strict=True):
             assert torch.equal(got, ref[mine]), rank
-    full =experts.ep_partials(x, routes, ids, ranks=1)[0]
+    full = experts.ep_partials(x, routes, ids, ranks=1)[0]
     assert torch.equal(full, _serving_rank(stacks, x, ids, routes, 0, ranks=1))
     # The saved per-route output is the one the partials combine: where a
     # rank owns a single slot of a token, its partial is that slot's output
@@ -390,46 +393,9 @@ def test_export_rounds_kv_scales_to_bf16():
         assert not torch.equal(value, source)
 
 
-# EP4 tests run four ranks in subprocesses so a plain pytest invocation works.
 # Per-rank source rows; a source rank with no tokens, and (last case) routes
 # that avoid rank 3's experts, so it receives no rows.
 EP4_ROWS = ((513, 7, 64, 1), (8192, 4096, 1, 2048), (0, 7, 64, 1), (33, 5, 0, 17))
-# Workers start from the NCCL environment at collection (vLLM's
-# init_batch_invariance exports more). The GB200 image's gcp NET/env plugins
-# find no NIC in a test container; the spcx plugin falls back to sockets.
-_COLLECTION_NCCL_ENV = {k: v for k, v in __import__("os").environ.items() if "NCCL" in k}
-
-
-def _spawn_ep4(worker, *args):
-    import socket
-
-    import torch.multiprocessing as mp
-
-    if torch.cuda.device_count() < 4:
-        pytest.skip("requires four GPUs")
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    mp.spawn(worker, args=(port, _COLLECTION_NCCL_ENV, *args), nprocs=4, join=True)
-
-
-def _init_ep4_rank(rank, port, nccl_env):
-    import os
-
-    import torch.distributed as dist
-
-    for name in [k for k in os.environ if "NCCL" in k]:
-        del os.environ[name]
-    os.environ.update(nccl_env)
-    if os.environ.get("NCCL_NET_PLUGIN") == "gcp":
-        for name in ("NCCL_ENV_PLUGIN", "NCCL_PROFILER_PLUGIN", "NCCL_TUNER_CONFIG_PATH"):
-            os.environ.pop(name, None)
-        os.environ["NCCL_NET_PLUGIN"] = "spcx"
-    os.environ["VLLM_BATCH_INVARIANT"] = "1"
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=4
-    )
 
 
 def _gather_rows(tensor):
@@ -442,7 +408,7 @@ def _gather_rows(tensor):
     return torch.cat(out), sum(sizes[: dist.get_rank()])
 
 
-def _ep4_deepep_worker(rank, port, nccl_env):
+def _ep4_deepep_worker(rank):
     from types import SimpleNamespace
 
     import torch.distributed as dist
@@ -453,7 +419,6 @@ def _ep4_deepep_worker(rank, port, nccl_env):
         routed_vjp,
     )
 
-    _init_ep4_rank(rank, port, nccl_env)
     g = torch.Generator(device="cuda").manual_seed(2)
     up = (torch.randn(128, 1856, 2688, generator=g, device="cuda") * 0.02).bfloat16()
     down = (torch.randn(128, 2688, 1856, generator=g, device="cuda") * 0.02).bfloat16()
@@ -484,7 +449,6 @@ def _ep4_deepep_worker(rank, port, nccl_env):
         for rows_per_rank in EP4_ROWS if snapshot == 0 else EP4_ROWS[:1]:
             _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
                             down_local, mine_experts, ep4_routed_experts, routed_vjp)
-    dist.destroy_process_group()
 
 
 def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
@@ -543,16 +507,17 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
 
 @cuda
 @pytest.mark.gpus(4, min_architecture="blackwell")
-def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise():
+def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise(ep4, monkeypatch):
     """Real EP4 over DeepEP: forward equals the single-rank EP4 serving
     reduction bitwise; backward is deterministic and matches the EP1 VJP.
     Each rank launches CuTe-DSL over its own 32 experts, as a serving rank
     does."""
     pytest.importorskip("deep_ep")
-    _spawn_ep4(_ep4_deepep_worker)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    ep4(_ep4_deepep_worker)
 
 
-def _flashinfer_combine_worker(rank, port, nccl_env):
+def _flashinfer_combine_worker(rank):
     import torch.distributed as dist
     from flashinfer.comm import Mapping
     from flashinfer.comm.comm_backend import TorchDistBackend
@@ -560,7 +525,6 @@ def _flashinfer_combine_worker(rank, port, nccl_env):
     from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
     from megatron.lite.model.nemotron_h.vllm.primitive.moe.communication import reduce_ep4_parts
 
-    _init_ep4_rank(rank, port, nccl_env)
     hidden, max_tokens = 2688, 1024
     a2a = MoeAlltoAll(
         Mapping(world_size=4, rank=rank, gpus_per_node=4, tp_size=4, moe_ep_size=4),
@@ -588,19 +552,18 @@ def _flashinfer_combine_worker(rank, port, nccl_env):
         combined = a2a.combine(payload, max(rows))
         parts = [partial(rank, dest, torch.arange(mine, device="cuda")) for dest in range(4)]
         assert torch.equal(combined, reduce_ep4_parts(parts, ids))
-    dist.destroy_process_group()
 
 
 @cuda
 @pytest.mark.gpus(4, min_architecture="blackwell")
-def test_flashinfer_one_sided_combine_matches_ep4_reduction_bitwise():
+def test_flashinfer_one_sided_combine_matches_ep4_reduction_bitwise(ep4, monkeypatch):
     """Guard against a FlashInfer upgrade changing the serving combine order."""
     pytest.importorskip("flashinfer.comm.trtllm_moe_alltoall")
-    _spawn_ep4(_flashinfer_combine_worker)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    ep4(_flashinfer_combine_worker)
 
 
-def _fsdp_requant_worker(rank, port, nccl_env):
-    import torch.distributed as dist
+def _fsdp_requant_worker(rank):
     from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
         Fp8TrainingLinear,
         HummingNvfp4Linear,
@@ -609,7 +572,6 @@ def _fsdp_requant_worker(rank, port, nccl_env):
     from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Shard, distribute_tensor
 
-    _init_ep4_rank(rank, port, nccl_env)
     mesh = init_device_mesh("cuda", (4,))
     g = torch.Generator(device="cuda").manual_seed(4)
     master = (torch.randn(512, 2688, generator=g, device="cuda") * 0.02).bfloat16()
@@ -642,13 +604,13 @@ def _fsdp_requant_worker(rank, port, nccl_env):
                 exported[name].reshape(-1).view(torch.uint8),
                 tensor.reshape(-1).view(torch.uint8),
             ), (algorithm, name)
-    dist.destroy_process_group()
 
 
 @cuda
 @pytest.mark.gpus(4, min_architecture="blackwell")
-def test_fsdp2_shard_requantizes_from_the_full_matrix():
+def test_fsdp2_shard_requantizes_from_the_full_matrix(ep4, monkeypatch):
     """Under FSDP2 a quantized layer tracks its FP32 shard: an optimizer update
     makes it stale, and the refresh requantizes the gathered BF16 matrix (the
     one the unsharded forward sees), so its scales come from the full matrix."""
-    _spawn_ep4(_fsdp_requant_worker)
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    ep4(_fsdp_requant_worker)
