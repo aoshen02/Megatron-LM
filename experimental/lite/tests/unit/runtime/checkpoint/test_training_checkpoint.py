@@ -572,14 +572,14 @@ def _save_then_resume(rank, world, tmp_path, kind, overwrite, missing_file, load
     from torch.distributed.device_mesh import init_device_mesh
 
     os.environ["MLITE_DCP_LOCAL_STAGE_DIR"] = str(tmp_path / "stage")
-    torch.cuda.synchronize = lambda *args, **kwargs: None
-    torch.cuda.current_device = lambda: torch.device("cpu")
     dist.init_process_group(
         "gloo", init_method=f"file://{tmp_path / 'dist-init'}", rank=rank, world_size=world
     )
     try:
         model = torch.nn.Linear(4, 2)
         if kind == "dist_opt":
+            torch.cuda.synchronize = lambda *args, **kwargs: None
+            torch.cuda.current_device = lambda: torch.device("cpu")
             attach_model_sharded_state_dict(
                 [model], ParallelState(dp_size=world, dp_rank=rank, dp_cp_rank=rank)
             )
@@ -606,10 +606,10 @@ def _save_then_resume(rank, world, tmp_path, kind, overwrite, missing_file, load
             try:
                 dcp.load_training_checkpoint(model, optimizer, path, **topology, **load_kwargs)
                 outcomes.append(None)
-            except Exception as exc:
+            except BaseException as exc:  # DCP's CheckpointException is a BaseException
                 outcomes.append(f"{type(exc).__name__}: {exc}")
         results.put((rank, outcomes))
-    except Exception as exc:
+    except BaseException as exc:
         results.put((rank, [f"save failed: {exc}"]))
     finally:
         dist.destroy_process_group()
