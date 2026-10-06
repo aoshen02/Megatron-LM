@@ -534,6 +534,42 @@ def test_vjp_past_the_recompile_limit_skips_dynamo_and_keeps_numerics(monkeypatc
         assert all(map(torch.equal, later[rows], expected))
 
 
+@pytest.mark.gpus(1)
+def test_vjp_past_the_recompile_limit_without_cache_api_keeps_asking_dynamo(monkeypatch):
+    """Without dynamo's private cache-entry API, the limit hit must not raise in
+    backward: new shapes run eager and every call still goes through dynamo."""
+    from megatron.lite.model.nemotron_h.vllm.primitive import dense
+
+    monkeypatch.setattr(dense, "_VJP_STATE", {})
+    monkeypatch.delattr(torch._dynamo.eval_frame, "_debug_get_cache_entry_list")
+
+    def vjp(*args):  # own code object: dynamo's cache is per code object
+        return dense._rms_norm_vjp(*args)
+
+    compiled = torch.compile(vjp, **dense._VJP_COMPILE)
+    entries = []
+
+    @functools.wraps(compiled)
+    def counted(*args):
+        entries.append(args[0].shape[0])
+        return compiled(*args)
+
+    weight = torch.empty(256, device="cuda").uniform_(0.5, 1.5)
+    inputs = {
+        rows: [torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        for rows in (64, 96, 128, 160)
+    }
+    with torch._dynamo.config.patch(recompile_limit=2):
+        for rows in (64, 96, 128, 160, 128):
+            out = dense.compiled_vjp_or_eager(
+                counted, dense._rms_norm_vjp, *inputs[rows], weight, 1e-5
+            )
+            if rows in (128, 160):
+                expected = dense._rms_norm_vjp(*inputs[rows], weight, 1e-5)
+                assert all(map(torch.equal, out, expected))
+    assert entries == [64, 96, 128, 160, 128]
+
+
 def _lightning_router():
     from types import SimpleNamespace
 

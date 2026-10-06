@@ -90,8 +90,11 @@ def _signature(args):
 
 
 def _cache_entries(compiled):
-    code = compiled._torchdynamo_orig_callable.__code__
-    return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
+    try:
+        code = compiled._torchdynamo_orig_callable.__code__
+        return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
+    except AttributeError:  # private dynamo API; without it, always ask dynamo
+        return None
 
 
 def compiled_vjp_or_eager(compiled, eager, *args):
@@ -104,18 +107,16 @@ def compiled_vjp_or_eager(compiled, eager, *args):
     cache entry was made by a call that returned here, so its (shape, dtype) is
     recorded; recorded signatures still go through dynamo's own guards. A cache
     reset (``torch._dynamo.reset``) drops the entry count, so new signatures
-    compile again. Raising the recompile limit at runtime is not seen.
+    compile again. Raising the recompile limit at runtime is not seen. If the
+    entry count is unavailable or zero (e.g. the global limit was hit), every
+    call goes through dynamo as before.
     """
     if not any(isinstance(arg, torch.Tensor) and arg.is_cuda for arg in args):
         return eager(*args)
     signature = _signature(args)
     state = _VJP_STATE.setdefault(compiled, [set(), None])
     signatures, full = state
-    if (
-        full is not None
-        and signature not in signatures
-        and _cache_entries(compiled) >= full
-    ):
+    if full and signature not in signatures and _cache_entries(compiled) >= full:
         return eager(*args)
     try:
         result = compiled(*args)
