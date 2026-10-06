@@ -482,6 +482,48 @@ def test_rms_norm_vjp_within_bf16_noise_floor(norm, kind):
     assert_within_noise_floor(names, actual, expected, reference, kind)
 
 
+@pytest.mark.gpus(1)
+def test_vjp_past_the_recompile_limit_skips_dynamo_and_keeps_numerics():
+    """Past the limit, new shapes run eager without entering dynamo (each entry
+    leaked ~2 KiB of guard-failure records); compiled shapes stay compiled."""
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
+        _VJP_COMPILE,
+        _rms_norm_vjp,
+        compiled_vjp_or_eager,
+    )
+
+    def vjp(*args):  # own code object: dynamo's cache is per code object
+        return _rms_norm_vjp(*args)
+
+    compiled = torch.compile(vjp, **_VJP_COMPILE)
+    entries = []
+
+    def counted(*args):
+        entries.append(args[0].shape[0])
+        return compiled(*args)
+
+    weight = torch.empty(256, device="cuda").uniform_(0.5, 1.5)
+    inputs = {
+        rows: [torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        for rows in (64, 96, 128, 160, 192)
+    }
+
+    def run(rows):
+        return compiled_vjp_or_eager(counted, _rms_norm_vjp, *inputs[rows], weight, 1e-5)
+
+    with torch._dynamo.config.patch(recompile_limit=2):
+        first = {rows: run(rows) for rows in (64, 96, 128)}
+        assert entries == [64, 96, 128]
+        later = {rows: run(rows) for rows in (160, 192, 128, 64, 96, 160)}
+    assert entries == [64, 96, 128, 64, 96]
+    for rows in (64, 96):
+        assert all(map(torch.equal, later[rows], first[rows]))
+        assert all(map(torch.equal, first[rows], compiled(*inputs[rows], weight, 1e-5)))
+    for rows in (128, 160, 192):
+        expected = _rms_norm_vjp(*inputs[rows], weight, 1e-5)
+        assert all(map(torch.equal, later[rows], expected))
+
+
 def _lightning_router():
     from types import SimpleNamespace
 
