@@ -162,7 +162,10 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     # hc_mult into the hidden dim ([B, S, hc_mult * H]); size the P2P buffer to match.
     # hc_mult defaults to 1, so this is a no-op for every other model.
     hc_mult = int(getattr(model_cfg, "hc_mult", 1) or 1)
-    return (local_seq_len, batch_size, int(model_cfg.hidden_size) * hc_mult)
+    hidden_size = getattr(model_cfg, "pipeline_hidden_size", None)
+    if hidden_size is None:
+        hidden_size = int(model_cfg.hidden_size) * hc_mult
+    return (local_seq_len, batch_size, int(hidden_size))
 
 
 def _last_loss_output(outputs: list[dict]) -> dict:
@@ -393,7 +396,8 @@ class MegatronLiteRuntime(RuntimeBase):
             )
         )
         get_placements, is_expert = _checkpoint_hooks(handle)
-        return load_training_checkpoint(
+        load_model = kwargs.pop("load_model", True)
+        step = load_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
             handle._optimizer,
             path,
@@ -404,10 +408,15 @@ class MegatronLiteRuntime(RuntimeBase):
             use_dcp=use_dcp,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=update_legacy_format,
-            load_model=kwargs.pop("load_model", True),
+            load_model=load_model,
             load_optimizer=kwargs.pop("load_optimizer", True),
             **kwargs,
         )
+        if load_model:
+            post_update_hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
+        return step
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
@@ -628,6 +637,10 @@ class MegatronLiteRuntime(RuntimeBase):
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
+        if update_successful:
+            hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(hook):
+                hook()
         return update_successful, float(grad_norm), num_zeros
 
     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:

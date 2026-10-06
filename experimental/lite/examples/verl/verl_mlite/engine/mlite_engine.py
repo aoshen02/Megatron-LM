@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.ckpt.local_stage import run_on_all_ranks
 from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
@@ -136,7 +137,7 @@ class _MegatronLiteLRScheduler:
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
             if param_group.get("weight_decay", None) is not None:
-                param_group["weight_decay"] = wd
+                param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
     def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
@@ -194,6 +195,13 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
+        # Without a scheduler, still apply wd_mult once: Megatron Core builds
+        # every group with the base weight decay and relies on the scheduler.
+        for param_group in optimizer.param_groups:
+            if param_group.get("weight_decay", None) is not None:
+                param_group["weight_decay"] = opt.weight_decay * param_group.get(
+                    "wd_mult", 1.0
+                )
         return None
 
     warmup_steps = opt.lr_warmup_steps if opt.lr_warmup_steps is not None else -1
@@ -468,6 +476,10 @@ class MegatronLiteEngine(BaseEngine):
         if reload_params_for_save:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
+        scheduler = self.handle._lr_scheduler
+        rank0_states = (
+            {_LR_SCHEDULER_STATE: scheduler.state_dict()} if scheduler is not None else None
+        )
         try:
             if save_model or save_optimizer:
                 save_training_checkpoint(
@@ -481,11 +493,7 @@ class MegatronLiteEngine(BaseEngine):
                     is_expert=expert_classifier,
                     save_model=save_model,
                     save_optimizer=save_optimizer,
-                )
-            if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(
-                    self.handle._lr_scheduler.state_dict(),
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    rank0_states=rank0_states,
                 )
             if save_hf_model:
                 self._save_hf_checkpoint(local_path)
@@ -559,6 +567,18 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
+            scheduler_state = []
+            if self.handle._lr_scheduler is not None:
+                run_on_all_ranks(
+                    lambda: scheduler_state.append(
+                        torch.load(
+                            os.path.join(local_path, _LR_SCHEDULER_STATE),
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    ),
+                    "reading the LR scheduler state",
+                )
             load_training_checkpoint(
                 self.module,
                 self.handle._optimizer,
@@ -570,15 +590,21 @@ class MegatronLiteEngine(BaseEngine):
                 load_model=True,
                 load_optimizer=True,
             )
-            scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
-            if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
-                state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
-                self.handle._lr_scheduler.load_state_dict(state)
+            post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
+            if scheduler_state:
+                self.handle._lr_scheduler.load_state_dict(scheduler_state[0])
             if dist.is_initialized():
                 dist.barrier()
         finally:
-            if reload_params_for_load:
-                self.to(device="cpu", model=True, optimizer=False, grad=False)
+            if reload_params_for_load or self.is_optimizer_offload_enabled:
+                self.to(
+                    device="cpu",
+                    model=reload_params_for_load,
+                    optimizer=self.is_optimizer_offload_enabled,
+                    grad=False,
+                )
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:

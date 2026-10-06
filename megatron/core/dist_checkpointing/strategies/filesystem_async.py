@@ -3,6 +3,7 @@
 """Storage writer for PyT Distributed format allowing asynchronous save."""
 
 import dataclasses
+import errno
 import inspect
 import logging
 import os
@@ -47,6 +48,93 @@ except ImportError:
     HAVE_PSUTIL = False
 
 _results_queue = None
+
+
+_EFAULT_RETRY_ENV = "MCORE_DIST_CKPT_EFAULT_RETRY"
+
+
+class _BounceWriter:
+    """Writes through fresh pageable copies in 1 MiB chunks instead of from the source buffer."""
+
+    def __init__(self, stream, chunk_bytes: int = 1 << 20):
+        self._stream = stream
+        self._chunk_bytes = chunk_bytes
+
+    def write(self, data) -> int:
+        """Write ``data`` chunk by chunk; returns its size."""
+        view = memoryview(data).cast("B")
+        for start in range(0, view.nbytes, self._chunk_bytes):
+            self._stream.write(bytes(view[start : start + self._chunk_bytes]))
+        return view.nbytes
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _root_os_error(exc: Optional[BaseException]) -> Optional[OSError]:
+    while exc is not None:
+        if isinstance(exc, OSError):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _write_item_checked(*args, **kwargs):
+    """``_write_item`` that reports the real I/O error of a failed item.
+
+    When a ``write()`` inside ``torch.save`` fails, torch's zip writer still writes
+    the end of the archive and raises ``unexpected pos ...`` instead, hiding the
+    original error. Re-raise with file, offset, item and the original error.
+
+    Payload writes to Lustre 2.17 from GB200 hosts intermittently fail with EFAULT,
+    with pinned and pageable staging buffers alike; the cause is not identified.
+    As a logged fallback, such an item is rewritten once from its start through
+    fresh 1 MiB bounce copies; set MCORE_DIST_CKPT_EFAULT_RETRY=0 to disable.
+
+    Args are those of ``_write_item``: optional transforms, then stream, data,
+    write_item and storage_key.
+    """
+    *transforms, stream, data, write_item, storage_key = args
+    start = stream.tell()
+
+    def describe(exc: BaseException) -> str:
+        os_error = _root_os_error(exc)
+        is_tensor = isinstance(data, torch.Tensor)
+        return (
+            f"file={getattr(stream, 'name', '?')} offset={start} item={write_item.index} "
+            f"bytes={data.untyped_storage().nbytes() if is_tensor else '?'} "
+            f"pinned={data.is_pinned() if is_tensor else '?'} "
+            f"error={os_error if os_error is not None else exc!r}"
+        )
+
+    try:
+        return _write_item(*args, **kwargs)
+    except Exception as exc:
+        description = describe(exc)
+        os_error = _root_os_error(exc)
+        retry = (
+            isinstance(data, torch.Tensor)
+            and os_error is not None
+            and os_error.errno == errno.EFAULT
+            and getattr(stream, "seekable", lambda: False)()
+            and os.environ.get(_EFAULT_RETRY_ENV, "1") != "0"
+        )
+        if not retry:
+            raise RuntimeError(f"Checkpoint write failed: {description}") from exc
+        logger.error(f"Checkpoint write failed, retrying through bounce buffers: {description}")
+        try:
+            stream.seek(start)
+            stream.truncate(start)
+            result = _write_item(
+                *transforms, _BounceWriter(stream), data, write_item, storage_key, **kwargs
+            )
+        except Exception as retry_exc:
+            raise RuntimeError(
+                f"Checkpoint write retry failed: {describe(retry_exc)}; "
+                f"first attempt: {description}"
+            ) from retry_exc
+    logger.warning(f"Checkpoint write retry succeeded: item={write_item.index}")
+    return result
 
 
 @_disable_gc()
@@ -404,7 +492,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             with open_file(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
                     local_results.append(
-                        _write_item(
+                        _write_item_checked(
                             *transform_list, stream, data, write_item, storage_key, **extra_kwargs
                         )
                     )
@@ -412,7 +500,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 for write_item, tensor in tensor_data:
                     assert tensor.is_cpu
                     local_results.append(
-                        _write_item(
+                        _write_item_checked(
                             *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
                         )
                     )

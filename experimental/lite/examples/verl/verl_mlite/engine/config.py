@@ -66,6 +66,8 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 "qat online export and native resync_format are mutually exclusive"
             )
+        if self.impl == "vllm" and self.param_offload:
+            raise ValueError("impl='vllm' requires param_offload=False")
         if self.router_replay_mode not in ("disabled", "R3"):
             raise ValueError(
                 "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "

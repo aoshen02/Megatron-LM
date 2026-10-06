@@ -220,7 +220,7 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
     model = TinyMLP()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
     parallel = ParallelConfig(tp=1, ep=1, pp=1, cp=1)
-    parallel_state = SimpleNamespace(pp_size=1, pp_rank=0)
+    parallel_state = SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0)
 
     with (
         patch("megatron.lite.primitive.ckpt.dcp._build_meshes", return_value=(None, None)),

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import random
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,11 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.ckpt.local_stage import (
+    NodeLocalStagingFileSystem as _NodeLocalStagingFileSystem,
+    local_stage_root,
+    run_on_all_ranks,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -45,8 +50,13 @@ def save_training_checkpoint(
     save_rng: bool = True,
     save_model: bool = True,
     save_optimizer: bool = True,
+    rank0_states: Mapping[str, Any] | None = None,
 ) -> None:
-    """Save training checkpoint using DTensor + DCP for automatic resharding."""
+    """Save training checkpoint using DTensor + DCP for automatic resharding.
+
+    ``rank0_states`` maps file names under ``path`` to states that rank 0 saves
+    before the checkpoint is committed.
+    """
     if path is None and isinstance(step, str):
         path = step
         step = 0
@@ -60,12 +70,14 @@ def save_training_checkpoint(
         return
     if _supports_dist_opt_distckpt(model, optimizer):
         ckpt_path = os.path.join(path, f"step_{step}")
-        os.makedirs(ckpt_path, exist_ok=True)
+        _uncommit_checkpoint_dir(ckpt_path)
+        _save_rank_files(
+            None, path, ckpt_path, save_optimizer=False, save_rng=save_rng,
+            rank0_states=rank0_states,
+        )
         _save_dist_opt_checkpoint(
             model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
         )
-        if save_rng:
-            _save_rng_sidecar(ckpt_path)
         log_rank0(f"Saved dist_opt checkpoint at step {step} to {ckpt_path}")
         return
     if config is None or ps is None:
@@ -84,16 +96,68 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
+            state_dict[key] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
-    os.makedirs(ckpt_path, exist_ok=True)
-    dcp.save(state_dict, checkpoint_id=ckpt_path)
-    if save_optimizer:
-        _save_optimizer_checkpoint(optimizer, ckpt_path)
-    if save_rng:
-        _save_rng_sidecar(ckpt_path)
+    _uncommit_checkpoint_dir(ckpt_path)
+    _save_rank_files(
+        optimizer, path, ckpt_path, save_optimizer=save_optimizer, save_rng=save_rng,
+        rank0_states=rank0_states,
+    )
+    storage_writer = _staged_dcp_writer(ckpt_path)
+    dcp.save(
+        state_dict,
+        checkpoint_id=ckpt_path,
+        storage_writer=storage_writer,
+    )
+    # DCP stages the rank's shards in pinned memory; do not keep them cached.
+    empty_host_cache = getattr(torch.accelerator, "empty_host_cache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
+
+
+def _is_rank0() -> bool:
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _uncommit_checkpoint_dir(ckpt_path: str) -> None:
+    """Remove an older save's files, commit markers first, before any rank writes."""
+
+    def prepare() -> None:
+        os.makedirs(ckpt_path, exist_ok=True)
+        if _is_rank0():
+            for marker in (".metadata", "metadata.json"):
+                Path(ckpt_path, marker).unlink(missing_ok=True)
+            for entry in Path(ckpt_path).iterdir():
+                if not entry.is_dir():
+                    entry.unlink()
+
+    run_on_all_ranks(prepare, "preparing the checkpoint directory")
+
+
+def _save_rank_files(
+    optimizer,
+    path: str,
+    ckpt_path: str,
+    *,
+    save_optimizer: bool,
+    save_rng: bool,
+    rank0_states: Mapping[str, Any] | None,
+) -> None:
+    """Write the per-rank sidecars before the checkpoint's collective .metadata commit."""
+
+    def save() -> None:
+        if save_optimizer:
+            _save_optimizer_checkpoint(optimizer, ckpt_path)
+        if save_rng:
+            _save_rng_sidecar(ckpt_path)
+        if rank0_states and _is_rank0():
+            for name, state in rank0_states.items():
+                _torch_save_with_optional_staging(state, os.path.join(path, name))
+
+    run_on_all_ranks(save, "saving per-rank checkpoint files")
 
 
 def load_training_checkpoint(
@@ -124,6 +188,7 @@ def load_training_checkpoint(
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
+        _check_rank_files(ckpt_path, optimizer=False, rng=load_rng)
         step = _load_dist_opt_checkpoint(
             model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
         )
@@ -146,15 +211,15 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
-            )
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
+            state_dict[key] = _empty_dcp_tensor_like_param(param, mesh, placements)
 
+    _check_rank_files(ckpt_path, optimizer=load_optimizer and optimizer is not None, rng=load_rng)
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
         for name, param in model.named_parameters():
-            key = f"{model_prefix}.{name}"
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():
@@ -168,6 +233,22 @@ def load_training_checkpoint(
         _load_rng_sidecar(ckpt_path)
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
     return step
+
+
+def _check_rank_files(ckpt_path: str, *, optimizer: bool, rng: bool) -> None:
+    """Fail on every rank, before the collective load, if any rank lacks a sidecar."""
+
+    def check() -> None:
+        required = []
+        if optimizer:
+            required.append((_optimizer_checkpoint_path(ckpt_path), "load_optimizer=False"))
+        if rng:
+            required.append((_rng_sidecar_file(ckpt_path), "load_rng=False"))
+        for file, flag in required:
+            if not os.path.exists(file):
+                raise FileNotFoundError(f"checkpoint file {file} is missing; pass {flag}")
+
+    run_on_all_ranks(check, "checking the checkpoint's per-rank files")
 
 
 def _resolve_step_checkpoint_path(path: str) -> str:
@@ -205,7 +286,13 @@ def _save_dist_opt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import save_dist_opt_checkpoint
 
     save_dist_opt_checkpoint(
-        model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
+        model,
+        optimizer,
+        step,
+        path,
+        save_model=save_model,
+        save_optimizer=save_optimizer,
+        local_stage_root=local_stage_root(),
     )
 
 
@@ -229,6 +316,31 @@ def _optimizer_checkpoint_path(path: str) -> str:
     return os.path.join(path, f"optimizer_rank_{rank}.pt")
 
 
+def _staged_dcp_writer(checkpoint_path: str):
+    filesystem = _local_staging_filesystem()
+    if filesystem is None:
+        return None
+    writer = dcp.FileSystemWriter(checkpoint_path)
+    writer.fs = filesystem
+    return writer
+
+
+def _local_staging_filesystem() -> _NodeLocalStagingFileSystem | None:
+    stage_root = local_stage_root()
+    return _NodeLocalStagingFileSystem(stage_root) if stage_root is not None else None
+
+
+def _torch_save_with_optional_staging(
+    state: Any, destination: str | os.PathLike[str]
+) -> None:
+    filesystem = _local_staging_filesystem()
+    if filesystem is None:
+        torch.save(state, destination)
+        return
+    with filesystem.create_stream(os.fspath(destination), "wb") as stream:
+        torch.save(state, stream)
+
+
 def _save_optimizer_checkpoint(optimizer, path: str) -> None:
     if optimizer is None:
         log_rank0("Skipping optimizer checkpoint save because optimizer is None")
@@ -236,7 +348,9 @@ def _save_optimizer_checkpoint(optimizer, path: str) -> None:
     state_dict_fn = getattr(optimizer, "state_dict", None)
     if not callable(state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide state_dict().")
-    torch.save(state_dict_fn(), _optimizer_checkpoint_path(path))
+    _torch_save_with_optional_staging(
+        state_dict_fn(), _optimizer_checkpoint_path(path)
+    )
 
 
 def _load_optimizer_checkpoint(optimizer, path: str) -> None:
@@ -244,13 +358,12 @@ def _load_optimizer_checkpoint(optimizer, path: str) -> None:
         log_rank0("Skipping optimizer checkpoint load because optimizer is None")
         return
     ckpt_path = _optimizer_checkpoint_path(path)
-    if not os.path.exists(ckpt_path):
-        log_rank0(f"No optimizer checkpoint found at {ckpt_path}; loading model state only")
-        return
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = torch.load(
+        ckpt_path, map_location="cpu", weights_only=False, mmap=True
+    )
     load_state_dict_fn(state)
 
 
@@ -279,6 +392,14 @@ def _is_dtensor_like(tensor: Any) -> bool:
         and hasattr(tensor, "device_mesh")
         and hasattr(tensor, "placements")
     )
+
+
+def _model_checkpoint_key(prefix, name, ps, is_expert):
+    # FSDP DTensors describe the DP shard, not the identity of EP-local experts.
+    # Include EP size so incompatible topologies cannot silently restore a subset.
+    if ps.ep_size > 1 and is_expert(name):
+        prefix = f"{prefix}_ep{ps.ep_size}_rank{ps.ep_rank}"
+    return f"{prefix}.{name}"
 
 
 def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
@@ -432,14 +553,11 @@ def _restore_rng_state(state: dict[str, Any] | None) -> None:
 def _save_rng_sidecar(path: str | os.PathLike[str]) -> None:
     rng_file = _rng_sidecar_file(path)
     rng_file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_get_rng_state(), rng_file)
+    _torch_save_with_optional_staging(_get_rng_state(), rng_file)
 
 
 def _load_rng_sidecar(path: str | os.PathLike[str]) -> None:
     rng_file = _rng_sidecar_file(path)
-    if not rng_file.exists():
-        log_rank0(f"RNG sidecar not found at {rng_file}; skipping RNG restore.")
-        return
     _restore_rng_state(torch.load(rng_file, map_location="cpu", weights_only=False))
 
 
