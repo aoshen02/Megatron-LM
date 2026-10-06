@@ -5,6 +5,8 @@ within the BF16 noise floor of the plain BF16 computation. The requantization
 must be the rule that produced the Lightning checkpoint, byte for byte.
 """
 
+import functools
+
 import pytest
 import torch
 from megatron.lite.model.nemotron_h.quantization import (
@@ -480,6 +482,92 @@ def test_rms_norm_vjp_within_bf16_noise_floor(norm, kind):
     names = {"rms": ("dx",), "residual_rms": ("dx", "dresidual")}
     names = (*names.get(norm, ("dx", "dgate")), "dweight")
     assert_within_noise_floor(names, actual, expected, reference, kind)
+
+
+@pytest.mark.gpus(1)
+def test_vjp_past_the_recompile_limit_skips_dynamo_and_keeps_numerics(monkeypatch):
+    """Past the limit, new shapes run eager without entering dynamo (each entry
+    leaked ~2 KiB of guard-failure records); compiled shapes stay compiled, a
+    recorded shape with other strides is still judged by dynamo's guards, and a
+    dynamo cache reset lets new shapes compile again."""
+    from megatron.lite.model.nemotron_h.vllm.primitive import dense
+
+    monkeypatch.setattr(dense, "_VJP_STATE", {})
+
+    def vjp(*args):  # own code object: dynamo's cache is per code object
+        return dense._rms_norm_vjp(*args)
+
+    compiled = torch.compile(vjp, **dense._VJP_COMPILE)
+    entries = []
+
+    @functools.wraps(compiled)
+    def counted(*args):
+        entries.append(args[0].shape[0])
+        return compiled(*args)
+
+    weight = torch.empty(256, device="cuda").uniform_(0.5, 1.5)
+    inputs = {
+        rows: [torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        for rows in (64, 96, 128, 160, 192)
+    }
+    strided = [inputs[64][0], inputs[64][1].t().contiguous().t()]
+
+    def run(*args):
+        return dense.compiled_vjp_or_eager(counted, dense._rms_norm_vjp, *args, weight, 1e-5)
+
+    with torch._dynamo.config.patch(recompile_limit=2):
+        first = {rows: run(*inputs[rows]) for rows in (64, 96, 128)}
+        assert entries == [64, 96, 128]
+        later = {rows: run(*inputs[rows]) for rows in (160, 192, 128, 64, 96, 160)}
+        assert entries == [64, 96, 128, 64, 96]
+        assert all(map(torch.equal, run(*strided), dense._rms_norm_vjp(*strided, weight, 1e-5)))
+        assert entries == [64, 96, 128, 64, 96, 64]
+        torch._dynamo.eval_frame.reset_code(vjp.__code__)
+        run(*inputs[160])
+        run(*inputs[192])
+        assert entries[-2:] == [160, 192]
+    for rows in (64, 96):
+        assert all(map(torch.equal, later[rows], first[rows]))
+        assert all(map(torch.equal, first[rows], compiled(*inputs[rows], weight, 1e-5)))
+    for rows in (128, 160, 192):
+        expected = dense._rms_norm_vjp(*inputs[rows], weight, 1e-5)
+        assert all(map(torch.equal, later[rows], expected))
+
+
+@pytest.mark.gpus(1)
+def test_vjp_past_the_recompile_limit_without_cache_api_keeps_asking_dynamo(monkeypatch):
+    """Without dynamo's private cache-entry API, the limit hit must not raise in
+    backward: new shapes run eager and every call still goes through dynamo."""
+    from megatron.lite.model.nemotron_h.vllm.primitive import dense
+
+    monkeypatch.setattr(dense, "_VJP_STATE", {})
+    monkeypatch.delattr(torch._dynamo.eval_frame, "_debug_get_cache_entry_list")
+
+    def vjp(*args):  # own code object: dynamo's cache is per code object
+        return dense._rms_norm_vjp(*args)
+
+    compiled = torch.compile(vjp, **dense._VJP_COMPILE)
+    entries = []
+
+    @functools.wraps(compiled)
+    def counted(*args):
+        entries.append(args[0].shape[0])
+        return compiled(*args)
+
+    weight = torch.empty(256, device="cuda").uniform_(0.5, 1.5)
+    inputs = {
+        rows: [torch.randn(rows, 256, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+        for rows in (64, 96, 128, 160)
+    }
+    with torch._dynamo.config.patch(recompile_limit=2):
+        for rows in (64, 96, 128, 160, 128):
+            out = dense.compiled_vjp_or_eager(
+                counted, dense._rms_norm_vjp, *inputs[rows], weight, 1e-5
+            )
+            if rows in (128, 160):
+                expected = dense._rms_norm_vjp(*inputs[rows], weight, 1e-5)
+                assert all(map(torch.equal, out, expected))
+    assert entries == [64, 96, 128, 160, 128]
 
 
 def _lightning_router():
