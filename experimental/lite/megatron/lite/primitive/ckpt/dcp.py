@@ -112,7 +112,9 @@ def save_training_checkpoint(
         storage_writer=storage_writer,
     )
     # DCP stages the rank's shards in pinned memory; do not keep them cached.
-    torch.accelerator.empty_host_cache()
+    empty_host_cache = getattr(torch.accelerator, "empty_host_cache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
 
 
