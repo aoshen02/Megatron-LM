@@ -79,8 +79,8 @@ def projection(x, module):
     raise TypeError(f"Unsupported Nemotron projection: {type(module).__name__}")
 
 
-_COMPILED_SIGNATURES = {}
-_RECOMPILE_LIMIT_HIT = set()
+# compiled -> [signatures that ran compiled, dynamo cache entries when the limit was hit]
+_VJP_STATE = {}
 
 
 def _signature(args):
@@ -89,28 +89,40 @@ def _signature(args):
     )
 
 
+def _cache_entries(compiled):
+    code = compiled._torchdynamo_orig_callable.__code__
+    return len(torch._dynamo.eval_frame._debug_get_cache_entry_list(code))
+
+
 def compiled_vjp_or_eager(compiled, eager, *args):
     """``compiled`` for every input it compiled for, ``eager`` otherwise.
 
     With ``use_dynamic_bsz`` most backward shapes are new once the recompile
     limit is hit. Each such call would still enter dynamo, fail every guard and
-    leave ~2 KiB in its global tables, so after the limit an input whose
-    signature never ran compiled goes straight to ``eager``. The signature
-    (shape, dtype) is a subset of the static-shape guards, so no input that
-    matches a compiled entry is sent to eager.
+    leave ~2 KiB in its global tables, so while dynamo's cache stays full an
+    input whose signature never ran compiled goes straight to ``eager``. Every
+    cache entry was made by a call that returned here, so its (shape, dtype) is
+    recorded; recorded signatures still go through dynamo's own guards. A cache
+    reset (``torch._dynamo.reset``) drops the entry count, so new signatures
+    compile again. Raising the recompile limit at runtime is not seen.
     """
     if not any(isinstance(arg, torch.Tensor) and arg.is_cuda for arg in args):
         return eager(*args)
     signature = _signature(args)
-    compiled_signatures = _COMPILED_SIGNATURES.setdefault(compiled, set())
-    if compiled in _RECOMPILE_LIMIT_HIT and signature not in compiled_signatures:
+    state = _VJP_STATE.setdefault(compiled, [set(), None])
+    signatures, full = state
+    if (
+        full is not None
+        and signature not in signatures
+        and _cache_entries(compiled) >= full
+    ):
         return eager(*args)
     try:
         result = compiled(*args)
     except torch._dynamo.exc.FailOnRecompileLimitHit:
-        _RECOMPILE_LIMIT_HIT.add(compiled)
+        state[1] = _cache_entries(compiled)
         return eager(*args)
-    compiled_signatures.add(signature)
+    signatures.add(signature)
     return result
 
 
