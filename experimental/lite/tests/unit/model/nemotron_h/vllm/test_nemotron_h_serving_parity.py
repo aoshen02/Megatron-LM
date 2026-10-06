@@ -505,6 +505,18 @@ def _check_ep4_rows(rank, rows_per_rank, ep, owner, full, up, down, up_local,
         assert error < 1e-2, (name, error)
 
 
+def _fail_on_rank_2(rank):
+    assert rank != 2, "rank 2 mismatch"
+
+
+@cuda
+@pytest.mark.gpus(4)
+def test_ep4_failure_on_one_rank_fails_every_rank_at_once(ep4):
+    """The other ranks must not wait in a collective until the NCCL timeout."""
+    with pytest.raises(BaseException, match="rank 2 mismatch"):
+        ep4(_fail_on_rank_2)
+
+
 @cuda
 @pytest.mark.gpus(4, min_architecture="blackwell")
 def test_ep4_deepep_routed_experts_match_serving_reduction_bitwise(ep4, monkeypatch):

@@ -39,26 +39,31 @@ def _exact_size_pinned_empty(tensor: torch.Tensor) -> torch.Tensor:
     which rounds every block up to a power of two; per-parameter optimizer-state
     buffers then cost up to 2x their size (146.9 GiB pinned for 88.2 GiB of state
     per rank on Nemotron-H). Page-locking a private anonymous mapping in place is
-    exact; it is unregistered and unmapped when the tensor is freed.
+    exact; it is unregistered and unmapped when the storage is freed.
     """
     nbytes = tensor.numel() * tensor.element_size()
     if nbytes < _EXACT_PIN_MIN_BYTES:
         return torch.empty(tensor.size(), dtype=tensor.dtype, device="cpu", pin_memory=True)
     region = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
-    buf = torch.frombuffer(region, dtype=tensor.dtype, count=tensor.numel()).view(tensor.size())
+    # The storage holds the only reference to ``owner``, so ``owner`` dies with the
+    # storage, not with any one tensor viewing it.
+    owner = memoryview(region)
+    buf = torch.frombuffer(owner, dtype=tensor.dtype, count=tensor.numel()).view(tensor.size())
     ptr = buf.data_ptr()
     cudart = torch.cuda.cudart()
     err = cudart.cudaHostRegister(ptr, nbytes, 0)
     if int(err) != 0:
         raise RuntimeError(f"cudaHostRegister of {nbytes} bytes failed: {err}")
 
-    def unregister() -> None:
-        # Pending async copies may still read the buffer.
+    def unregister(region: mmap.mmap) -> None:
+        # Pending async copies may still read the buffer. ``region`` is kept mapped
+        # until this returns.
         torch.cuda.synchronize()
         cudart.cudaHostUnregister(ptr)
 
-    # Runs before the storage drops its reference to ``region``.
-    weakref.finalize(buf, unregister)
+    # Not run at exit: a wedged device would hang the sync, and exit unmaps anyway.
+    weakref.finalize(owner, unregister, region).atexit = False
+    del owner
     return buf
 
 

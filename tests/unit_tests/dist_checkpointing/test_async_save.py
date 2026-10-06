@@ -135,18 +135,18 @@ _NVRX_SUBMODULES = [
 
 
 class _FailingLargeWrites(io.BytesIO):
-    """Fails the first ``failures`` writes larger than 1 MiB with ``err``."""
+    """Fails successive writes of at least ``min_bytes`` with the errnos in ``errs``."""
 
     name = "/ckpt/__0_0.distcp"
 
-    def __init__(self, err, failures):
+    def __init__(self, *errs, min_bytes=(1 << 20) + 1):
         super().__init__()
-        self.err, self.failures = err, failures
+        self.errs, self.min_bytes = list(errs), min_bytes
 
     def write(self, data):
-        if memoryview(data).nbytes > (1 << 20) and self.failures > 0:
-            self.failures -= 1
-            raise OSError(self.err, os.strerror(self.err))
+        if memoryview(data).nbytes >= self.min_bytes and self.errs:
+            err = self.errs.pop(0)
+            raise OSError(err, os.strerror(err))
         return super().write(data)
 
 
@@ -187,14 +187,14 @@ def _write_tensor(stream, tensor):
 class TestWriteItemChecked:
     def test_failed_write_reports_the_original_error(self):
         """torch.save alone would surface only "unexpected pos ..."."""
-        stream = _FailingLargeWrites(errno.ENOSPC, failures=1)
+        stream = _FailingLargeWrites(errno.ENOSPC)
         stream.write(b"x" * 64)
         with pytest.raises(RuntimeError, match="offset=64 item=.*decoder.weight.*No space"):
             _write_tensor(stream, torch.randn(1 << 20))
 
     def test_efault_is_rewritten_once_through_bounce_buffers(self):
         tensor = torch.randn(1 << 20)
-        stream = _FailingLargeWrites(errno.EFAULT, failures=1)
+        stream = _FailingLargeWrites(errno.EFAULT)
         stream.write(b"x" * 64)
 
         result = _write_tensor(stream, tensor)
@@ -204,9 +204,22 @@ class TestWriteItemChecked:
         restored = torch.load(io.BytesIO(stream.getvalue()[info.offset :]), weights_only=True)
         assert torch.equal(restored, tensor)
 
+    def test_failed_retry_reports_both_errors(self):
+        """The bounce write fails too (1 MiB chunks hit ENOSPC)."""
+        stream = _FailingLargeWrites(errno.EFAULT, errno.ENOSPC, min_bytes=1 << 20)
+        with pytest.raises(
+            RuntimeError, match="retry failed: .*No space.*first attempt: .*Bad address"
+        ) as info:
+            _write_tensor(stream, torch.randn(1 << 20))
+        chain, exc = [], info.value
+        while exc is not None:
+            chain.append(exc)
+            exc = exc.__cause__ or exc.__context__
+        assert any(isinstance(e, OSError) and e.errno == errno.EFAULT for e in chain)
+
     def test_efault_retry_can_be_disabled(self, monkeypatch):
         monkeypatch.setenv("MCORE_DIST_CKPT_EFAULT_RETRY", "0")
-        stream = _FailingLargeWrites(errno.EFAULT, failures=1)
+        stream = _FailingLargeWrites(errno.EFAULT)
         with pytest.raises(RuntimeError, match="Bad address"):
             _write_tensor(stream, torch.randn(1 << 20))
 

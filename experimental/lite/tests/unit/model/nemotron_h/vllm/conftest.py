@@ -36,7 +36,20 @@ def ep4(_ep4_group):
     import torch.distributed as dist
 
     def run(worker, *args):
-        worker(dist.get_rank(), *args)
-        dist.barrier()
+        # Exchange outcomes so a failure on one rank fails every rank at once
+        # instead of leaving the others in a barrier until the NCCL timeout.
+        rank, error = dist.get_rank(), None
+        try:
+            worker(rank, *args)
+        except BaseException as exc:  # pytest skips and fails too
+            error = exc
+        message = None if error is None else f"{type(error).__name__}: {error}"
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, message)
+        if error is not None:
+            raise error
+        failed = {r: e for r, e in enumerate(errors) if e is not None}
+        if failed:
+            pytest.fail(f"failed on other ranks: {failed}")
 
     return run
