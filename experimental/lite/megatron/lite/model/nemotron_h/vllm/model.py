@@ -161,12 +161,10 @@ class NemotronHModel(nn.Module):
 
 
 def attention_kv_scales(config, impl, layer_range, *, device):
-    """Per attention layer, the checkpoint's (k_scale, v_scale) when attention
-    serves the release's static FP8 KV cache. The BF16 activation mode attends
-    over a BF16 cache: no scales, so none are loaded or exported (the rollout's
-    BF16 KV cache does not use them either)."""
-    if impl.activation_precision != "release":
-        return {}
+    """Per attention layer, the checkpoint's (k_scale, v_scale). The release
+    attends over the static FP8 KV cache with them; the BF16 activation mode
+    attends over a BF16 cache and only exports them unchanged, since vLLM's
+    ModelOpt KV-cache method waits for them on every refit."""
     attention_ids = [
         i
         for i in range(*layer_range)

@@ -12,17 +12,21 @@ class Fa4KVAttention(torch.nn.Module):
     """Serving FA4 (``FlashAttnFixedSplitBackend``) with 6768-token pages and
     the fixed split-KV schedule. Causal packed sequences starting at zero.
 
-    With KV scales: the release's static FP8 KV cache, FP8 query and KV
-    quantization with fixed scales. Without (the BF16 activation mode,
-    ``kv_cache_dtype=bfloat16``): BF16 query and KV.
+    ``fp8`` (the release): static FP8 KV cache, FP8 query and KV quantization
+    with the fixed scales. Otherwise (the BF16 activation mode,
+    ``kv_cache_dtype=bfloat16``): BF16 query and KV; the checkpoint's scales,
+    if given, are only held so the weight export keeps sending them, because
+    vLLM's ModelOpt KV-cache method still expects them on every refit.
     """
 
-    def __init__(self, num_heads, num_kv_heads, head_dim, k_scale=None, v_scale=None):
+    def __init__(self, num_heads, num_kv_heads, head_dim, k_scale=None, v_scale=None, *, fp8=None):
         super().__init__()
         if (k_scale is None) != (v_scale is None):
             raise ValueError("Expected both FP8 KV scales or neither")
-        self.fp8 = k_scale is not None
-        if self.fp8:
+        self.fp8 = k_scale is not None if fp8 is None else fp8
+        if self.fp8 and k_scale is None:
+            raise ValueError("The FP8 KV cache needs the checkpoint's KV scales")
+        if k_scale is not None:
             self.register_buffer("k_scale", k_scale.detach().clone())
             self.register_buffer("v_scale", v_scale.detach().clone())
         self.scale = head_dim**-0.5
@@ -140,8 +144,9 @@ class Fa4KVAttention(torch.nn.Module):
 class Attention(nn.Module):
     """Nemotron's non-rotary attention; query width is independent of hidden size.
 
-    ``fp8_kv_scales`` is the checkpoint's (k_scale, v_scale) for the static FP8
-    KV cache, or None for a BF16 one (the BF16 activation mode).
+    ``fp8_kv_scales`` is the checkpoint's (k_scale, v_scale). The projection
+    factory's activation precision picks the static FP8 KV cache (release) or
+    a BF16 one (the BF16 activation mode), which keeps the scales for export.
     """
 
     def __init__(
@@ -165,6 +170,7 @@ class Attention(nn.Module):
             config.num_key_value_heads,
             config.head_dim,
             *(scale.to(device=device) for scale in scales),
+            fp8=getattr(projection_factory, "fp8_activations", True),
         )
         for name, heads in (
             ("q_proj", config.num_attention_heads),

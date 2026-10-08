@@ -518,10 +518,10 @@ def test_export_rounds_kv_scales_to_bf16():
 
 @pytest.mark.parametrize("activation_precision", ["release", "bf16"])
 def test_activation_precision_selects_the_attention_kv_cache(tmp_path, activation_precision):
-    """The release mode attends over the static FP8 KV cache and loads and
-    exports the checkpoint's KV scales; the BF16 mode (kv_cache_dtype=bfloat16)
-    attends over a BF16 cache and has no scales for the loader or the refit,
-    although the checkpoint carries them."""
+    """The release mode attends over the static FP8 KV cache with the
+    checkpoint's KV scales; the BF16 mode (kv_cache_dtype=bfloat16) attends over
+    a BF16 cache. Both export the scales unchanged: vLLM's ModelOpt KV-cache
+    method waits for them on every refit, whatever the cache dtype."""
     import json
     from types import SimpleNamespace
 
@@ -544,22 +544,27 @@ def test_activation_precision_selects_the_attention_kv_cache(tmp_path, activatio
     )
     impl = SimpleNamespace(hf_path=str(tmp_path), activation_precision=activation_precision)
     kv = attention_kv_scales(config, impl, (0, 6), device="cpu")
+    fp8 = activation_precision == "release"
+
+    class Factory:
+        fp8_activations = fp8
+
+        def __call__(self, _name, *shape, **kwargs):
+            return torch.nn.Linear(*shape, **kwargs)
+
     attention = Attention(
         config, None,
         fp8_kv_scales=kv.get(5),
-        projection_factory=lambda _name, *shape, **kwargs: torch.nn.Linear(*shape, **kwargs),
+        projection_factory=Factory(),
         hf_prefix="backbone.layers.5.mixer",
     )
-    fp8 = activation_precision == "release"
     assert attention.kv_attention.fp8 is fp8
     model = torch.nn.Module()
     model.add_module("layers", torch.nn.ModuleDict({"5": torch.nn.Module()}))
     model.layers["5"].add_module("mixer", attention)
-    expected = set(scales) if fp8 else set()
-    assert {name for name, _ in hf_tensor_views(model)} & set(scales) == expected
-    assert dict(NemotronExport.iter_export_tensors(None, model)).keys() & set(scales) == expected
-    if fp8:
-        assert torch.equal(attention.kv_attention.k_scale, scales[min(scales)])
+    assert {name for name, _ in hf_tensor_views(model)} & set(scales) == set(scales)
+    assert dict(NemotronExport.iter_export_tensors(None, model)).keys() & set(scales) == set(scales)
+    assert torch.equal(attention.kv_attention.k_scale, scales[min(scales)])
 
 
 # Per-rank source rows; a source rank with no tokens, and (last case) routes
