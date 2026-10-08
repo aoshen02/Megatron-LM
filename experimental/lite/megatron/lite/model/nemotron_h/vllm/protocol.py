@@ -125,10 +125,16 @@ def _validate_full_depth(config, source):
         config.moe_shared_expert_intermediate_size,
     ) != (131072, 32, 2, 128, 64, 64, 8, 128, 4, 128, 1, 3712):
         raise ValueError("Expected full Lightning attention/SSM/shared geometry")
+    quantized = config.quantization_config.get("quantized_layers") or {}
+    # Mamba in/out_proj are either all FP8 (the release) or all BF16 Linear
+    # (a derived checkpoint that serves them without FP8 activations).
+    fp8_mamba = any(
+        name.endswith(("mixer.in_proj", "mixer.out_proj")) for name in quantized
+    )
     expected = {"lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16}}
     for index, kind in enumerate(config.layers_block_type):
         prefix = f"backbone.layers.{index}.mixer"
-        if kind == "linear_attention":
+        if kind == "linear_attention" and fp8_mamba:
             for projection in ("in_proj", "out_proj"):
                 expected[f"{prefix}.{projection}"] = {"quant_algo": "FP8"}
         elif kind == "moe":
@@ -143,7 +149,7 @@ def _validate_full_depth(config, source):
                     }
     # The authentic full checkpoint's MTP tensors are not quantized recipe entries.
     # Do not silently exclude unknown prefixes from the coverage contract.
-    if config.quantization_config.get("quantized_layers") != expected:
+    if quantized != expected:
         raise ValueError("Expected the exact full Lightning projection recipe")
 
 
