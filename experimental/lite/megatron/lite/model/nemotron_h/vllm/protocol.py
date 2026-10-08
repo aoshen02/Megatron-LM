@@ -15,7 +15,10 @@ from megatron.lite.model.nemotron_h.checkpoint import (
     refresh_quantized_projections,
 )
 from megatron.lite.model.nemotron_h.config import NemotronHConfig
-from megatron.lite.model.nemotron_h.quantization import fp8_kv_cache
+from megatron.lite.model.nemotron_h.quantization import (
+    check_activation_precision,
+    check_static_fp8_kv_cache,
+)
 from megatron.lite.model.nemotron_h.vllm.model import NemotronHLayer, build_stage
 from megatron.lite.model.nemotron_h.vllm.primitive.logprob import (
     aligned_selected_log_probs,
@@ -50,6 +53,10 @@ class ImplConfig:
     # BF16 release hf_path was quantized from; theta0 deploys requant(master).
     bf16_master_path: str | None = None
     recompute: str | list[str] | None = None
+    # "release" serves the checkpoint's FP8 activations (W8A8 Mamba in/out_proj,
+    # FP8 query and KV cache); "bf16" keeps them BF16 (W8A16 Mamba in/out_proj,
+    # BF16 KV cache). The rollout must serve the same mode.
+    activation_precision: str = "release"
 
 
 def build_model_config(source, **overrides):
@@ -173,12 +180,11 @@ def _validate_contract(config, impl):
         config.num_experts_per_tok,
     ) != (2688, 128, 1856, 6):
         raise ValueError("Quantized Nemotron requires Lightning operator geometry")
+    check_activation_precision(impl.activation_precision)
     recipe = config.quantization_config
     if recipe.get("quant_algo") != "MIXED_PRECISION":
         raise ValueError("Expected checkpoint mixed precision")
-    # Static FP8 KV (the release) or none (a derived checkpoint served with a
-    # BF16 KV cache and query); raises on any other scheme.
-    fp8_kv_cache(recipe)
+    check_static_fp8_kv_cache(recipe)
     source = json.loads((Path(impl.hf_path) / "config.json").read_text())
     _validate_full_depth(config, source)
     if not impl.bf16_master_path:

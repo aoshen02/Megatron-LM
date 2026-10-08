@@ -5,8 +5,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from megatron.lite.model.nemotron_h.checkpoint import check_no_kv_scales, load_fp8_kv_scales
-from megatron.lite.model.nemotron_h.quantization import fp8_kv_cache
+from megatron.lite.model.nemotron_h.checkpoint import load_fp8_kv_scales
 from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Attention
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     CheckpointProjectionFactory,
@@ -161,23 +160,31 @@ class NemotronHModel(nn.Module):
         return projection(hidden, self.lm_head) if return_logits else hidden
 
 
-def build_stage(config, impl, ps, *, layer_range):
-    """Construct one pipeline stage from the checkpoint, before optimizer binding."""
-    from vllm.utils.torch_utils import set_default_torch_dtype
-
-    factory = CheckpointProjectionFactory(
-        impl.hf_path, config.quantization_config["quantized_layers"]
-    )
+def attention_kv_scales(config, impl, layer_range, *, device):
+    """Per attention layer, the checkpoint's (k_scale, v_scale) when attention
+    serves the release's static FP8 KV cache. The BF16 activation mode attends
+    over a BF16 cache: no scales, so none are loaded or exported (the rollout's
+    BF16 KV cache does not use them either)."""
+    if impl.activation_precision != "release":
+        return {}
     attention_ids = [
         i
         for i in range(*layer_range)
         if config.layers_block_type[i] == "full_attention"
     ]
-    if fp8_kv_cache(config.quantization_config):
-        kv = load_fp8_kv_scales(impl.hf_path, attention_ids, device="cuda")
-    else:
-        check_no_kv_scales(impl.hf_path)
-        kv = {}
+    return load_fp8_kv_scales(impl.hf_path, attention_ids, device=device)
+
+
+def build_stage(config, impl, ps, *, layer_range):
+    """Construct one pipeline stage from the checkpoint, before optimizer binding."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    factory = CheckpointProjectionFactory(
+        impl.hf_path,
+        config.quantization_config["quantized_layers"],
+        fp8_activations=impl.activation_precision == "release",
+    )
+    kv = attention_kv_scales(config, impl, layer_range, device="cuda")
     with set_default_torch_dtype(torch.bfloat16):
         model = NemotronHModel(
             config,

@@ -1,15 +1,19 @@
-"""Which Nemotron-H Lightning checkpoints the vLLM-aligned actor accepts.
+"""Which Nemotron-H Lightning checkpoints and modes the vLLM-aligned actor accepts.
 
 The release serves Mamba in/out_proj as FP8 W8A8 and attention over a static
-FP8 KV cache. A derived checkpoint may serve either with BF16 activations;
-nothing else is accepted.
+FP8 KV cache; a derived checkpoint may keep Mamba in/out_proj as BF16 Linear.
+``activation_precision`` chooses how the actor serves them: as stored
+("release") or with BF16 activations ("bf16").
 """
 
 import json
 
 import pytest
 
-from megatron.lite.model.nemotron_h.quantization import STATIC_FP8_KV_CACHE, fp8_kv_cache
+from megatron.lite.model.nemotron_h.quantization import (
+    ACTIVATION_PRECISIONS,
+    STATIC_FP8_KV_CACHE,
+)
 
 LIGHTNING_PATTERN = "MEMEMAEMEMEMAEMEMEMAEMEMEMAEMEMEMAEMEMEMEMAEMEMEMEME"
 NVFP4 = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
@@ -46,7 +50,7 @@ def _lightning_source(*, fp8_mamba, **kv_cache):
     }
 
 
-def _validate(tmp_path, source):
+def _validate(tmp_path, source, **impl_overrides):
     from megatron.lite.model.nemotron_h.vllm import protocol
     from megatron.lite.runtime.contracts import OptimizerConfig
 
@@ -58,51 +62,62 @@ def _validate(tmp_path, source):
         hf_path=str(tmp_path / "checkpoint"),
         bf16_master_path=str(tmp_path / "master"),
         optimizer_config=OptimizerConfig(),
+        **impl_overrides,
     )
     protocol._validate_contract(protocol.build_model_config(source), impl)
 
 
+RELEASE_KV = {"kv_cache_scheme": STATIC_FP8_KV_CACHE}
+
+
+def test_activation_precision_defaults_to_the_release():
+    from megatron.lite.model.nemotron_h.vllm import protocol
+
+    assert protocol.ImplConfig().activation_precision == "release"
+    assert ACTIVATION_PRECISIONS == ("release", "bf16")
+
+
+@pytest.mark.parametrize("activation_precision", ACTIVATION_PRECISIONS)
 @pytest.mark.parametrize("fp8_mamba", [True, False], ids=["fp8_mamba", "bf16_mamba"])
-@pytest.mark.parametrize(
-    "kv_cache", [{"kv_cache_scheme": STATIC_FP8_KV_CACHE}, {}], ids=["fp8_kv", "bf16_kv"]
-)
-def test_contract_accepts_fp8_or_bf16_mamba_and_kv_cache(tmp_path, fp8_mamba, kv_cache):
-    _validate(tmp_path, _lightning_source(fp8_mamba=fp8_mamba, **kv_cache))
+def test_contract_accepts_the_release_kv_cache_in_either_mode(
+    tmp_path, fp8_mamba, activation_precision
+):
+    _validate(
+        tmp_path,
+        _lightning_source(fp8_mamba=fp8_mamba, **RELEASE_KV),
+        activation_precision=activation_precision,
+    )
 
 
+@pytest.mark.parametrize("activation_precision", ["fp8", "BF16", "", None])
+def test_contract_rejects_an_unknown_activation_precision(tmp_path, activation_precision):
+    with pytest.raises(ValueError, match="activation_precision must be one of"):
+        _validate(
+            tmp_path,
+            _lightning_source(fp8_mamba=True, **RELEASE_KV),
+            activation_precision=activation_precision,
+        )
+
+
+@pytest.mark.parametrize("activation_precision", ACTIVATION_PRECISIONS)
 @pytest.mark.parametrize(
     "kv_cache",
     [
+        {},
         {"kv_cache_scheme": {"dynamic": True, "num_bits": 8, "type": "float"}},
         {"kv_cache_scheme": {"dynamic": False, "num_bits": 4, "type": "float"}},
         {"kv_cache_scheme": {}},
         # vLLM reads this ModelOpt key too, so it must not slip past.
-        {"kv_cache_quant_algo": "FP8"},
+        {**RELEASE_KV, "kv_cache_quant_algo": "FP8"},
     ],
-    ids=["dynamic_fp8", "fp4", "empty", "quant_algo"],
+    ids=["none", "dynamic_fp8", "fp4", "empty", "quant_algo"],
 )
-def test_contract_rejects_other_kv_cache_recipes(tmp_path, kv_cache):
-    with pytest.raises(ValueError, match="static FP8 KV or no KV cache scheme"):
-        _validate(tmp_path, _lightning_source(fp8_mamba=True, **kv_cache))
-
-
-def test_kv_cache_scheme_selects_the_attention_cache():
-    assert fp8_kv_cache({"kv_cache_scheme": dict(STATIC_FP8_KV_CACHE)}) is True
-    assert fp8_kv_cache({}) is False
-    assert fp8_kv_cache({"kv_cache_scheme": None, "kv_cache_quant_algo": None}) is False
-
-
-@pytest.mark.parametrize("stray", [".k_proj.k_scale", ".v_proj.v_scale"])
-def test_bf16_kv_checkpoint_rejects_kv_scales(tmp_path, stray):
-    """Serving a BF16 KV cache ignores KV scales; a checkpoint carrying them
-    was derived incompletely."""
-    from megatron.lite.model.nemotron_h.checkpoint import check_no_kv_scales
-
-    weight_map = {"backbone.layers.5.mixer.k_proj.weight": "a.safetensors"}
-    index = tmp_path / "model.safetensors.index.json"
-    index.write_text(json.dumps({"weight_map": weight_map}))
-    check_no_kv_scales(tmp_path)
-    weight_map[f"backbone.layers.5.mixer{stray}"] = "a.safetensors"
-    index.write_text(json.dumps({"weight_map": weight_map}))
-    with pytest.raises(ValueError, match="KV scales without an FP8 KV cache scheme"):
-        check_no_kv_scales(tmp_path)
+def test_contract_rejects_other_kv_cache_recipes(tmp_path, kv_cache, activation_precision):
+    """The mode, not the checkpoint, chooses the KV cache: the checkpoint is
+    the release in both."""
+    with pytest.raises(ValueError, match="static FP8 KV cache scheme"):
+        _validate(
+            tmp_path,
+            _lightning_source(fp8_mamba=True, **kv_cache),
+            activation_precision=activation_precision,
+        )

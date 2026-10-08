@@ -75,16 +75,6 @@ def load_fp8_kv_scales(path, layer_ids, *, device):
     return result
 
 
-def check_no_kv_scales(path):
-    """A checkpoint served with a BF16 KV cache must not carry KV scales."""
-    index = json.loads((Path(path) / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
-    scales = sorted(n for n in index if n.endswith((".k_proj.k_scale", ".v_proj.v_scale")))
-    if scales:
-        raise ValueError(f"KV scales without an FP8 KV cache scheme: {scales[:4]}")
-
-
 class NemotronExport:
     """Expose the deployment tensors to the framework's PP exporter."""
 

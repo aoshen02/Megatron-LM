@@ -7,29 +7,38 @@ import torch
 
 FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 STATIC_FP8_KV_CACHE = {"dynamic": False, "num_bits": 8, "type": "float"}
+# How the actor and the rollout serve the release checkpoint's activations.
+# release: FP8 W8A8 Mamba in/out_proj, FP8 query and static FP8 KV cache.
+# bf16: W8A16 Mamba in/out_proj (fp8_w8a16_weight), BF16 query and KV cache.
+# The routed experts are W4A16 NVFP4 in both.
+ACTIVATION_PRECISIONS = ("release", "bf16")
 
 
-def fp8_kv_cache(recipe):
-    """Whether attention serves the checkpoint's static FP8 KV cache.
+def check_activation_precision(value):
+    if value not in ACTIVATION_PRECISIONS:
+        raise ValueError(
+            f"activation_precision must be one of {ACTIVATION_PRECISIONS}, got {value!r}"
+        )
 
-    The release quantizes the query and KV cache to FP8 with fixed scales. A
-    checkpoint without a KV cache scheme is served with vLLM's
-    ``kv_cache_dtype=auto``: BF16 query and KV cache. Anything else is rejected.
+
+def check_static_fp8_kv_cache(recipe):
+    """The release's KV cache recipe: static FP8 with fixed k/v scales.
+
+    The BF16 activation mode serves a BF16 KV cache and ignores it.
     """
     scheme = recipe.get("kv_cache_scheme")
     algorithm = recipe.get("kv_cache_quant_algo")
-    if algorithm is not None or scheme not in (None, STATIC_FP8_KV_CACHE):
+    if algorithm is not None or scheme != STATIC_FP8_KV_CACHE:
         raise ValueError(
-            "Expected static FP8 KV or no KV cache scheme, got "
+            "Expected the static FP8 KV cache scheme, got "
             f"kv_cache_scheme={scheme}, kv_cache_quant_algo={algorithm}"
         )
-    return scheme is not None
 
 
 def fp8_w8a16_weight(weight, weight_scale):
     """The BF16 weight of a per-tensor FP8 projection served W8A16.
 
-    Mirrors vLLM's load-time dequantization for W8A16 serving,
+    Mirrors vLLM's load-time dequantization in the BF16 activation mode,
     ``(weight.float() * weight_scale).to(torch.bfloat16)``: E4M3 codes times
     the FP32 per-tensor scale in FP32, rounded once to BF16. The product then
     goes through the unquantized batch-invariant linear.

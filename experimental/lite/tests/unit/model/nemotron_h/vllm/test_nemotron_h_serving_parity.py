@@ -516,33 +516,50 @@ def test_export_rounds_kv_scales_to_bf16():
         assert not torch.equal(value, source)
 
 
-@pytest.mark.parametrize("fp8_kv", [True, False], ids=["fp8_kv", "bf16_kv"])
-def test_attention_holds_kv_scales_only_for_an_fp8_kv_cache(fp8_kv):
-    """An FP8 KV cache loads and exports the checkpoint's KV scales; a BF16
-    one (kv_cache_dtype=auto) has none for the loader or the refit."""
+@pytest.mark.parametrize("activation_precision", ["release", "bf16"])
+def test_activation_precision_selects_the_attention_kv_cache(tmp_path, activation_precision):
+    """The release mode attends over the static FP8 KV cache and loads and
+    exports the checkpoint's KV scales; the BF16 mode (kv_cache_dtype=bfloat16)
+    attends over a BF16 cache and has no scales for the loader or the refit,
+    although the checkpoint carries them."""
+    import json
     from types import SimpleNamespace
 
     from megatron.lite.model.nemotron_h.checkpoint import NemotronExport, hf_tensor_views
+    from megatron.lite.model.nemotron_h.vllm.model import attention_kv_scales
     from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Attention
+    from safetensors.torch import save_file
 
+    scales = {
+        f"backbone.layers.5.mixer.{x}_proj.{x}_scale": torch.tensor(value)
+        for x, value in (("k", 0.02), ("v", 0.01))
+    }
+    save_file(scales, str(tmp_path / "model.safetensors"))
+    index = {"weight_map": dict.fromkeys(scales, "model.safetensors")}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     config = SimpleNamespace(
         attention_bias=False, head_dim=8, num_attention_heads=4,
         num_key_value_heads=2, hidden_size=16,
+        layers_block_type=["mamba"] * 5 + ["full_attention"],
     )
+    impl = SimpleNamespace(hf_path=str(tmp_path), activation_precision=activation_precision)
+    kv = attention_kv_scales(config, impl, (0, 6), device="cpu")
     attention = Attention(
         config, None,
-        fp8_kv_scales=(torch.tensor(0.02), torch.tensor(0.01)) if fp8_kv else None,
+        fp8_kv_scales=kv.get(5),
         projection_factory=lambda _name, *shape, **kwargs: torch.nn.Linear(*shape, **kwargs),
         hf_prefix="backbone.layers.5.mixer",
     )
-    assert attention.kv_attention.fp8 is fp8_kv
+    fp8 = activation_precision == "release"
+    assert attention.kv_attention.fp8 is fp8
     model = torch.nn.Module()
     model.add_module("layers", torch.nn.ModuleDict({"5": torch.nn.Module()}))
     model.layers["5"].add_module("mixer", attention)
-    scales = {f"backbone.layers.5.mixer.{x}_proj.{x}_scale" for x in "kv"}
-    expected = scales if fp8_kv else set()
-    assert {name for name, _ in hf_tensor_views(model)} & scales == expected
-    assert dict(NemotronExport.iter_export_tensors(None, model)).keys() & scales == expected
+    expected = set(scales) if fp8 else set()
+    assert {name for name, _ in hf_tensor_views(model)} & set(scales) == expected
+    assert dict(NemotronExport.iter_export_tensors(None, model)).keys() & set(scales) == expected
+    if fp8:
+        assert torch.equal(attention.kv_attention.k_scale, scales[min(scales)])
 
 
 # Per-rank source rows; a source rank with no tokens, and (last case) routes

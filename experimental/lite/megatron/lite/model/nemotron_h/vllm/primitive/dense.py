@@ -399,11 +399,12 @@ class CheckpointProjectionFactory:
     Quantized adapters load their own checkpoint-domain tensors at construction.
     """
 
-    def __init__(self, root, quantized_layers):
+    def __init__(self, root, quantized_layers, *, fp8_activations=True):
         from pathlib import Path
 
         self.root = Path(root)
         self.recipes = dict(quantized_layers)
+        self.fp8_activations = fp8_activations
         self.index = json.loads(
             (self.root / "model.safetensors.index.json").read_text()
         )["weight_map"]
@@ -476,7 +477,9 @@ class CheckpointProjectionFactory:
                 f"Quantized projection geometry/dtype disagrees for {prefix}"
             )
         checkpoint = load_quantized_weight(self.root, prefix, recipe)
-        return build_quantized_projection(checkpoint, prefix, device=device)
+        return build_quantized_projection(
+            checkpoint, prefix, device=device, fp8_activations=self.fp8_activations
+        )
 
 
 class Nvfp4TrainingLinear(torch.nn.Module):

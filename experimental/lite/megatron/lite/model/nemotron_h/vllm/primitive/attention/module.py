@@ -1,4 +1,4 @@
-"""Nemotron-H attention over the checkpoint's FP8 or BF16 KV cache."""
+"""Nemotron-H attention over a static FP8 or a BF16 KV cache."""
 
 import torch
 from torch import nn
@@ -12,8 +12,9 @@ class Fa4KVAttention(torch.nn.Module):
     """Serving FA4 (``FlashAttnFixedSplitBackend``) with 6768-token pages and
     the fixed split-KV schedule. Causal packed sequences starting at zero.
 
-    With KV scales: the static FP8 KV cache, FP8 query and KV quantization
-    with fixed scales. Without (``kv_cache_dtype=auto``): BF16 query and KV.
+    With KV scales: the release's static FP8 KV cache, FP8 query and KV
+    quantization with fixed scales. Without (the BF16 activation mode,
+    ``kv_cache_dtype=bfloat16``): BF16 query and KV.
     """
 
     def __init__(self, num_heads, num_kv_heads, head_dim, k_scale=None, v_scale=None):
@@ -139,8 +140,8 @@ class Fa4KVAttention(torch.nn.Module):
 class Attention(nn.Module):
     """Nemotron's non-rotary attention; query width is independent of hidden size.
 
-    ``fp8_kv_scales`` is the checkpoint's (k_scale, v_scale) for a static FP8
-    KV cache, or None for a BF16 one.
+    ``fp8_kv_scales`` is the checkpoint's (k_scale, v_scale) for the static FP8
+    KV cache, or None for a BF16 one (the BF16 activation mode).
     """
 
     def __init__(
