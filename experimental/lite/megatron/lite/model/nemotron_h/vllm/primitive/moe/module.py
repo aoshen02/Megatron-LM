@@ -62,6 +62,26 @@ class Router(nn.Module):
             "e_score_correction_bias",
             torch.zeros(config.n_routed_experts, device=device, dtype=torch.float32),
         )
+        self.router_replay = None
+
+    def _replay(self, logits, weights, ids):
+        """Pin rows whose expert set differs from the replay target.
+
+        Rows with the same set keep the native ids and weights bit for bit;
+        the rest take the target ids gated by the live FP32 sigmoid, which is
+        what ``_FixedRouteVJP`` differentiates.
+        """
+        target = self.router_replay.select_indices(ids)
+        if target is ids:
+            return weights, ids
+        changed = (target.sort(-1).values != ids.sort(-1).values).any(-1, keepdim=True)
+        pinned = logits.float().sigmoid().gather(-1, target)
+        if self.config.norm_topk_prob:
+            pinned = pinned / pinned.sum(-1, keepdim=True)
+        return (
+            torch.where(changed, pinned.to(weights.dtype), weights),
+            torch.where(changed, target.to(ids.dtype), ids),
+        )
 
     def forward(self, x):
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
@@ -76,7 +96,7 @@ class Router(nn.Module):
         )
 
         def visible(logits):
-            return grouped_topk(
+            weights, ids = grouped_topk(
                 x,
                 logits,
                 config.num_experts_per_tok,
@@ -87,6 +107,9 @@ class Router(nn.Module):
                 1.0,
                 self.e_score_correction_bias.float(),
             )
+            if self.router_replay is None:
+                return weights, ids
+            return self._replay(logits, weights, ids)
 
         if not torch.is_grad_enabled():
             weights, ids = visible(logits)

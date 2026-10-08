@@ -371,3 +371,80 @@ def test_r3_driver_slices_global_layer_axis_for_pipeline_stage():
     assert getattr(local, "is_nested", False)
     for actual, source in zip(local.unbind(0), routed.unbind(0), strict=True):
         assert torch.equal(actual, source[:, 2:4, :])
+
+
+def test_r2_driver_records_jagged_routes_through_nemotron_protocol():
+    from megatron.lite.model.nemotron_h.vllm import protocol
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    class FakeRouter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_replay = None
+
+        def forward(self, native):
+            return self.router_replay.select_indices(native)
+
+    class FakeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ps = ParallelState()
+            self.routers = nn.ModuleList([FakeRouter(), FakeRouter()])
+
+    model = FakeModel()
+    handle = SimpleNamespace(
+        _model=model,
+        _extras={"model_chunks": [model], "protocol": protocol},
+    )
+    batch = PackedBatch(
+        input_ids=torch.arange(5), labels=torch.arange(5), seq_lens=torch.tensor([3, 2])
+    )
+    native = torch.arange(10, dtype=torch.int32).reshape(5, 2)
+
+    driver = RouterReplayDriver.maybe_create(handle, {"action": "record"})
+    driver.begin()
+    try:
+        stepped = driver.wrap(
+            lambda active_model, _batch: {
+                "ids": [r(native + 100 * i) for i, r in enumerate(active_model.routers)]
+            }
+        )
+        routes = stepped(model, batch)["routed_experts"].unbind(0)
+    finally:
+        driver.end()
+
+    # The R3 consumer's layout: one [tokens, layers, topk] row per sequence.
+    assert [tuple(row.shape) for row in routes] == [(3, 2, 2), (2, 2, 2)]
+    expected = torch.stack([native, native + 100], dim=1).to(torch.int16)
+    assert torch.equal(torch.cat(routes), expected)
+
+
+def test_nemotron_router_replay_keeps_rows_whose_expert_set_matches():
+    from megatron.lite.model.nemotron_h.vllm.primitive.moe.module import Router
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+        attach_router_replay,
+    )
+
+    config = SimpleNamespace(n_routed_experts=4, hidden_size=2, norm_topk_prob=True)
+    router = Router(config)
+    attach_router_replay(router)
+    RouterReplay.set_replay_data([torch.tensor([[0, 2], [1, 3]])])
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    logits = torch.tensor([[0.5, -1.0, 2.0, 0.0], [1.0, 0.3, -0.2, 0.7]])
+    ids = torch.tensor([[2, 0], [0, 3]], dtype=torch.int32)
+    weights = torch.tensor([[0.6, 0.4], [0.55, 0.45]])
+
+    pinned_weights, pinned_ids = router._replay(logits, weights, ids)
+
+    # Same set in another order: native ids and weights stay bit-identical.
+    assert torch.equal(pinned_ids[0], ids[0])
+    assert torch.equal(pinned_weights[0], weights[0])
+    # A flipped row takes the replayed ids, gated by the live sigmoid.
+    assert pinned_ids.dtype == torch.int32
+    assert torch.equal(pinned_ids[1], torch.tensor([1, 3], dtype=torch.int32))
+    gate = logits[1, [1, 3]].sigmoid()
+    torch.testing.assert_close(pinned_weights[1], gate / gate.sum())

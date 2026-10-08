@@ -784,23 +784,13 @@ class MegatronLiteEngine(BaseEngine):
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
-        replay_specs = [
-            runtime_batch.routed_experts is not None
-            for runtime_batch, _loss_context in runtime_batches
-        ]
-        replay_enabled = self.engine_config.router_replay_mode == "R3"
-        if replay_enabled and not all(replay_specs):
-            raise ValueError(
-                "router_replay_mode='R3' requires routed_experts on every "
-                "actor micro-batch in a step."
-            )
         result = self.runtime.forward_backward(
             self.handle,
             iter(runtime_batches),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
+            router_replay=self._router_replay_spec(data, runtime_batches, forward_only),
         )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
@@ -821,6 +811,31 @@ class MegatronLiteEngine(BaseEngine):
             },
         }
 
+    def _router_replay_spec(self, data: TensorDict, runtime_batches, forward_only: bool):
+        """R3 replays rollout routes; R2 records them in the actor's old-log-prob
+        forward and replays them in every update of the step."""
+        mode = self.engine_config.router_replay_mode
+        if mode == "disabled":
+            return None
+        has_routes = [batch.routed_experts is not None for batch, _ in runtime_batches]
+        if mode == "R3" or any(has_routes):
+            if not all(has_routes):
+                raise ValueError(
+                    f"router_replay_mode={mode!r} requires routed_experts on every "
+                    "actor micro-batch in a step."
+                )
+            return {"action": "replay"}
+        if not forward_only:
+            raise ValueError(
+                "router_replay_mode='R2' training requires the routed_experts that "
+                "compute_log_prob recorded for the same samples."
+            )
+        # VERL sets this flag only for megatron/veomni actors (False on the ref
+        # forward); without it every R2 forward-only call is the actor's.
+        if tu.get_non_tensor_data(data, key="enable_routing_replay", default=True):
+            return {"action": "record"}
+        return None
+
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
         """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.
 
@@ -834,15 +849,18 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
-        r3_replay_mask = None
-        if self.engine_config.router_replay_mode == "R3":
-            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
         routed_experts = micro_batch.get("routed_experts", None)
         if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
             raise ValueError(
-                "R3 routed_experts must use VERL's jagged no-padding layout; "
+                "routed_experts must use VERL's jagged no-padding layout; "
                 f"got shape {tuple(routed_experts.shape)}."
             )
+        r3_replay_mask = None
+        if self.engine_config.router_replay_mode == "R3":
+            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
+        elif self.engine_config.router_replay_mode == "R2" and routed_experts is not None:
+            # R2 routes were recorded for every input row.
+            r3_replay_mask = torch.ones_like(input_ids, dtype=torch.bool)
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
@@ -954,6 +972,8 @@ class MegatronLiteEngine(BaseEngine):
         entropy = raw_output.get("entropy")
         if entropy is not None:
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
+        if raw_output.get("routed_experts") is not None:
+            output["routed_experts"] = raw_output["routed_experts"]
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):

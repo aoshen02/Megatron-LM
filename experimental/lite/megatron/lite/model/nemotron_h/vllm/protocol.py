@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 
+from megatron.lite.model import protocol_utils
 from megatron.lite.model.nemotron_h.checkpoint import (
     NemotronExport,
     is_expert,
@@ -281,6 +282,21 @@ def unpack_forward_output(model, batch, output):
         batch.seq_lens, tp_size=ps.tp_size, cp_size=ps.cp_size, cp_group=ps.cp_group
     )
     return unpack_thd_to_nested(output, meta, contiguous=True)
+
+
+def pack_routed_experts(model, batch, routed_experts):
+    return protocol_utils.pack_routed_experts(
+        model, batch, routed_experts, contiguous=True
+    )
+
+
+def pack_r3_replay_mask(model, batch):
+    return protocol_utils.pack_r3_replay_mask(model, batch, contiguous=True)
+
+
+def unpack_routed_experts(model, batch, routes):
+    """Recorded ``[local_rows, layers, topk]`` routes to jagged per-sequence rows."""
+    return unpack_forward_output(model, batch, routes[None])
 
 
 def _build_fsdp2(chunks, impl_cfg, ps):

@@ -68,8 +68,8 @@ class MegatronLiteEngineConfig(EngineConfig):
             )
         if self.impl == "vllm" and self.param_offload:
             raise ValueError("impl='vllm' requires param_offload=False")
-        if self.router_replay_mode not in ("disabled", "R3"):
+        if self.router_replay_mode not in ("disabled", "R2", "R3"):
             raise ValueError(
-                "MegatronLiteEngine supports router_replay_mode='disabled' or 'R3', "
-                f"got {self.router_replay_mode!r}"
+                "MegatronLiteEngine supports router_replay_mode='disabled', 'R2' or "
+                f"'R3', got {self.router_replay_mode!r}"
             )
