@@ -10,6 +10,7 @@ import json
 import torch
 
 from megatron.lite.model.nemotron_h.quantization import (
+    fp8_w8a16_weight,
     full_master,
     load_quantized_weight,
     master_version,
@@ -545,14 +546,19 @@ class Nvfp4TrainingLinear(torch.nn.Module):
 
 
 class Fp8TrainingLinear(torch.nn.Module):
-    """Static FP8 W/A forward over a BF16 master weight.
+    """Per-tensor FP8 forward over a BF16 master weight.
 
-    Requantization replaces the weight and its scale (amax / 448) and keeps
-    the calibrated input scale.
+    ``fp8_activations`` (W8A8, the release): the input is quantized with the
+    calibrated static input scale. Otherwise (W8A16) the input stays BF16 and
+    multiplies ``fp8_w8a16_weight`` of the deployed FP8 weight through the
+    unquantized batch-invariant linear, as vLLM serves it. Requantization
+    replaces the weight and its scale (amax / 448) and keeps the calibrated
+    input scale; both forwards deploy and export the same tensors.
     """
 
-    def __init__(self, checkpoint, *, device):
+    def __init__(self, checkpoint, *, device, fp8_activations=True):
         super().__init__()
+        self.fp8_activations = fp8_activations
         if checkpoint.algorithm != "FP8":
             raise ValueError("Expected a tensor-scaled FP8 checkpoint")
         for name in ("input_scale", "weight_scale"):
@@ -616,13 +622,18 @@ class Fp8TrainingLinear(torch.nn.Module):
 
     def _visible(self, x):
         from vllm import _custom_ops as ops
+        from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
         from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm
 
         rows = x.reshape(-1, x.shape[-1])
-        quantized, _ = ops.scaled_fp8_quant(rows.contiguous(), self.input_scale)
-        output = flashinfer_scaled_fp8_mm(
-            quantized, self._packed.T, self.input_scale, self.weight_scale, torch.bfloat16
-        )
+        if self.fp8_activations:
+            quantized, _ = ops.scaled_fp8_quant(rows.contiguous(), self.input_scale)
+            output = flashinfer_scaled_fp8_mm(
+                quantized, self._packed.T, self.input_scale, self.weight_scale, torch.bfloat16
+            )
+        else:
+            weight = fp8_w8a16_weight(self._packed, self.weight_scale)
+            output = linear_batch_invariant(rows, weight)
         return output.reshape(*x.shape[:-1], self._packed.shape[0])
 
     def forward(self, x):
@@ -632,11 +643,11 @@ class Fp8TrainingLinear(torch.nn.Module):
         return visible_linear(self._visible, x, self.weight)
 
 
-def build_quantized_projection(checkpoint, prefix, *, device):
+def build_quantized_projection(checkpoint, prefix, *, device, fp8_activations=True):
     """NVFP4 uses the serving kernels: CuTe-DSL for the shared expert, Humming
-    elsewhere."""
+    elsewhere. FP8 runs W8A8, or W8A16 without ``fp8_activations``."""
     if checkpoint.algorithm == "FP8":
-        return Fp8TrainingLinear(checkpoint, device=device)
+        return Fp8TrainingLinear(checkpoint, device=device, fp8_activations=fp8_activations)
     if checkpoint.algorithm != "W4A16_NVFP4":
         raise ValueError(f"Unsupported projection recipe: {checkpoint.algorithm}")
     shared = prefix.rsplit(".", 2)[-2:] in (

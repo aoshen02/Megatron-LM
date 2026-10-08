@@ -26,6 +26,21 @@ def fp8_kv_cache(recipe):
     return scheme is not None
 
 
+def fp8_w8a16_weight(weight, weight_scale):
+    """The BF16 weight of a per-tensor FP8 projection served W8A16.
+
+    Mirrors vLLM's load-time dequantization for W8A16 serving,
+    ``(weight.float() * weight_scale).to(torch.bfloat16)``: E4M3 codes times
+    the FP32 per-tensor scale in FP32, rounded once to BF16. The product then
+    goes through the unquantized batch-invariant linear.
+    """
+    if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+        raise ValueError("Expected an E4M3 FP8 weight matrix")
+    if weight_scale.dtype != torch.float32 or weight_scale.numel() != 1:
+        raise ValueError("Expected one FP32 per-tensor weight scale")
+    return (weight.float() * weight_scale).to(torch.bfloat16)
+
+
 def requantize(algorithm, weight):
     """Quantize a BF16 master with the rule that produced the Lightning checkpoint.
 

@@ -265,6 +265,129 @@ def test_requantized_bytes_are_what_the_vllm_loaders_hold(vllm_oracle_runtime):
                 ), (stem, suffix)
 
 
+def _calibrated_fp8(rows, columns, generator, device):
+    """An FP8 checkpoint projection with a calibrated (not amax/448) scale."""
+    from megatron.lite.model.nemotron_h.quantization import fp8_encode
+
+    master = (torch.randn(rows, columns, generator=generator) * 0.02).bfloat16().to(device)
+    scale = master.float().abs().amax() / 448 * 1.5
+    return QuantizedWeight(
+        "FP8",
+        {
+            "weight": fp8_encode(master, scale),
+            "weight_scale": scale,
+            "input_scale": torch.tensor(0.01, device=device),
+        },
+    )
+
+
+def test_w8a16_weight_is_the_fp32_product_rounded_once_to_bf16():
+    """vLLM's W8A16 load: ``(weight.float() * weight_scale).to(bfloat16)``.
+    The E4M3 x FP32 product is exact in FP64, so FP64 -> FP32 -> BF16 is an
+    independent reference; rounding the scale to BF16 first is not it."""
+    from megatron.lite.model.nemotron_h.quantization import fp8_w8a16_weight
+
+    g = torch.Generator().manual_seed(0)
+    checkpoint = _calibrated_fp8(96, 160, g, "cpu")
+    codes, scale = checkpoint.tensors["weight"], checkpoint.tensors["weight_scale"]
+    expected = (codes.double() * scale.double()).float().bfloat16()
+    for shape in ((), (1,)):
+        weight = fp8_w8a16_weight(codes, scale.reshape(shape))
+        assert weight.dtype == torch.bfloat16 and weight.shape == codes.shape
+        assert torch.equal(weight.view(torch.int16), expected.view(torch.int16))
+    assert torch.equal(checkpoint.initial_master().bfloat16(), expected)
+    assert not torch.equal(codes.bfloat16() * scale.bfloat16(), expected)
+    with pytest.raises(ValueError, match="E4M3"):
+        fp8_w8a16_weight(codes.view(torch.uint8), scale)
+    with pytest.raises(ValueError, match="per-tensor"):
+        fp8_w8a16_weight(codes, scale.expand(2))
+
+
+def test_w8a16_projection_deploys_and_exports_the_w8a8_bytes():
+    """W8A16 changes the forward only: theta0 and every update deploy and
+    export the same FP8 weight, weight scale and input scale as W8A8."""
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import Fp8TrainingLinear
+
+    g = torch.Generator().manual_seed(1)
+    checkpoint = _calibrated_fp8(64, 128, g, "cpu")
+    modules = [
+        Fp8TrainingLinear(checkpoint, device="cpu", fp8_activations=fp8)
+        for fp8 in (True, False)
+    ]
+    update = (torch.randn(64, 128, generator=g) * 1e-3).bfloat16()
+    for step in range(2):
+        for module in modules:
+            if step:
+                with torch.no_grad():
+                    module.weight.add_(update)
+            module.refresh_deployment(recompute_scales=True)
+        w8a8, w8a16 = (module.export_quantized() for module in modules)
+        assert w8a8.keys() == w8a16.keys() == {"weight", "weight_scale", "input_scale"}
+        for name, tensor in w8a8.items():
+            assert torch.equal(
+                w8a16[name].reshape(-1).view(torch.uint8),
+                tensor.reshape(-1).view(torch.uint8),
+            ), (step, name)
+
+
+# Lightning Mamba in_proj and out_proj (N, K).
+MAMBA_PROJECTIONS = {"in_proj": (10304, 2688), "out_proj": (2688, 4096)}
+
+
+@cuda
+@pytest.mark.gpus(1, min_architecture="blackwell")
+@pytest.mark.parametrize("shape", MAMBA_PROJECTIONS.values(), ids=MAMBA_PROJECTIONS.keys())
+def test_w8a16_projection_is_the_bi_linear_on_the_dequantized_weight(
+    vllm_oracle_runtime, shape
+):
+    """The W8A16 forward is F.linear(x, W) through vLLM's unquantized BI linear
+    (a ReplicatedLinear holding W = fp8_w8a16_weight), bitwise; the VJP is the
+    BF16 master's, straight through the FP8 weight as for W8A8."""
+    from megatron.lite.model.nemotron_h.quantization import fp8_w8a16_weight
+    from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
+        Fp8TrainingLinear,
+        native_linear_vjp,
+    )
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    n, k = shape
+    master = (torch.randn(n, k, generator=g, device="cuda") * 0.02).bfloat16()
+    tensors = dict(requantize("FP8", master), input_scale=torch.tensor(0.05, device="cuda"))
+    module = Fp8TrainingLinear(
+        QuantizedWeight("FP8", tensors), device="cuda", fp8_activations=False
+    )
+    weight = fp8_w8a16_weight(tensors["weight"], tensors["weight_scale"])
+    with set_current_vllm_config(vllm_oracle_runtime), torch.device("cuda"):
+        oracle = ReplicatedLinear(
+            k, n, bias=False, params_dtype=torch.bfloat16, prefix="model.proj",
+            return_bias=False, disable_tp=True,
+        )
+    with torch.no_grad():
+        oracle.weight.weight_loader(oracle.weight, weight.clone())
+        oracle.quant_method.process_weights_after_loading(oracle)
+    for rows in ORACLE_ROWS:
+        x = torch.randn(rows, k, generator=g, device="cuda").to(torch.bfloat16)
+        with torch.no_grad():
+            actual = module(x)
+        with set_current_vllm_config(vllm_oracle_runtime):
+            expected = oracle(x)
+        assert torch.equal(actual, expected), rows
+        assert torch.equal(actual, linear_batch_invariant(x, weight)), rows
+    x = torch.randn(513, k, generator=g, device="cuda").to(torch.bfloat16)
+    x.requires_grad_()
+    output = module(x)
+    with torch.no_grad():
+        assert torch.equal(output, linear_batch_invariant(x, weight))
+    upstream = torch.randn(output.shape, generator=g, device="cuda").to(torch.bfloat16)
+    grads = torch.autograd.grad(output, (x, module.weight), upstream)
+    expected = native_linear_vjp(upstream, x.detach(), module.weight.detach())
+    for name, a, b in zip(("dx", "dweight"), grads, expected, strict=True):
+        assert torch.equal(a, b), name
+
+
 def _stacks(generator, experts=128):
     def nvfp4(rows, columns):
         packed = torch.randint(
