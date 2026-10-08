@@ -15,6 +15,7 @@ from megatron.lite.model.nemotron_h.checkpoint import (
     refresh_quantized_projections,
 )
 from megatron.lite.model.nemotron_h.config import NemotronHConfig
+from megatron.lite.model.nemotron_h.quantization import fp8_kv_cache
 from megatron.lite.model.nemotron_h.vllm.model import NemotronHLayer, build_stage
 from megatron.lite.model.nemotron_h.vllm.primitive.logprob import (
     aligned_selected_log_probs,
@@ -173,10 +174,11 @@ def _validate_contract(config, impl):
     ) != (2688, 128, 1856, 6):
         raise ValueError("Quantized Nemotron requires Lightning operator geometry")
     recipe = config.quantization_config
-    if recipe.get("quant_algo") != "MIXED_PRECISION" or recipe.get(
-        "kv_cache_scheme"
-    ) != {"dynamic": False, "num_bits": 8, "type": "float"}:
-        raise ValueError("Expected checkpoint mixed precision and static FP8 KV")
+    if recipe.get("quant_algo") != "MIXED_PRECISION":
+        raise ValueError("Expected checkpoint mixed precision")
+    # Static FP8 KV (the release) or none (a derived checkpoint served with a
+    # BF16 KV cache and query); raises on any other scheme.
+    fp8_kv_cache(recipe)
     source = json.loads((Path(impl.hf_path) / "config.json").read_text())
     _validate_full_depth(config, source)
     if not impl.bf16_master_path:

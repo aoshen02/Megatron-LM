@@ -5,7 +5,8 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from megatron.lite.model.nemotron_h.checkpoint import load_fp8_kv_scales
+from megatron.lite.model.nemotron_h.checkpoint import check_no_kv_scales, load_fp8_kv_scales
+from megatron.lite.model.nemotron_h.quantization import fp8_kv_cache
 from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Attention
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import (
     CheckpointProjectionFactory,
@@ -172,7 +173,11 @@ def build_stage(config, impl, ps, *, layer_range):
         for i in range(*layer_range)
         if config.layers_block_type[i] == "full_attention"
     ]
-    kv = load_fp8_kv_scales(impl.hf_path, attention_ids, device="cuda")
+    if fp8_kv_cache(config.quantization_config):
+        kv = load_fp8_kv_scales(impl.hf_path, attention_ids, device="cuda")
+    else:
+        check_no_kv_scales(impl.hf_path)
+        kv = {}
     with set_default_torch_dtype(torch.bfloat16):
         model = NemotronHModel(
             config,

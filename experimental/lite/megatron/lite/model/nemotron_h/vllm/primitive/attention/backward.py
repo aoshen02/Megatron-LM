@@ -1,15 +1,16 @@
-"""FlashAttention varlen VJP for the serving-visible FP8 KV attention."""
+"""FlashAttention varlen VJP for the serving-visible KV-cache attention."""
 
 import torch
 
 
-class _Fp8AttentionVJP(torch.autograd.Function):
+class _AttentionVJP(torch.autograd.Function):
     """FlashAttention VJP on the dequantized Q/K/V of the visible forward.
 
     The visible output multiplies an FP8-rounded P by V, so it is not the
     softmax(QK^T)V that FlashAttention's backward assumes when it forms
     D = rowsum(dO * O). Backward recomputes the BF16 output and LSE on the
-    dequantized Q/K/V and passes those instead.
+    dequantized Q/K/V and passes those instead. A BF16 KV cache passes its
+    Q/K/V unchanged.
     """
 
     @staticmethod

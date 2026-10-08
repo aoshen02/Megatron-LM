@@ -323,23 +323,34 @@ def test_checkpoint_load_redeploys_the_saved_bytes(monkeypatch, tmp_path):
             assert torch.equal(exported[name], value), (step, name)
 
 
+# Static FP8 KV scales (the release), or none for a BF16 KV cache.
+KV_SCALES = {"fp8_kv": (0.02, 0.01), "bf16_kv": ()}
+
+
+def _kv_attention(kv):
+    from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4KVAttention
+
+    return Fa4KVAttention(
+        32, 2, 128, *(torch.tensor(scale, device="cuda") for scale in KV_SCALES[kv])
+    )
+
+
 @pytest.mark.gpus(1)
 @pytest.mark.parametrize("kind", ["random", "zero", "sparse"])
-def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
+@pytest.mark.parametrize("kv", list(KV_SCALES))
+def test_attention_vjp_within_bf16_noise_floor(kv, kind, monkeypatch):
     """Lightning Q32/KV2/D128 vs per-request SDPA on the dequantized Q/K/V.
 
     The VJP recomputes the BF16 output for D = rowsum(dO * O); the visible
-    output (FP8 P@V) would put dQ/dK about 3x the BF16 noise floor.
+    output (FP8 P@V) would put dQ/dK about 3x the BF16 noise floor. A BF16
+    KV cache attends over Q/K/V unchanged.
     """
-    from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(42)
     meta = SSMMeta((0, *torch.tensor(LENGTHS).cumsum(0).tolist()))
-    module = Fa4Fp8KVAttention(
-        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
-    )
+    module = _kv_attention(kv)
     q, k, v = (
         torch.randn(
             meta.boundaries[-1], heads, 128, device="cuda", dtype=torch.bfloat16
@@ -350,6 +361,8 @@ def test_fp8_attention_vjp_within_bf16_noise_floor(kind, monkeypatch):
     with torch.no_grad():
         serving, _, *references = module._visible(q, k, v, meta.boundaries)
     assert torch.equal(output, serving)
+    if kv == "bf16_kv":
+        assert all(r is x for r, x in zip(references, (q, k, v), strict=True))
     upstream = upstream_gradient(kind, output)
     actual = torch.autograd.grad(output, (q, k, v), upstream)
 
@@ -615,17 +628,14 @@ def test_selected_log_probs_vjp_within_bf16_noise_floor(temperature, kind):
 
 
 @pytest.mark.gpus(1, min_architecture="blackwell")
-def test_fp8_attention_vjp_is_run_to_run_bitwise(monkeypatch):
+@pytest.mark.parametrize("kv", list(KV_SCALES))
+def test_attention_vjp_is_run_to_run_bitwise(kv, monkeypatch):
     """full_determinism: the FlashAttention backward accumulates dQ in a fixed order."""
-    from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
-
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(7)
     lengths = (8192, 3000, 1, 5000)
     meta = SSMMeta((0, *torch.tensor(lengths).cumsum(0).tolist()))
-    module = Fa4Fp8KVAttention(
-        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
-    )
+    module = _kv_attention(kv)
     q, k, v = (
         torch.randn(meta.boundaries[-1], h, 128, device="cuda", dtype=torch.bfloat16)
         .requires_grad_()
@@ -668,18 +678,15 @@ def test_router_gemm_row_check_detects_a_missing_batch_invariance_init(init_firs
 
 
 @pytest.mark.gpus(1)
-def test_fp8_attention_cache_pages_follow_request_lengths(monkeypatch):
+@pytest.mark.parametrize("kv,limit", [("fp8_kv", 9), ("bf16_kv", 12)])
+def test_attention_cache_pages_follow_request_lengths(kv, limit, monkeypatch):
     """1024 one-token requests and one of 7000 tokens take 1026 cache pages of
-    3.3 MiB (3.4 GiB; three pages per request alone would be 10 GiB; FA4's
-    split scratch adds about 4 GiB), and each request's output is the one it
-    gets alone."""
-    from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Fa4Fp8KVAttention
-
+    3.3 MiB in FP8 (3.4 GiB; three pages per request alone would be 10 GiB)
+    or 6.6 MiB in BF16 (6.6 GiB vs 20 GiB); FA4's split scratch adds about
+    4 GiB. Each request's output is the one it gets alone."""
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     torch.manual_seed(3)
-    module = Fa4Fp8KVAttention(
-        32, 2, 128, torch.tensor(0.02, device="cuda"), torch.tensor(0.01, device="cuda")
-    )
+    module = _kv_attention(kv)
     lengths = [1] * 1024 + [7000]
     bounds = [0, *torch.tensor(lengths).cumsum(0).tolist()]
     q, k, v = (
@@ -690,7 +697,7 @@ def test_fp8_attention_cache_pages_follow_request_lengths(monkeypatch):
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     packed = module._visible(q, k, v, bounds)[0]
-    assert torch.cuda.max_memory_allocated() - base < 9 * 2**30
+    assert torch.cuda.max_memory_allocated() - base < limit * 2**30
     for start, end in ((0, 1), (1023, 1024), (1024, bounds[-1])):
         alone = module._visible(q[start:end], k[start:end], v[start:end], [0, end - start])
         assert torch.equal(packed[start:end], alone[0])

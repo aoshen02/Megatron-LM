@@ -6,6 +6,24 @@ import torch
 
 
 FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+STATIC_FP8_KV_CACHE = {"dynamic": False, "num_bits": 8, "type": "float"}
+
+
+def fp8_kv_cache(recipe):
+    """Whether attention serves the checkpoint's static FP8 KV cache.
+
+    The release quantizes the query and KV cache to FP8 with fixed scales. A
+    checkpoint without a KV cache scheme is served with vLLM's
+    ``kv_cache_dtype=auto``: BF16 query and KV cache. Anything else is rejected.
+    """
+    scheme = recipe.get("kv_cache_scheme")
+    algorithm = recipe.get("kv_cache_quant_algo")
+    if algorithm is not None or scheme not in (None, STATIC_FP8_KV_CACHE):
+        raise ValueError(
+            "Expected static FP8 KV or no KV cache scheme, got "
+            f"kv_cache_scheme={scheme}, kv_cache_quant_algo={algorithm}"
+        )
+    return scheme is not None
 
 
 def requantize(algorithm, weight):

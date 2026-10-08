@@ -1,30 +1,34 @@
-"""Nemotron-H attention over the checkpoint's static FP8 KV cache."""
+"""Nemotron-H attention over the checkpoint's FP8 or BF16 KV cache."""
 
 import torch
 from torch import nn
 
-from megatron.lite.model.nemotron_h.vllm.primitive.attention.backward import (
-    _Fp8AttentionVJP,
-)
+from megatron.lite.model.nemotron_h.vllm.primitive.attention.backward import _AttentionVJP
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 
 
-class Fa4Fp8KVAttention(torch.nn.Module):
-    """Serving FA4 (``FlashAttnFixedSplitBackend``) over the static FP8 KV
-    cache: FP8 query and KV quantization with fixed scales, 6768-token pages
-    and the fixed split-KV schedule. Causal packed sequences starting at zero.
+class Fa4KVAttention(torch.nn.Module):
+    """Serving FA4 (``FlashAttnFixedSplitBackend``) with 6768-token pages and
+    the fixed split-KV schedule. Causal packed sequences starting at zero.
+
+    With KV scales: the static FP8 KV cache, FP8 query and KV quantization
+    with fixed scales. Without (``kv_cache_dtype=auto``): BF16 query and KV.
     """
 
-    def __init__(self, num_heads, num_kv_heads, head_dim, k_scale, v_scale):
+    def __init__(self, num_heads, num_kv_heads, head_dim, k_scale=None, v_scale=None):
         super().__init__()
-        self.register_buffer("k_scale", k_scale.detach().clone())
-        self.register_buffer("v_scale", v_scale.detach().clone())
+        if (k_scale is None) != (v_scale is None):
+            raise ValueError("Expected both FP8 KV scales or neither")
+        self.fp8 = k_scale is not None
+        if self.fp8:
+            self.register_buffer("k_scale", k_scale.detach().clone())
+            self.register_buffer("v_scale", v_scale.detach().clone())
         self.scale = head_dim**-0.5
         self.heads = (num_heads, num_kv_heads, head_dim)
 
     def _visible(self, q, k, v, boundaries):
-        """Return the serving output, its LSE and the dequantized Q/K/V."""
+        """Return the serving output, its LSE and the Q/K/V it attends over."""
         from vllm.v1.attention.backends.flash_attn_fixed_split import (
             MAX_SEQ_LEN,
             NUM_SPLITS,
@@ -59,23 +63,32 @@ class Fa4Fp8KVAttention(torch.nn.Module):
         )
         lengths = torch.tensor(lengths, device=q.device, dtype=torch.int32)
         cu = torch.tensor(boundaries, device=q.device, dtype=torch.int32)
-        cache = torch.zeros(
-            sum(owned), 2, 6768, 256, dtype=torch.uint8, device=q.device
-        )
-        # Serving rounds the KV scales to BF16 at load.
-        ks = self.k_scale.to(torch.bfloat16).float()
-        vs = self.v_scale.to(torch.bfloat16).float()
-        qs = torch.ones_like(ks)
-        quantized_q, _ = ops.scaled_fp8_quant(q.flatten(1), qs)
-        quantized_q = quantized_q.view(q.shape)
+        dtype = torch.uint8 if self.fp8 else torch.bfloat16
+        cache = torch.zeros(sum(owned), 2, 6768, 256, dtype=dtype, device=q.device)
         key_cache, value_cache = cache.transpose(1, 2).split(128, dim=-1)
-        reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "fp8_e4m3", ks, vs)
-        key_cache = key_cache.view(torch.float8_e4m3fn)
-        value_cache = value_cache.view(torch.float8_e4m3fn)
+        if self.fp8:
+            # Serving rounds the KV scales to BF16 at load.
+            ks = self.k_scale.to(torch.bfloat16).float()
+            vs = self.v_scale.to(torch.bfloat16).float()
+            qs = torch.ones_like(ks)
+            query, _ = ops.scaled_fp8_quant(q.flatten(1), qs)
+            query = query.view(q.shape)
+            reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "fp8_e4m3", ks, vs)
+            key_cache = key_cache.view(torch.float8_e4m3fn)
+            value_cache = value_cache.view(torch.float8_e4m3fn)
+            scale_shape = (lengths.numel(), 2)
+            descales = dict(
+                q_descale=qs.expand(scale_shape),
+                k_descale=ks.expand(scale_shape),
+                v_descale=vs.expand(scale_shape),
+            )
+        else:
+            ones = torch.ones(1, dtype=torch.float32, device=q.device)
+            reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "auto", ones, ones)
+            query, descales = q, {}
         output = torch.empty_like(q)
-        scale_shape = (lengths.numel(), 2)
         _, lse, *_ = _flash_attn_fwd(
-            quantized_q,
+            query,
             key_cache,
             value_cache,
             cu_seqlens_q=cu,
@@ -85,9 +98,7 @@ class Fa4Fp8KVAttention(torch.nn.Module):
             page_table=table,
             softmax_scale=self.scale,
             causal=True,
-            q_descale=qs.expand(scale_shape),
-            k_descale=ks.expand(scale_shape),
-            v_descale=vs.expand(scale_shape),
+            **descales,
             tile_mn=(128, 128),
             pack_gqa=True,
             num_splits=NUM_SPLITS,
@@ -96,11 +107,13 @@ class Fa4Fp8KVAttention(torch.nn.Module):
             out=output,
             return_lse=True,
         )
+        if not self.fp8:
+            return output, lse, q, k, v
         saved = cache[slots // 6768, :, slots % 6768]
         saved_k, saved_v = saved.view(torch.float8_e4m3fn).split(128, -1)
         k_ref = (saved_k.float() * ks).to(k.dtype)
         v_ref = (saved_v.float() * vs).to(v.dtype)
-        q_ref = (quantized_q.float() * qs).to(q.dtype)
+        q_ref = (query.float() * qs).to(q.dtype)
         return output, lse, q_ref, k_ref, v_ref
 
     def forward(self, q, k, v, meta):
@@ -112,20 +125,23 @@ class Fa4Fp8KVAttention(torch.nn.Module):
             or k.shape != (q.shape[0], hkv, dim)
         ):
             raise ValueError("Attention geometry does not match the module")
+        device = self.k_scale.device if self.fp8 else q.device
         if any(
-            x.dtype != torch.bfloat16
-            or not x.is_cuda
-            or x.device != self.k_scale.device
+            x.dtype != torch.bfloat16 or not x.is_cuda or x.device != device
             for x in (q, k, v)
         ):
             raise ValueError("Expected CUDA BF16 QKV on the scale device")
         if not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, v)):
             return self._visible(q, k, v, meta.boundaries)[0]
-        return _Fp8AttentionVJP.apply(q, k, v, self, meta.boundaries)
+        return _AttentionVJP.apply(q, k, v, self, meta.boundaries)
 
 
 class Attention(nn.Module):
-    """Nemotron's non-rotary attention; query width is independent of hidden size."""
+    """Nemotron's non-rotary attention; query width is independent of hidden size.
+
+    ``fp8_kv_scales`` is the checkpoint's (k_scale, v_scale) for a static FP8
+    KV cache, or None for a BF16 one.
+    """
 
     def __init__(
         self,
@@ -142,13 +158,12 @@ class Attention(nn.Module):
         if config.attention_bias:
             raise ValueError("Expected bias-free Nemotron attention")
         self.head_dim = config.head_dim
-        k_scale, v_scale = fp8_kv_scales
-        self.kv_attention = Fa4Fp8KVAttention(
+        scales = [] if fp8_kv_scales is None else fp8_kv_scales
+        self.kv_attention = Fa4KVAttention(
             config.num_attention_heads,
             config.num_key_value_heads,
             config.head_dim,
-            k_scale.to(device=device),
-            v_scale.to(device=device),
+            *(scale.to(device=device) for scale in scales),
         )
         for name, heads in (
             ("q_proj", config.num_attention_heads),

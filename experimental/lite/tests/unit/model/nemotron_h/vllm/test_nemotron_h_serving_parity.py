@@ -393,6 +393,35 @@ def test_export_rounds_kv_scales_to_bf16():
         assert not torch.equal(value, source)
 
 
+@pytest.mark.parametrize("fp8_kv", [True, False], ids=["fp8_kv", "bf16_kv"])
+def test_attention_holds_kv_scales_only_for_an_fp8_kv_cache(fp8_kv):
+    """An FP8 KV cache loads and exports the checkpoint's KV scales; a BF16
+    one (kv_cache_dtype=auto) has none for the loader or the refit."""
+    from types import SimpleNamespace
+
+    from megatron.lite.model.nemotron_h.checkpoint import NemotronExport, hf_tensor_views
+    from megatron.lite.model.nemotron_h.vllm.primitive.attention.module import Attention
+
+    config = SimpleNamespace(
+        attention_bias=False, head_dim=8, num_attention_heads=4,
+        num_key_value_heads=2, hidden_size=16,
+    )
+    attention = Attention(
+        config, None,
+        fp8_kv_scales=(torch.tensor(0.02), torch.tensor(0.01)) if fp8_kv else None,
+        projection_factory=lambda _name, *shape, **kwargs: torch.nn.Linear(*shape, **kwargs),
+        hf_prefix="backbone.layers.5.mixer",
+    )
+    assert attention.kv_attention.fp8 is fp8_kv
+    model = torch.nn.Module()
+    model.add_module("layers", torch.nn.ModuleDict({"5": torch.nn.Module()}))
+    model.layers["5"].add_module("mixer", attention)
+    scales = {f"backbone.layers.5.mixer.{x}_proj.{x}_scale" for x in "kv"}
+    expected = scales if fp8_kv else set()
+    assert {name for name, _ in hf_tensor_views(model)} & scales == expected
+    assert dict(NemotronExport.iter_export_tensors(None, model)).keys() & scales == expected
+
+
 # Per-rank source rows; a source rank with no tokens, and (last case) routes
 # that avoid rank 3's experts, so it receives no rows.
 EP4_ROWS = ((513, 7, 64, 1), (8192, 4096, 1, 2048), (0, 7, 64, 1), (33, 5, 0, 17))
