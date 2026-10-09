@@ -240,7 +240,16 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         self._runtime_ctx = None
 
     def __enter__(self):
-        super().__enter__()
+        # Optimizer offload: the train context keeps the optimizer state on the
+        # host through forward/backward and optimizer_step() brings it in for the
+        # step alone. Loading it on entry kept Adam's moments (~60 GiB per PP4
+        # stage of Nemotron-H 30B) resident under every 128K micro-batch from
+        # the second step on.
+        self.engine._defer_optimizer_load = self.mode == "train"
+        try:
+            super().__enter__()
+        finally:
+            self.engine._defer_optimizer_load = False
         assert self.engine.runtime is not None and self.engine.handle is not None
         if self.mode == "train":
             self._runtime_ctx = self.engine.runtime.train_mode(self.engine.handle)
@@ -253,6 +262,7 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
+        self.engine._optimizer_load_pending = False
         return False
 
 
@@ -281,6 +291,8 @@ class MegatronLiteEngine(BaseEngine):
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._defer_optimizer_load = False
+        self._optimizer_load_pending = False
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -333,7 +345,14 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
-        _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        if not self._optimizer_load_pending:
+            _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+            return grad_norm
+        self.runtime.to(self.handle, "cuda", model=False, optimizer=True, grad=False)
+        try:
+            _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        finally:
+            self.runtime.to(self.handle, "cpu", model=False, optimizer=True, grad=False)
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -442,6 +461,10 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
+        if optimizer and device != "cpu" and self._defer_optimizer_load:
+            self._optimizer_load_pending, optimizer = True, False
+        elif optimizer and device == "cpu" and self._optimizer_load_pending:
+            optimizer = False
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
