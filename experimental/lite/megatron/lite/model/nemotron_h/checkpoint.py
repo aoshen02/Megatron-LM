@@ -12,7 +12,27 @@ def is_expert(name):
 
 def hf_name(name):
     """HF name of a native module or tensor name."""
-    return name if name.split(".")[0] == "lm_head" else f"backbone.{name}"
+    return name if name.split(".")[0] in ("lm_head", "mtp") else f"backbone.{name}"
+
+
+def _mtp_experts(model):
+    """The trained MTP block's BF16 routed experts (native module name, module)."""
+    from megatron.lite.model.nemotron_h.vllm.mtp import Bf16RoutedExperts
+
+    return [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, Bf16RoutedExperts)
+    ]
+
+
+def _full_bf16(tensor):
+    """The forward's value of a (possibly FSDP2-sharded FP32) parameter."""
+    model_dtype = getattr(tensor, "_fsdp2_model_param_dtype", None)
+    if model_dtype is not None:
+        return tensor.full_tensor().to(model_dtype)
+    full_tensor = getattr(tensor, "full_tensor", None)
+    return full_tensor() if callable(full_tensor) else tensor
 
 
 def _routed_checkpoint_owners(model):
@@ -117,6 +137,12 @@ class NemotronExport:
         # EP shards use local expert numbers; the exporter gathers them.
         for weights in _routed_checkpoint_owners(model).values():
             yield from weights.export_quantized(local_names=model.ps.ep_size > 1).items()
+        for _, experts in _mtp_experts(model):
+            up, down = (_full_bf16(p).detach() for p in (experts.up_proj, experts.down_proj))
+            for expert in range(experts.num_local):
+                names = experts.hf_names(expert, local=model.ps.ep_size > 1)
+                yield names["up_proj"], up[expert]
+                yield names["down_proj"], down[expert]
 
 
 @torch.no_grad()
@@ -160,6 +186,7 @@ def refresh_quantized_projections(chunks, *, recompute_scales=False):
 def hf_tensor_views(model):
     """Yield HF names and destination views of the non-routed tensors."""
     routed = _routed_checkpoint_owners(model)
+    routed.update(dict(_mtp_experts(model)))
     for name, tensor in model.state_dict(keep_vars=True).items():
         if any(name.startswith(prefix + ".") for prefix in routed):
             continue
@@ -469,6 +496,7 @@ def load_hf_weights(model, path):
     missing = targets.keys() - index.keys()
     if missing:
         raise ValueError(f"Missing required HF weights: {sorted(missing)}")
+    _load_mtp_experts(model, root, index)
     for filename in sorted({index[name] for name in targets}):
         with safe_open(root / filename, framework="pt", device="cpu") as handle:
             for name, target in targets.items():
@@ -483,4 +511,36 @@ def load_hf_weights(model, path):
                     raise ValueError(
                         f"HF shape mismatch for {name}: {value.shape} != {target.shape}"
                     )
+                target.copy_(value)
+
+
+@torch.no_grad()
+def _load_mtp_experts(model, root, index):
+    """This EP rank's BF16 MTP experts, from the checkpoint (BF16 there; the
+    BF16 release holds the same bytes, which is checked)."""
+    experts_list = _mtp_experts(model)
+    if not experts_list:
+        return
+    master_root = Path(model._bf16_master_root)
+    source = json.loads((master_root / "model.safetensors.index.json").read_text())["weight_map"]
+    for _, experts in experts_list:
+        names = [
+            name
+            for expert in range(experts.num_local)
+            for name in experts.hf_names(expert).values()
+        ]
+        missing = [name for name in names if name not in index or name not in source]
+        if missing:
+            raise ValueError(f"Missing MTP expert tensors: {missing[:4]}")
+        device = experts.up_proj.device
+        ours = _read_tensors(root, index, names, device)
+        theirs = _read_tensors(master_root, source, names, device)
+        for expert in range(experts.num_local):
+            for projection, name in experts.hf_names(expert).items():
+                value = ours[name]
+                if value.dtype != torch.bfloat16 or not torch.equal(value, theirs[name]):
+                    raise ValueError(f"MTP expert differs from the BF16 release: {name}")
+                target = getattr(experts, projection)[expert]
+                if value.shape != target.shape:
+                    raise ValueError(f"MTP expert shape mismatch for {name}")
                 target.copy_(value)

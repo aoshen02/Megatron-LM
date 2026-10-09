@@ -79,6 +79,7 @@ class NemotronHModel(nn.Module):
         dtype=torch.bfloat16,
         fp8_kv_scales,
         projection_factory,
+        mtp=False,
     ):
         super().__init__()
         self.config, self.ps = config, ps
@@ -133,6 +134,17 @@ class NemotronHModel(nn.Module):
             if self.post_process
             else None
         )
+        self.mtp = None
+        if mtp:
+            from megatron.lite.model.nemotron_h.vllm.mtp import NemotronHMTP
+
+            if not (self.pre_process and self.post_process):
+                raise ValueError("The trained MTP block needs the embedding and head stage (PP1)")
+            if config.num_nextn_predict_layers != 1 or not config.mtp_layers_block_type:
+                raise ValueError("Expected one Nemotron MTP depth in the checkpoint")
+            self.mtp = NemotronHMTP(
+                config, ps, projection_factory=projection_factory, device=device, dtype=dtype
+            )
         self._input_tensor = None
 
     def set_input_tensor(self, tensor):
@@ -173,7 +185,7 @@ def attention_kv_scales(config, impl, layer_range, *, device):
     return load_fp8_kv_scales(impl.hf_path, attention_ids, device=device)
 
 
-def build_stage(config, impl, ps, *, layer_range):
+def build_stage(config, impl, ps, *, layer_range, mtp=False):
     """Construct one pipeline stage from the checkpoint, before optimizer binding."""
     from vllm.utils.torch_utils import set_default_torch_dtype
 
@@ -192,6 +204,7 @@ def build_stage(config, impl, ps, *, layer_range):
             dtype=torch.bfloat16,
             projection_factory=factory,
             fp8_kv_scales=kv,
+            mtp=mtp,
         )
     model._hf_root = str(Path(impl.hf_path).resolve())
     model._bf16_master_root = str(Path(impl.bf16_master_path).resolve())

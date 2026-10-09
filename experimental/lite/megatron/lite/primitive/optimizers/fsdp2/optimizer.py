@@ -105,6 +105,15 @@ class FSDP2Optimizer:
         self.tp_replicated_grad_sync_group = tp_replicated_grad_sync_group
         self._cpu_offloaded_state: dict[tuple[int, str], OffloadedStateEntry] = {}
         self.grad_sync_enabled = False
+        # Parameters clipped on their own norm, by group name.
+        self.separate_norm_param_ids: dict[str, set[int]] = {}
+        for group in getattr(optimizer, "param_groups", ()):
+            name = group.get("grad_norm_group")
+            if name is not None:
+                self.separate_norm_param_ids.setdefault(name, set()).update(
+                    id(param) for param in group["params"]
+                )
+        self.grad_norms_by_group: dict[str, float] = {}
 
     @property
     def param_groups(self):
@@ -166,14 +175,23 @@ class FSDP2Optimizer:
             if grad is not None:
                 grad.mul_(self.expert_sharded_grad_scale)
 
-    def compute_grad_norm(self) -> torch.Tensor:
+    def compute_grad_norm(self, only: set[int] | None = None) -> torch.Tensor:
+        """Norm over ``only`` (parameter ids), or else over every parameter
+        outside a separate norm group."""
+        if only is None:
+            skip = set().union(*self.separate_norm_param_ids.values())
+            keep = lambda param: id(param) not in skip  # noqa: E731
+        else:
+            keep = lambda param: id(param) in only  # noqa: E731
         excluded_sharded_param_ids = (
             self._replicated_grad_param_ids
             | self._tp_replicated_grad_param_ids
             | self._expert_sharded_grad_param_ids
         )
         sharded_params = [
-            param for param in self.params if id(param) not in excluded_sharded_param_ids
+            param
+            for param in self.params
+            if id(param) not in excluded_sharded_param_ids and keep(param)
         ]
         dtensor_sharded_params = [
             param for param in sharded_params if has_dtensor_grad_or_param(param)
@@ -208,12 +226,12 @@ class FSDP2Optimizer:
             all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.tp_group)
 
         tp_replicated_sq = sharded_grad_sq_sum(
-            self.tp_replicated_grad_params,
+            [param for param in self.tp_replicated_grad_params if keep(param)],
             accum_dtype=self.grad_norm_accum_dtype,
             default_device=total_sq.device,
         )
         replicated_sq = local_grad_sq_sum(
-            self.replicated_grad_params,
+            [param for param in self.replicated_grad_params if keep(param)],
             dtype=self.grad_norm_accum_dtype,
             default_device=total_sq.device,
         )
@@ -227,7 +245,7 @@ class FSDP2Optimizer:
             )
 
         expert_sharded_sq = sharded_grad_sq_sum(
-            self.expert_sharded_grad_params,
+            [param for param in self.expert_sharded_grad_params if keep(param)],
             accum_dtype=self.grad_norm_accum_dtype,
             default_device=total_sq.device,
         )
@@ -260,8 +278,23 @@ class FSDP2Optimizer:
 
     def clip_grad_norm(self) -> float:
         grad_norm = self.compute_grad_norm()
+        separate = set().union(*self.separate_norm_param_ids.values())
         if torch.isfinite(grad_norm):
-            clip_grads_with_sharded_norm_(self.params, self.clip_grad, grad_norm)
+            clip_grads_with_sharded_norm_(
+                [param for param in self.params if id(param) not in separate],
+                self.clip_grad,
+                grad_norm,
+            )
+        self.grad_norms_by_group = {}
+        for name, ids in self.separate_norm_param_ids.items():
+            group_norm = self.compute_grad_norm(only=ids)
+            if torch.isfinite(group_norm):
+                clip_grads_with_sharded_norm_(
+                    [param for param in self.params if id(param) in ids],
+                    self.clip_grad,
+                    group_norm,
+                )
+            self.grad_norms_by_group[name] = float(group_norm.float().item())
         return float(grad_norm.float().item())
 
     def state_dict(self) -> dict[str, Any]:
@@ -324,6 +357,7 @@ def build_fsdp2_adamw(
     adamw_foreach: bool | str = "auto",
     use_fp32_master: bool = False,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
+    separate_norm_group: tuple[str, Callable[[str], bool], float | None] | None = None,
 ) -> FSDP2Optimizer:
     """Build AdamW from Megatron Lite's shared OptimizerConfig-like object."""
 
@@ -336,6 +370,7 @@ def build_fsdp2_adamw(
         weight_decay=float(getattr(opt, "weight_decay", 0.01)),
         apply_wd_to_qk_layernorm=bool(getattr(opt, "apply_wd_to_qk_layernorm", False)),
         model_param_dtypes=model_param_dtypes,
+        separate_norm_group=separate_norm_group,
     )
     beta1 = getattr(opt, "adam_beta1", None)
     beta2 = getattr(opt, "adam_beta2", None)
@@ -395,8 +430,15 @@ def build_fsdp2_training_optimizer(
     use_fp32_shards: bool | None = None,
     use_fp32_master: bool | None = None,
     adamw_foreach: bool | str = _DEFAULT_ADAMW_FOREACH,
+    separate_norm_group: tuple[str, Callable[[str], bool], float | None] | None = None,
 ) -> FSDP2Optimizer:
-    """Wrap model chunks with FSDP2 and build the matching AdamW adapter."""
+    """Wrap model chunks with FSDP2 and build the matching AdamW adapter.
+
+    ``separate_norm_group=(name, classifier, lr)`` puts the parameters whose
+    names match ``classifier`` in their own AdamW groups (at ``lr`` when given;
+    the scheduler scales it like the base rate) and clips them on their own
+    gradient norm, which the main norm excludes.
+    """
 
     if (vpp or 1) > 1 and ps.pp_size <= 1:
         raise ValueError("optimizer='fsdp2' requires pp>1 when vpp>1.")
@@ -522,6 +564,7 @@ def build_fsdp2_training_optimizer(
         adamw_foreach=False if deterministic else adamw_foreach,
         use_fp32_master=fsdp2_use_fp32_master,
         model_param_dtypes=model_param_dtypes,
+        separate_norm_group=separate_norm_group,
     )
 
 
@@ -663,10 +706,13 @@ def _build_adamw_param_groups(
     weight_decay: float,
     apply_wd_to_qk_layernorm: bool,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
+    separate_norm_group: tuple[str, Callable[[str], bool], float | None] | None = None,
 ) -> tuple[list[nn.Parameter], list[dict[str, Any]], dict[int, str], dict[int, torch.dtype]]:
     params: list[nn.Parameter] = []
     decay_params: list[nn.Parameter] = []
     no_decay_params: list[nn.Parameter] = []
+    separate_decay: list[nn.Parameter] = []
+    separate_no_decay: list[nn.Parameter] = []
     param_names: dict[int, str] = {}
     param_model_dtypes: dict[int, torch.dtype] = {}
     seen_param_ids: set[int] = set()
@@ -685,10 +731,11 @@ def _build_adamw_param_groups(
                 model_dtype = fsdp2_model_param_dtype(param)
             if model_dtype is not None:
                 param_model_dtypes[id(param)] = model_dtype
+            separate = separate_norm_group is not None and separate_norm_group[1](name)
             if _matches_megatron_no_weight_decay(name, param, apply_wd_to_qk_layernorm):
-                no_decay_params.append(param)
+                (separate_no_decay if separate else no_decay_params).append(param)
             else:
-                decay_params.append(param)
+                (separate_decay if separate else decay_params).append(param)
 
     # Match Megatron's default get_megatron_optimizer(config_overrides=None):
     # 1D params and bias skip AdamW decay unless the Q/K layernorm override is set.
@@ -697,6 +744,19 @@ def _build_adamw_param_groups(
         param_groups.append({"params": decay_params, "weight_decay": weight_decay, "wd_mult": 1.0})
     if no_decay_params:
         param_groups.append({"params": no_decay_params, "weight_decay": 0.0, "wd_mult": 0.0})
+    if separate_norm_group is not None:
+        group_name, _, group_lr = separate_norm_group
+        extra = {"grad_norm_group": group_name}
+        if group_lr is not None:
+            extra["max_lr"] = float(group_lr)
+        if separate_decay:
+            param_groups.append(
+                {"params": separate_decay, "weight_decay": weight_decay, "wd_mult": 1.0, **extra}
+            )
+        if separate_no_decay:
+            param_groups.append(
+                {"params": separate_no_decay, "weight_decay": 0.0, "wd_mult": 0.0, **extra}
+            )
     return params, param_groups, param_names, param_model_dtypes
 
 

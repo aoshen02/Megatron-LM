@@ -57,6 +57,14 @@ class ImplConfig:
     # FP8 query and KV cache); "bf16" keeps them BF16 (W8A16 Mamba in/out_proj,
     # BF16 KV cache). The rollout must serve the same mode.
     activation_precision: str = "release"
+    # MTP (verl model.mtp): the trained block sees the policy's hidden states,
+    # embedding and LM head detached, so the policy update is unchanged; its
+    # parameters train at ``mtp_lr`` (None: the actor's) on their own gradient
+    # norm. ``mtp_enable`` alone keeps the block out of the actor.
+    mtp_enable: bool = False
+    mtp_enable_train: bool = False
+    mtp_loss_scaling_factor: float = 0.1
+    mtp_lr: float | None = None
 
 
 def build_model_config(source, **overrides):
@@ -229,6 +237,56 @@ def _check_router_gemm_rows_invariant():
             raise RuntimeError("Router GEMM depends on the row count")
 
 
+def _is_mtp(name):
+    return name.startswith("mtp.") or ".mtp." in name
+
+
+class _AddLoss(torch.autograd.Function):
+    """Identity on ``output``; backward also seeds ``loss`` with gradient one,
+    so a loss the caller never sees reaches its parameters (MTP)."""
+
+    @staticmethod
+    def forward(ctx, output, loss):
+        ctx.save_for_backward(loss)
+        return output.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        (loss,) = ctx.saved_tensors
+        return grad, torch.ones_like(loss)
+
+
+def _mtp_loss(model, packed, local, meta, hidden, ps, coef):
+    """MTP next-next-token loss on the detached policy hidden states.
+
+    Position i combines ``h[i]`` with ``embed(t[i+1])`` and predicts
+    ``t[i+2]`` where the loss mask (the sampled response tokens) covers it.
+    Returns (scaled loss to backpropagate, per-token NLL sum, mask count,
+    top-1 hits) over this rank's tokens.
+    """
+    from megatron.lite.model.nemotron_h.vllm.mtp import mtp_token_nll, roll_packed_left
+
+    root = unwrap_model(model)
+    boundaries = meta.boundaries
+    def rolled(tensor, fill):
+        return roll_packed_left(tensor.reshape(-1), boundaries, fill=fill)[None]
+
+    next_ids = local(rolled(packed.input_ids, 0))
+    targets = local(rolled(packed.labels, -1))
+    mask = packed.labels.new_ones(packed.labels.shape) if packed.loss_mask is None else packed.loss_mask
+    full_mask = rolled(mask, 0) * (rolled(packed.labels, -1) >= 0)
+    mask = local(full_mask)
+    with torch.no_grad():
+        embed = torch.nn.functional.embedding(next_ids, root.embeddings.weight)
+    out = root.mtp(hidden.detach(), embed, meta)
+    nll, hits = mtp_token_nll(out, root.lm_head, targets.clamp_min(0))
+    mask = mask.to(nll.dtype)
+    total = full_mask.sum().clamp_min(1)
+    # Same normalization as the policy's token mean (gradients average over DP*CP).
+    loss = coef * (nll * mask).sum() * ps.cp_size / total
+    return loss, (nll.detach() * mask).sum(), mask.sum(), (hits * mask.bool()).sum()
+
+
 def _token_mean_loss(log_probs, local_mask, full_mask, cp_size):
     # Megatron averages dense and expert gradients over DP*CP.
     return -(log_probs * local_mask).sum() * cp_size / full_mask.sum().clamp_min(1)
@@ -290,7 +348,22 @@ def _forward_step(model, batch):
     if packed.loss_mask is not None:
         full_mask = full_mask * packed.loss_mask
     loss = _token_mean_loss(log_probs, mask, full_mask, ps.cp_size)
+    root = unwrap_model(model)
+    mtp_stats = None
+    if getattr(root, "mtp", None) is not None and torch.is_grad_enabled():
+        mtp_loss, *mtp_stats = _mtp_loss(
+            model, packed, local, meta, output, ps, root.mtp_coef
+        )
+        # The policy's backward through log_probs also seeds the MTP loss.
+        log_probs = _AddLoss.apply(log_probs, mtp_loss)
     result = {"log_probs": log_probs[None], "loss": loss}
+    if mtp_stats is not None:
+        stats = torch.stack([t.float() for t in mtp_stats])
+        if ps.cp_size > 1:
+            torch.distributed.all_reduce(stats, group=ps.cp_group)
+        nll_sum, count, hits = stats
+        result["mtp_loss"] = nll_sum / count.clamp_min(1)
+        result["mtp_acc"] = hits / count.clamp_min(1)
     if calculate_entropy:
         result["entropy"] = entropy[None]
     return result
@@ -325,11 +398,16 @@ def _build_fsdp2(chunks, impl_cfg, ps):
     the gathered BF16 matrix the unsharded forward sees."""
     from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
+    from megatron.lite.model.nemotron_h.vllm.mtp import NemotronHMTP
+
     optimizer = build_fsdp2_training_optimizer(
         chunks,
         impl_cfg.optimizer_config,
         ps,
-        unit_modules=(NemotronHLayer,),
+        # The MTP block is its own unit: the policy's units and root group
+        # (embedding, final norm, LM head) keep the parameters they have without it.
+        unit_modules=(NemotronHLayer, NemotronHMTP),
+        separate_norm_group=("mtp", _is_mtp, impl_cfg.mtp_lr) if impl_cfg.mtp_enable_train else None,
         expert_classifier=is_expert,
         replicated_param_classifier=lambda _name, param: param.dtype == torch.float32,
         deterministic=impl_cfg.deterministic,
@@ -367,7 +445,11 @@ def build_model(model_cfg, *, impl_cfg):
         count * ps.pp_rank // ps.pp_size,
         count * (ps.pp_rank + 1) // ps.pp_size,
     )
-    chunks = [build_stage(model_cfg, impl_cfg, ps, layer_range=(start, end))]
+    mtp = impl_cfg.mtp_enable_train
+    if mtp and impl_cfg.optimizer != "fsdp2":
+        raise ValueError("Nemotron MTP training requires optimizer='fsdp2'")
+    chunks = [build_stage(model_cfg, impl_cfg, ps, layer_range=(start, end), mtp=mtp)]
+    chunks[0].mtp_coef = impl_cfg.mtp_loss_scaling_factor
     recompute = parse_recompute_spec(impl_cfg.recompute)
     if recompute:
         if recompute != ["full"]:

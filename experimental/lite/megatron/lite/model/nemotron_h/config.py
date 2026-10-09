@@ -42,6 +42,9 @@ class NemotronHConfig:
     n_group: int
     topk_group: int
     quantization_config: dict | None = None
+    # The MTP block (vLLM's drafter): one depth of these HF block kinds.
+    num_nextn_predict_layers: int = 0
+    mtp_layers_block_type: list[str] | None = None
 
     @property
     def num_hidden_layers(self) -> int:

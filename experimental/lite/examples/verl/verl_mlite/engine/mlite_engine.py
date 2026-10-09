@@ -135,7 +135,12 @@ class _MegatronLiteLRScheduler:
         lr = self._get_lr()
         wd = self._get_wd()
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            # A group with its own max_lr (MTP) follows the same schedule shape.
+            group_max = param_group.get("max_lr")
+            if group_max is None:
+                param_group["lr"] = lr
+            else:
+                param_group["lr"] = lr * group_max / self.max_lr if self.max_lr > 0 else group_max
             if param_group.get("weight_decay", None) is not None:
                 param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
@@ -202,6 +207,8 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
                 param_group["weight_decay"] = opt.weight_decay * param_group.get(
                     "wd_mult", 1.0
                 )
+            if param_group.get("max_lr") is not None:
+                param_group["lr"] = param_group["max_lr"]
         return None
 
     warmup_steps = opt.lr_warmup_steps if opt.lr_warmup_steps is not None else -1
@@ -347,12 +354,15 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         if not self._optimizer_load_pending:
             _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
-            return grad_norm
-        self.runtime.to(self.handle, "cuda", model=False, optimizer=True, grad=False)
-        try:
-            _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
-        finally:
-            self.runtime.to(self.handle, "cpu", model=False, optimizer=True, grad=False)
+        else:
+            self.runtime.to(self.handle, "cuda", model=False, optimizer=True, grad=False)
+            try:
+                _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+            finally:
+                self.runtime.to(self.handle, "cpu", model=False, optimizer=True, grad=False)
+        # Separately clipped groups (the trained MTP block); the base engine logs it.
+        norms = getattr(self.handle._optimizer, "grad_norms_by_group", None) or {}
+        self.mtp_grad_norm = norms.get("mtp")
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -698,6 +708,8 @@ class MegatronLiteEngine(BaseEngine):
             impl_cfg["mtp_loss_scaling_factor"] = float(
                 getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1)
             )
+            mtp_lr = getattr(mtp_cfg, "lr", None)
+            impl_cfg["mtp_lr"] = None if mtp_lr is None else float(mtp_lr)
         if self.engine_config.full_determinism:
             impl_cfg.setdefault("deterministic", True)
         if self.engine_config.forward_only:
@@ -1028,6 +1040,10 @@ class MegatronLiteEngine(BaseEngine):
                 metrics["mtp_losses/mtp_1_loss"] = (
                     float(mtp_loss.item()) if mtp_loss.numel() == 1 else mtp_loss.cpu().tolist()
                 )
+                if raw_output.get("mtp_acc") is not None:
+                    metrics["mtp_losses/mtp_1_top1"] = float(
+                        self._reduce_mtp_metric(raw_output["mtp_acc"]).item()
+                    )
 
             raw_output["_verl_metrics"] = metrics
             assert loss_fn_ref is not None
