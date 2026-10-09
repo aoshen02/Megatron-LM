@@ -200,3 +200,68 @@ def test_fixed_buffer_truncates_variable_len_gloo():  # OLD: fixed buffer overfl
     results = mp.get_context("spawn").SimpleQueue()
     with pytest.raises(Exception):  # gloo aborts the receiver -> spawn failure
         mp.spawn(_fixed_buffer_worker, args=(2, 29664, results), nprocs=2, join=True)
+
+
+# --- pp_max_in_flight on a real gloo PP4 ---
+# The cap bounds the micro-batches a stage holds activations for, while backward
+# stays FIFO and accumulates in micro-batch order, so grads must be bitwise equal
+# to the default 1F1B. A send/recv mis-pairing on any stage trips the gloo timeout.
+_CAPS = [None, 0, 1, 2, 3]
+_CAP_VARLEN = [5, 9, 3, 7, 4, 6]
+
+
+def _capped_1f1b_worker(rank, world, port, results):
+    from datetime import timedelta
+
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port),
+                      RANK=str(rank), WORLD_SIZE=str(world))
+    pl._PIPELINE_TENSOR_DTYPE = torch.float32
+    dist.init_process_group("gloo", rank=rank, world_size=world, timeout=timedelta(seconds=60))
+    orig_srp = pl._send_recv_pipeline
+    pl._send_recv_pipeline = lambda *a, **k: orig_srp(*a, **{**k, "batch_p2p": False})
+    try:
+        ps = _make_ps(world, rank)
+        grads, peak = {}, {}
+        for cap in _CAPS:
+            live = [0, 0]
+            model = _MockModel(_PP_H)
+            with torch.no_grad():
+                gen = torch.Generator().manual_seed(7 + rank)
+                model.weight.copy_(torch.randn(_PP_H, _PP_H, generator=gen) / _PP_H**0.5)
+
+            def forward_step_fn(m, batch):
+                base = batch["x"] if ps.pp_is_first else unwrap_model(m)._input_tensor
+                hidden_t = torch.tanh(base @ m.weight)
+                live[0] += 1
+                live[1] = max(live[1], live[0])
+                hidden_t.register_hook(lambda g: live.__setitem__(0, live[0] - 1))
+                out = {"hidden_states": hidden_t}
+                if ps.pp_is_last:
+                    out["loss"] = (hidden_t.float() ** 2).sum()
+                return out
+
+            batches = [({"x": _pp_hidden(i, s)}, None) for i, s in enumerate(_CAP_VARLEN)]
+            pl._1f1b_schedule(
+                forward_step_fn, model, iter(batches), len(batches),
+                SimpleNamespace(num_microbatches=len(batches), pp_max_in_flight=cap),
+                ps, (1, 1, _PP_H))
+            grads[cap], peak[cap] = model.weight.grad.clone(), live[1]
+        same = {c: bool(torch.equal(g, grads[None])) for c, g in grads.items()}
+        results.put((rank, (same, peak)))
+    finally:
+        pl._send_recv_pipeline = orig_srp
+        dist.destroy_process_group()
+
+
+def test_capped_warmup_grads_bitwise_and_no_deadlock_gloo_pp4():
+    import torch.multiprocessing as mp
+
+    results = mp.get_context("spawn").SimpleQueue()
+    mp.spawn(_capped_1f1b_worker, args=(4, 29665, results), nprocs=4, join=True)
+    by_rank = dict(results.get() for _ in range(4))
+    assert set(by_rank) == {0, 1, 2, 3}, by_rank
+    for rank, (same, peak) in by_rank.items():
+        assert all(same.values()), f"stage {rank}: grads differ from default 1F1B: {same}"
+        for cap, held in peak.items():
+            depth = min(4 - rank, len(_CAP_VARLEN))
+            assert held == (depth if cap is None else min(depth, cap + 1)), (rank, peak)

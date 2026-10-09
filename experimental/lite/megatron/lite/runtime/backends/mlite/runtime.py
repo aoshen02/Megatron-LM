@@ -557,7 +557,10 @@ class MegatronLiteRuntime(RuntimeBase):
                     pipeline_forward_step,
                     pipeline_chunks,
                     data_iter,
-                    SimpleNamespace(num_microbatches=num_microbatches),
+                    SimpleNamespace(
+                        num_microbatches=num_microbatches,
+                        pp_max_in_flight=self._cfg.impl_cfg.get("pp_max_in_flight"),
+                    ),
                     ps,
                     tensor_shape=tensor_shape,
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),

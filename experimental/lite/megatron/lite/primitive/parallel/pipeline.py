@@ -251,8 +251,20 @@ def _1f1b_schedule(
     receiver sizes its recv buffer from that. No local shape derivation, no fixed
     ``tensor_shape`` fallback — a desync fails loud instead of silently truncating.
     """
-    num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
-    num_steady = num_microbatches - num_warmup
+    # pp_max_in_flight=c runs the micro-batches as consecutive 1F1B pipelines of
+    # c + 1, so no stage holds more than c + 1 micro-batches' activations
+    # (c = 0: each one goes forward through every stage and back before the next).
+    # Backward stays FIFO per stage and accumulates in micro-batch order, so
+    # gradients are bitwise identical to one pipeline over all micro-batches.
+    # Capping the warmup inside a single pipeline instead would give adjacent
+    # stages equal warmup, and their combined send_fwd+recv_bwd exchanges then
+    # wait on each other (deadlock), so the cap drains between groups instead.
+    max_in_flight = getattr(config, "pp_max_in_flight", None)
+    if max_in_flight is not None and max_in_flight < 0:
+        raise ValueError(f"pp_max_in_flight must be >= 0, got {max_in_flight}")
+    group_size = num_microbatches
+    if max_in_flight is not None and max_in_flight < ps.pp_size - 1:
+        group_size = max_in_flight + 1
 
     # Split each microbatch into (PackedBatch, LossContext) like run_microbatch_loop; the connector
     # yields (batch, loss_context) tuples, so forward_step must receive the unwrapped batch.
@@ -299,84 +311,90 @@ def _1f1b_schedule(
             dynamic_shape=True,
         )
 
-    # ── Warmup: pure forward passes ──
     fwd_input: torch.Tensor | None = None
-    for k in range(num_warmup):
-        if not ps.pp_is_first and k == 0:
-            fwd_input, _ = _p2p(recv_fwd=True)
+    for group_start in range(0, num_microbatches, group_size):
+        group_len = min(group_size, num_microbatches - group_start)
+        last_group = group_start + group_len == num_microbatches
+        num_warmup = min(ps.pp_size - ps.pp_rank - 1, group_len)
+        num_steady = group_len - num_warmup
 
-        batch, loss_ctx = batches[mb_idx]
-        mb_idx += 1
-        current_input = fwd_input
-        out = _run_forward(fwd_input, batch, loss_ctx)
-        hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        # ── Warmup: pure forward passes ──
+        for k in range(num_warmup):
+            if not ps.pp_is_first and k == 0:
+                fwd_input, _ = _p2p(recv_fwd=True)
 
-        # Recv the next forward input for every remaining warmup mb AND — on the
-        # last warmup step — for the first STEADY mb (num_steady > 0). Middle
-        # stages (num_warmup >= 1 with steady work) otherwise never receive their
-        # first steady input -> None input / unmatched send -> crash/NCCL hang on
-        # PP >= 3. PP2 has no such stage, so this is a no-op there.
-        need_recv_next = not ps.pp_is_first and (k < num_warmup - 1 or num_steady > 0)
-        if not ps.pp_is_last:
-            fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next)
-        elif need_recv_next:
-            fwd_input, _ = _p2p(recv_fwd=True)
+            batch, loss_ctx = batches[mb_idx]
+            mb_idx += 1
+            current_input = fwd_input
+            out = _run_forward(fwd_input, batch, loss_ctx)
+            hidden = out.get("hidden_states")
+            loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
-        input_tensors.append(current_input if not ps.pp_is_first else None)
-        output_hiddens.append(hidden)
-        losses.append(loss_s)
-        # Fix 4: only keep loss from output, drop logits/hidden references
-        outputs.append(_compact_pipeline_output(out))
+            # Recv the next forward input for every remaining warmup mb AND — on the
+            # last warmup step — for the first STEADY mb (num_steady > 0). Middle
+            # stages (num_warmup >= 1 with steady work) otherwise never receive their
+            # first steady input -> None input / unmatched send -> crash/NCCL hang on
+            # PP >= 3. PP2 has no such stage, so this is a no-op there.
+            need_recv_next = not ps.pp_is_first and (k < num_warmup - 1 or num_steady > 0)
+            if not ps.pp_is_last:
+                fwd_input, _ = _p2p(send_fwd=hidden, recv_fwd=need_recv_next)
+            elif need_recv_next:
+                fwd_input, _ = _p2p(recv_fwd=True)
 
-    # ── Steady: interleaved forward + backward ──
-    for k in range(num_steady):
-        if grad_sync_fn and num_warmup == 0 and k == num_steady - 1:
-            grad_sync_fn()
+            input_tensors.append(current_input if not ps.pp_is_first else None)
+            output_hiddens.append(hidden)
+            losses.append(loss_s)
+            # Fix 4: only keep loss from output, drop logits/hidden references
+            outputs.append(_compact_pipeline_output(out))
 
-        if not ps.pp_is_first and k == 0 and num_warmup == 0:
-            fwd_input, _ = _p2p(recv_fwd=True)
+        # ── Steady: interleaved forward + backward ──
+        for k in range(num_steady):
+            if grad_sync_fn and last_group and num_warmup == 0 and k == num_steady - 1:
+                grad_sync_fn()
 
-        batch, loss_ctx = batches[mb_idx]
-        mb_idx += 1
-        out = _run_forward(fwd_input, batch, loss_ctx)
-        hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+            if not ps.pp_is_first and k == 0 and num_warmup == 0:
+                fwd_input, _ = _p2p(recv_fwd=True)
 
-        input_tensors.append(fwd_input if not ps.pp_is_first else None)
-        output_hiddens.append(hidden)
-        losses.append(loss_s)
-        outputs.append(_compact_pipeline_output(out))
+            batch, loss_ctx = batches[mb_idx]
+            mb_idx += 1
+            out = _run_forward(fwd_input, batch, loss_ctx)
+            hidden = out.get("hidden_states")
+            loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
 
-        send_fwd = hidden if not ps.pp_is_last else None
-        need_bwd = not ps.pp_is_last
-        _, bwd_grad = _p2p(send_fwd=send_fwd, recv_bwd=need_bwd)
+            input_tensors.append(fwd_input if not ps.pp_is_first else None)
+            output_hiddens.append(hidden)
+            losses.append(loss_s)
+            outputs.append(_compact_pipeline_output(out))
 
-        old_inp = input_tensors.pop(0)
-        old_hid = output_hiddens.pop(0)
-        old_loss = losses.pop(0)
-        in_grad = _run_backward(old_inp, old_hid, old_loss, bwd_grad)
+            send_fwd = hidden if not ps.pp_is_last else None
+            need_bwd = not ps.pp_is_last
+            _, bwd_grad = _p2p(send_fwd=send_fwd, recv_bwd=need_bwd)
 
-        send_bwd = in_grad if not ps.pp_is_first else None
-        need_fwd = not ps.pp_is_first and k < num_steady - 1
-        fwd_input, _ = _p2p(send_bwd=send_bwd, recv_fwd=need_fwd)
+            old_inp = input_tensors.pop(0)
+            old_hid = output_hiddens.pop(0)
+            old_loss = losses.pop(0)
+            in_grad = _run_backward(old_inp, old_hid, old_loss, bwd_grad)
 
-    # ── Cooldown: drain remaining backwards ──
-    for k in range(num_warmup):
-        if grad_sync_fn and k == num_warmup - 1:
-            grad_sync_fn()
+            send_bwd = in_grad if not ps.pp_is_first else None
+            need_fwd = not ps.pp_is_first and k < num_steady - 1
+            fwd_input, _ = _p2p(send_bwd=send_bwd, recv_fwd=need_fwd)
 
-        need_bwd = not ps.pp_is_last
-        _, bwd_grad = _p2p(recv_bwd=need_bwd)
+        # ── Cooldown: drain remaining backwards ──
+        for k in range(num_warmup):
+            if grad_sync_fn and last_group and k == num_warmup - 1:
+                grad_sync_fn()
 
-        old_inp = input_tensors.pop(0)
-        old_hid = output_hiddens.pop(0)
-        old_loss = losses.pop(0)
-        in_grad = _run_backward(old_inp, old_hid, old_loss, bwd_grad)
+            need_bwd = not ps.pp_is_last
+            _, bwd_grad = _p2p(recv_bwd=need_bwd)
 
-        send_bwd = in_grad if not ps.pp_is_first else None
-        if send_bwd is not None:
-            _p2p(send_bwd=send_bwd)
+            old_inp = input_tensors.pop(0)
+            old_hid = output_hiddens.pop(0)
+            old_loss = losses.pop(0)
+            in_grad = _run_backward(old_inp, old_hid, old_loss, bwd_grad)
+
+            send_bwd = in_grad if not ps.pp_is_first else None
+            if send_bwd is not None:
+                _p2p(send_bwd=send_bwd)
 
     return outputs
 
