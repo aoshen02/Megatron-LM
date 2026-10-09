@@ -84,13 +84,14 @@ class Router(nn.Module):
         )
 
     def forward(self, x):
+        from vllm.model_executor.determinism.batch_invariant import mm_batch_invariant
         from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
             grouped_topk,
         )
 
         config = self.config
         logits = visible_linear(
-            lambda x: torch.mm(x, self.weight.T, out_dtype=torch.float32),
+            lambda x: mm_batch_invariant(x, self.weight.T, out_dtype=torch.float32),
             x,
             self.weight,
         )
