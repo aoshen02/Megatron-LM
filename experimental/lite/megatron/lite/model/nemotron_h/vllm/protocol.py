@@ -169,8 +169,12 @@ def _validate_contract(config, impl):
         raise ValueError("Quantized Nemotron requires an explicit hf_path")
     if impl.optimizer_config is None:
         raise ValueError("Quantized Nemotron requires explicit optimizer_config")
-    if any(value != 1 for value in (p.tp, p.etp or 1, p.cp, p.vpp)):
-        raise ValueError("Quantized Nemotron requires TP/ETP/CP/VPP1")
+    if any(value != 1 for value in (p.tp, p.etp or 1, p.vpp)):
+        raise ValueError("Quantized Nemotron requires TP/ETP/VPP1")
+    if p.cp != 1:
+        # Mamba would start every CP slice from a zero state and attention
+        # would see only the local keys.
+        raise ValueError("Quantized Nemotron does not implement CP>1 yet")
     if (p.pp, p.ep) not in ((1, 1), (4, 1), (1, 4)):
         raise ValueError("Quantized Nemotron supports PP1/EP1, PP4/EP1 or PP1/EP4")
     if (
