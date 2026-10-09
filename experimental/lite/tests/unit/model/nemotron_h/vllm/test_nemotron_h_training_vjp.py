@@ -1134,3 +1134,143 @@ def test_ep4_fsdp2_checkpoint_restores_each_ranks_expert_bank(ep4, tmp_path):
     requantized deployment bytes (ISEEKYAN/Megatron-LM#235), not one bank on
     all ranks."""
     ep4(_ep4_checkpoint_worker, tmp_path)
+
+
+# A request longer than one CP shard, one split mid-chunk, and short ones.
+CP_LENGTHS = (9000, 3001, 1, 2047, 5000, 1295)
+
+
+def _cp_meta(cp):
+    import torch.distributed as dist
+
+    rank = dist.get_rank()
+    groups = [dist.new_group(list(range(s, s + cp))) for s in range(0, 4, cp)]
+    full = SSMMeta((0, *torch.tensor(CP_LENGTHS).cumsum(0).tolist()))
+    local = SSMMeta(full.boundaries, cp_size=cp, cp_rank=rank % cp, cp_group=groups[rank // cp])
+    return full, local, slice(*local.local_range())
+
+
+def _cp_reference_and_shard(full, local, rows, leaves, tokens, function, upstream):
+    """CP=1 output and gradients on every rank, then this rank's CP shard. The
+    first ``tokens`` leaves are per-token (sharded to ``rows``); the rest are
+    parameters, whose gradients sum over the CP ranks."""
+    import torch.distributed as dist
+
+    reference_inputs = [t.detach().clone().requires_grad_() for t in leaves]
+    reference = function(full, *reference_inputs)
+    reference_grads = torch.autograd.grad(reference, reference_inputs, upstream)
+    shard_inputs = [
+        (t[rows] if index < tokens else t).detach().clone().requires_grad_()
+        for index, t in enumerate(leaves)
+    ]
+    output = function(local, *shard_inputs)
+    grads = torch.autograd.grad(output, shard_inputs, upstream[rows])
+    for grad in grads[tokens:]:
+        dist.all_reduce(grad, group=local.cp_group)
+    reference_grads = [
+        g[rows] if index < tokens else g for index, g in enumerate(reference_grads)
+    ]
+    return reference[rows], output, reference_grads, grads
+
+
+def _assert_cp_gradients_close(names, expected, actual, tolerance):
+    for name, e, a in zip(names, expected, actual, strict=True):
+        e, a = e.double(), a.double()
+        error = ((a - e).norm() / e.norm().clamp_min(1e-30)).item()
+        assert error <= tolerance, (name, error)
+
+
+def _cp_attention_worker(rank, cp, kv):
+    torch.manual_seed(11)
+    full, local, rows = _cp_meta(cp)
+    module = _kv_attention(kv)
+    leaves = [
+        torch.randn(full.boundaries[-1], h, 128, device="cuda", dtype=torch.bfloat16)
+        for h in (32, 2, 2)
+    ]
+    upstream = torch.randn_like(leaves[0])
+    expected, output, expected_grads, grads = _cp_reference_and_shard(
+        full, local, rows, leaves, 3, lambda meta, *x: module(*x, meta), upstream
+    )
+    assert torch.equal(output, expected)
+    # dQ/dK/dV take FlashAttention's tiles over local queries and the K/V
+    # gradient is reduced over the CP ranks: BF16 rounding apart.
+    _assert_cp_gradients_close(("dq", "dk", "dv"), expected_grads, grads, 1e-2)
+
+
+@cuda
+@pytest.mark.gpus(4)
+@pytest.mark.parametrize("cp", [2, 4])
+@pytest.mark.parametrize("kv", list(KV_SCALES))
+def test_cp_attention_matches_cp1_bitwise(ep4, cp, kv, monkeypatch):
+    """Each CP rank attends its contiguous queries over the gathered keys with
+    the CP=1 query-chunk grid: the forward is the CP=1 rows, bitwise."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    ep4(_cp_attention_worker, cp, kv)
+
+
+def _lightning_mamba():
+    from types import SimpleNamespace
+
+    from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import MambaMixer
+
+    heads, head_dim, groups, state = 64, 64, 8, 128
+    inner = heads * head_dim
+    conv_dim = inner + 2 * groups * state
+    config = SimpleNamespace(
+        mamba_hidden_act="silu", hidden_size=2688, use_bias=False, use_conv_bias=True,
+        conv_kernel=4, mamba_num_heads=heads, mamba_head_dim=head_dim, n_groups=groups,
+        ssm_state_size=state, mamba_inner_size=inner, mamba_conv_dim=conv_dim,
+        mamba_in_proj_size=inner + conv_dim + heads, layer_norm_epsilon=1e-5,
+    )
+
+    def factory(name, inputs, outputs, *, bias, device, dtype):
+        return torch.nn.Linear(inputs, outputs, bias=bias, device=device, dtype=dtype)
+
+    mixer = MambaMixer(
+        config, None, device="cuda", projection_factory=factory, hf_prefix="mixer"
+    )
+    with torch.no_grad():
+        for parameter in mixer.parameters():
+            parameter.normal_(0, 0.02)
+        mixer.A_log.uniform_(0, 2)
+        mixer.D.uniform_(0.5, 1.5)
+        mixer.dt_bias.copy_(torch.empty(heads).uniform_(1e-3, 0.1).expm1().log())
+        mixer.conv1d.weight.normal_(0, 0.5)
+        mixer.norm.weight.uniform_(0.5, 1.5)
+    return mixer
+
+
+def _cp_mamba_worker(rank, cp):
+    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+
+    init_batch_invariance()
+    torch.manual_seed(13)
+    full, local, rows = _cp_meta(cp)
+    mixer = _lightning_mamba()
+    parameters = dict(mixer.named_parameters())
+    hidden = torch.randn(full.boundaries[-1], 2688, device="cuda", dtype=torch.bfloat16)
+    upstream = torch.randn_like(hidden)
+
+    def run(meta, hidden, *values):
+        overrides = dict(zip(parameters, values, strict=True))
+        return torch.func.functional_call(mixer, overrides, (hidden, meta))
+
+    expected, output, expected_grads, grads = _cp_reference_and_shard(
+        full, local, rows, [hidden, *parameters.values()], 1, run, upstream
+    )
+    assert torch.equal(output, expected)
+    # Weight gradients sum each rank's tokens (projections) or are reduced
+    # over the whole sequence per head (conv, SSM): BF16/FP32 rounding apart.
+    _assert_cp_gradients_close(["dhidden", *parameters], expected_grads, grads, 1e-2)
+
+
+@cuda
+@pytest.mark.gpus(4)
+@pytest.mark.parametrize("cp", [2, 4])
+def test_cp_mamba_mixer_matches_cp1_bitwise(ep4, cp, monkeypatch):
+    """Head-parallel CP runs each rank's heads over the whole packed sequence:
+    the convolution and the scan chunks are the CP=1 ones, so the mixer
+    output is the CP=1 rows, bitwise."""
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    ep4(_cp_mamba_worker, cp)

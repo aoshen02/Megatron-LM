@@ -14,10 +14,13 @@ class _AttentionVJP(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, module, boundaries):
-        output, _, q_ref, k_ref, v_ref = module._visible(q, k, v, boundaries)
+    def forward(ctx, q, k, v, module, boundaries, key_boundaries):
+        output, _, q_ref, k_ref, v_ref = module._visible(
+            q, k, v, boundaries, key_boundaries
+        )
         ctx.save_for_backward(q_ref, k_ref, v_ref)
-        ctx.boundaries, ctx.scale = boundaries, module.scale
+        ctx.bounds = boundaries, key_boundaries
+        ctx.scale = module.scale
         return output
 
     @staticmethod
@@ -28,11 +31,16 @@ class _AttentionVJP(torch.autograd.Function):
         )
 
         q, k, v = ctx.saved_tensors
-        longest = max(b - a for a, b in zip(ctx.boundaries, ctx.boundaries[1:]))
-        cu = torch.tensor(ctx.boundaries, dtype=torch.int32, device=q.device)
+        # Causal masks align the queries with the last keys (CP shards).
+        cu_q, cu_k = (
+            torch.tensor(b, dtype=torch.int32, device=q.device) for b in ctx.bounds
+        )
+        longest_q, longest_k = (
+            max(end - start for start, end in zip(b, b[1:])) for b in ctx.bounds
+        )
         varlen = dict(
-            cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=longest,
-            max_seqlen_k=longest,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k, max_seqlen_q=longest_q,
+            max_seqlen_k=longest_k,
         )
         output, lse, *_ = _flash_attn_fwd(
             q, k, v, softmax_scale=ctx.scale, causal=True, return_lse=True,
@@ -44,4 +52,4 @@ class _AttentionVJP(torch.autograd.Function):
             q, k, v, output, grad.contiguous(), lse, ctx.scale, True,
             deterministic=True, **varlen,
         )
-        return *gradients[:3], None, None
+        return *gradients[:3], None, None, None

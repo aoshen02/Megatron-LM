@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from megatron.lite.model.nemotron_h.vllm.primitive.attention.backward import _AttentionVJP
+from megatron.lite.model.nemotron_h.vllm.primitive.cp import gather_sequence
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 
@@ -36,8 +37,12 @@ class Fa4KVAttention(torch.nn.Module):
         self.scale = head_dim**-0.5
         self.heads = (num_heads, num_kv_heads, head_dim)
 
-    def _visible(self, q, k, v, boundaries):
-        """Return the serving output, ``None`` (no LSE) and the Q/K/V it attends over."""
+    def _visible(self, q, k, v, boundaries, key_boundaries=None):
+        """Return the serving output, ``None`` (no LSE) and the Q/K/V it attends over.
+
+        Request i's queries ``q[boundaries[i]:boundaries[i + 1]]`` are the last
+        ones of its keys ``k[key_boundaries[i]:key_boundaries[i + 1]]`` (all of
+        them unless CP splits the request)."""
         from vllm.v1.attention.backends.flash_attn_fixed_split import (
             MAX_SEQ_LEN,
             NUM_SPLITS,
@@ -47,7 +52,8 @@ class Fa4KVAttention(torch.nn.Module):
         from vllm import _custom_ops as ops
         from vllm.vllm_flash_attn.cute.interface import _flash_attn_fwd
 
-        lengths = [end - start for start, end in zip(boundaries, boundaries[1:])]
+        key_boundaries = boundaries if key_boundaries is None else key_boundaries
+        lengths = [end - start for start, end in zip(key_boundaries, key_boundaries[1:])]
         if any(length > MAX_SEQ_LEN for length in lengths):
             raise ValueError(f"Expected sequences no longer than {MAX_SEQ_LEN}")
         # Each sequence owns the 6768-token pages it fills; the rest of its
@@ -99,12 +105,18 @@ class Fa4KVAttention(torch.nn.Module):
         # (NUM_SPLITS x chunk x heads x dim, FP32) stays bounded.
         output = torch.empty_like(q)
         for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
-            for lo in range(start, end, QUERY_CHUNK_TOKENS):
-                hi = min(lo + QUERY_CHUNK_TOKENS, end)
+            # Query chunks on the CP=1 grid of request positions.
+            length = lengths[index]
+            skipped = length - (end - start)
+            lo = skipped
+            while lo < length:
+                hi = min((lo // QUERY_CHUNK_TOKENS + 1) * QUERY_CHUNK_TOKENS, length)
+                rows = slice(start + lo - skipped, start + hi - skipped)
                 cu_q = torch.tensor([0, hi - lo], device=q.device, dtype=torch.int32)
-                used_k = torch.tensor([hi - start], device=q.device, dtype=torch.int32)
+                used_k = torch.tensor([hi], device=q.device, dtype=torch.int32)
+                lo = hi
                 _flash_attn_fwd(
-                    query[lo:hi],
+                    query[rows],
                     key_cache,
                     value_cache,
                     cu_seqlens_q=cu_q,
@@ -120,7 +132,7 @@ class Fa4KVAttention(torch.nn.Module):
                     num_splits=NUM_SPLITS,
                     seqlen_k_per_split=SEQLEN_K_PER_SPLIT,
                     disable_scheduler_metadata=True,
-                    out=output[lo:hi],
+                    out=output[rows],
                 )
         if not self.fp8:
             return output, None, q, k, v
@@ -146,9 +158,12 @@ class Fa4KVAttention(torch.nn.Module):
             for x in (q, k, v)
         ):
             raise ValueError("Expected CUDA BF16 QKV on the scale device")
+        queries, keys, key_start, key_end = meta.attention_spans()
+        if meta.cp_size > 1:
+            k, v = (gather_sequence(x, meta)[key_start:key_end] for x in (k, v))
         if not torch.is_grad_enabled() or not any(t.requires_grad for t in (q, k, v)):
-            return self._visible(q, k, v, meta.boundaries)[0]
-        return _AttentionVJP.apply(q, k, v, self, meta.boundaries)
+            return self._visible(q, k, v, queries, keys)[0]
+        return _AttentionVJP.apply(q, k, v, self, queries, keys)
 
 
 class Attention(nn.Module):

@@ -171,12 +171,11 @@ def _validate_contract(config, impl):
         raise ValueError("Quantized Nemotron requires explicit optimizer_config")
     if any(value != 1 for value in (p.tp, p.etp or 1, p.vpp)):
         raise ValueError("Quantized Nemotron requires TP/ETP/VPP1")
-    if p.cp != 1:
-        # Mamba would start every CP slice from a zero state and attention
-        # would see only the local keys.
-        raise ValueError("Quantized Nemotron does not implement CP>1 yet")
     if (p.pp, p.ep) not in ((1, 1), (4, 1), (1, 4)):
         raise ValueError("Quantized Nemotron supports PP1/EP1, PP4/EP1 or PP1/EP4")
+    # Head-parallel Mamba gives each CP rank whole B/C groups.
+    if p.cp not in (1, 2, 4, 8) or config.n_groups % p.cp:
+        raise ValueError("Nemotron CP must divide the Mamba groups")
     if (
         config.hidden_size,
         config.n_routed_experts,
@@ -259,7 +258,12 @@ def _forward_step(model, batch):
             tensor, ps.cp_rank, ps.cp_size, seq_dim=1
         ).reshape(-1)
 
-    meta = SSMMeta(tuple(packed.cu_seqlens_padded.cpu().tolist()))
+    meta = SSMMeta(
+        tuple(packed.cu_seqlens_padded.cpu().tolist()),
+        cp_size=ps.cp_size,
+        cp_rank=ps.cp_rank,
+        cp_group=ps.cp_group if ps.cp_size > 1 else None,
+    )
     labels = local(packed.labels)
     output = model(local(packed.input_ids), meta=meta, return_logits=labels is None)
     if not ps.pp_is_last:
