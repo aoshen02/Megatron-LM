@@ -703,6 +703,28 @@ def test_attention_cache_pages_follow_request_lengths(kv, limit, monkeypatch):
         assert torch.equal(packed[start:end], alone[0])
 
 
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("kv", list(KV_SCALES))
+def test_attention_query_chunks_match_one_call(kv, monkeypatch):
+    """Long-context training splits each sequence's queries like serving's
+    chunked prefill; the fixed split-KV schedule keeps every token bitwise."""
+    from megatron.lite.model.nemotron_h.vllm.primitive.attention import module as attention
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    torch.manual_seed(5)
+    module = _kv_attention(kv)
+    bounds = [0, 9000, 9001, 13129]
+    q, k, v = (
+        torch.randn(bounds[-1], h, 128, device="cuda", dtype=torch.bfloat16)
+        for h in (32, 2, 2)
+    )
+    monkeypatch.setattr(attention, "QUERY_CHUNK_TOKENS", 1 << 30)
+    whole = module._visible(q, k, v, bounds)[0]
+    for chunk in (4096, 1000, 128):
+        monkeypatch.setattr(attention, "QUERY_CHUNK_TOKENS", chunk)
+        assert torch.equal(module._visible(q, k, v, bounds)[0], whole)
+
+
 def test_vendor_backward_signatures_match_the_positional_calls():
     """The attention and Mamba VJPs pass these vendor backwards positionally;
     a reordered signature would silently swap arguments."""

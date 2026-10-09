@@ -8,6 +8,10 @@ from megatron.lite.model.nemotron_h.vllm.primitive.dense import projection
 from megatron.lite.model.nemotron_h.vllm.primitive.mamba.module import SSMMeta
 
 
+# Query tokens per FA4 call; bounds the split-KV scratch at long context.
+QUERY_CHUNK_TOKENS = 4096
+
+
 class Fa4KVAttention(torch.nn.Module):
     """Serving FA4 (``FlashAttnFixedSplitBackend``) with 6768-token pages and
     the fixed split-KV schedule. Causal packed sequences starting at zero.
@@ -33,7 +37,7 @@ class Fa4KVAttention(torch.nn.Module):
         self.heads = (num_heads, num_kv_heads, head_dim)
 
     def _visible(self, q, k, v, boundaries):
-        """Return the serving output, its LSE and the Q/K/V it attends over."""
+        """Return the serving output, ``None`` (no LSE) and the Q/K/V it attends over."""
         from vllm.v1.attention.backends.flash_attn_fixed_split import (
             MAX_SEQ_LEN,
             NUM_SPLITS,
@@ -66,8 +70,6 @@ class Fa4KVAttention(torch.nn.Module):
                 for start, length in zip(first, lengths)
             ]
         )
-        lengths = torch.tensor(lengths, device=q.device, dtype=torch.int32)
-        cu = torch.tensor(boundaries, device=q.device, dtype=torch.int32)
         dtype = torch.uint8 if self.fp8 else torch.bfloat16
         cache = torch.zeros(sum(owned), 2, 6768, 256, dtype=dtype, device=q.device)
         key_cache, value_cache = cache.transpose(1, 2).split(128, dim=-1)
@@ -81,7 +83,7 @@ class Fa4KVAttention(torch.nn.Module):
             reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "fp8_e4m3", ks, vs)
             key_cache = key_cache.view(torch.float8_e4m3fn)
             value_cache = value_cache.view(torch.float8_e4m3fn)
-            scale_shape = (lengths.numel(), 2)
+            scale_shape = (1, 2)
             descales = dict(
                 q_descale=qs.expand(scale_shape),
                 k_descale=ks.expand(scale_shape),
@@ -91,35 +93,43 @@ class Fa4KVAttention(torch.nn.Module):
             ones = torch.ones(1, dtype=torch.float32, device=q.device)
             reshape_and_cache_flash(k, v, key_cache, value_cache, slots, "auto", ones, ones)
             query, descales = q, {}
+        # Serving's chunked prefill: each query chunk reads the cached keys up
+        # to its last token. The fixed split-KV schedule makes every token's
+        # output independent of the chunking, and the split scratch
+        # (NUM_SPLITS x chunk x heads x dim, FP32) stays bounded.
         output = torch.empty_like(q)
-        _, lse, *_ = _flash_attn_fwd(
-            query,
-            key_cache,
-            value_cache,
-            cu_seqlens_q=cu,
-            seqused_k=lengths,
-            max_seqlen_q=MAX_SEQ_LEN,
-            max_seqlen_k=MAX_SEQ_LEN,
-            page_table=table,
-            softmax_scale=self.scale,
-            causal=True,
-            **descales,
-            tile_mn=(128, 128),
-            pack_gqa=True,
-            num_splits=NUM_SPLITS,
-            seqlen_k_per_split=SEQLEN_K_PER_SPLIT,
-            disable_scheduler_metadata=True,
-            out=output,
-            return_lse=True,
-        )
+        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
+            for lo in range(start, end, QUERY_CHUNK_TOKENS):
+                hi = min(lo + QUERY_CHUNK_TOKENS, end)
+                cu_q = torch.tensor([0, hi - lo], device=q.device, dtype=torch.int32)
+                used_k = torch.tensor([hi - start], device=q.device, dtype=torch.int32)
+                _flash_attn_fwd(
+                    query[lo:hi],
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q=cu_q,
+                    seqused_k=used_k,
+                    max_seqlen_q=MAX_SEQ_LEN,
+                    max_seqlen_k=MAX_SEQ_LEN,
+                    page_table=table[index : index + 1],
+                    softmax_scale=self.scale,
+                    causal=True,
+                    **descales,
+                    tile_mn=(128, 128),
+                    pack_gqa=True,
+                    num_splits=NUM_SPLITS,
+                    seqlen_k_per_split=SEQLEN_K_PER_SPLIT,
+                    disable_scheduler_metadata=True,
+                    out=output[lo:hi],
+                )
         if not self.fp8:
-            return output, lse, q, k, v
+            return output, None, q, k, v
         saved = cache[slots // 6768, :, slots % 6768]
         saved_k, saved_v = saved.view(torch.float8_e4m3fn).split(128, -1)
         k_ref = (saved_k.float() * ks).to(k.dtype)
         v_ref = (saved_v.float() * vs).to(v.dtype)
         q_ref = (query.float() * qs).to(q.dtype)
-        return output, lse, q_ref, k_ref, v_ref
+        return output, None, q_ref, k_ref, v_ref
 
     def forward(self, q, k, v, meta):
         meta.validate_tokens(q.shape[0])
