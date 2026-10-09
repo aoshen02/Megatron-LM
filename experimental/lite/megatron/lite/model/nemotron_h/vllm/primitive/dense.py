@@ -89,6 +89,41 @@ def compiled_vjp_or_eager(compiled, eager, *args):
         return eager(*args)
 
 
+# Norm VJPs run on fixed [NORM_VJP_CHUNK, width] token chunks, the last one
+# zero-padded. A static-shape compile per token count would recompile for every
+# THD micro-batch length, hit dynamo's recompile limit and fall back to eager,
+# which differs bitwise from the compiled kernel and keeps ~10 FP32 [T, width]
+# temporaries alive (+21 GiB for the gated norm at 128K tokens). One shape
+# keeps the kernel, its numerics and its memory independent of the lengths
+# seen before. Zero rows yield zero gradients, so padding does not change the
+# real rows or the FP32 weight-gradient partial sums.
+NORM_VJP_CHUNK = 16384
+
+
+def chunked_norm_vjp(compiled, eager, num_token_args, *args):
+    """``args[:num_token_args]`` are ``[..., width]`` per-token tensors; the rest
+    pass through. Returns the per-token gradients, then the summed weight grad."""
+    token_args, rest = args[:num_token_args], args[num_token_args:]
+    shape = token_args[0].shape
+    flat = [t.reshape(-1, t.shape[-1]) for t in token_args]
+    tokens = flat[0].shape[0]
+    if tokens == 0:
+        return eager(*args)
+    per_token, grad_weight = None, None
+    for start in range(0, tokens, NORM_VJP_CHUNK):
+        chunk = [t[start : start + NORM_VJP_CHUNK] for t in flat]
+        rows = chunk[0].shape[0]
+        if rows < NORM_VJP_CHUNK:
+            chunk = [torch.nn.functional.pad(t, (0, 0, 0, NORM_VJP_CHUNK - rows)) for t in chunk]
+        *grads, partial = compiled_vjp_or_eager(compiled, eager, *chunk, *rest)
+        if per_token is None:
+            per_token = [g.new_empty(tokens, g.shape[-1]) for g in grads]
+        for out, g in zip(per_token, grads):
+            out[start : start + rows] = g[:rows]
+        grad_weight = partial if grad_weight is None else grad_weight + partial
+    return (*(g.reshape(shape) for g in per_token), grad_weight)
+
+
 def _rms_norm_vjp(grad_output, value, weight, eps):
     x = value.float()
     w = weight.float()
@@ -98,7 +133,7 @@ def _rms_norm_vjp(grad_output, value, weight, eps):
     correction = (scaled_grad * x).mean(dim=-1, keepdim=True)
     grad_value = (scaled_grad * rstd - x * rstd.pow(3) * correction).to(value.dtype)
     reduce_dims = tuple(range(grad.ndim - 1))
-    grad_weight = (grad * x * rstd).sum(dim=reduce_dims).to(weight.dtype)
+    grad_weight = (grad * x * rstd).sum(dim=reduce_dims)
     return grad_value, grad_weight
 
 
@@ -123,7 +158,7 @@ def _gated_rms_norm_vjp(grad_output, x, gate, weight, group_size, eps):
     grad_x = (grad_y * g * sigmoid).to(x.dtype)
     grad_gate = (grad_y * x.float() * sigmoid * (1 + g * (1 - sigmoid))).to(gate.dtype)
     reduce_dims = tuple(range(grad.ndim - 1))
-    grad_weight = (grad * normalized.flatten(-2)).sum(dim=reduce_dims).to(weight.dtype)
+    grad_weight = (grad * normalized.flatten(-2)).sum(dim=reduce_dims)
     return grad_x, grad_gate, grad_weight
 
 
@@ -149,10 +184,10 @@ class _RMSNormVJP(torch.autograd.Function):
     def backward(ctx, grad_output):
         value, weight = ctx.saved_tensors
         check_parameter_versions((weight,), ctx.versions)
-        grad_value, grad_weight = compiled_vjp_or_eager(
-            _compiled_rms_norm_vjp, _rms_norm_vjp, grad_output, value, weight, ctx.eps
+        grad_value, grad_weight = chunked_norm_vjp(
+            _compiled_rms_norm_vjp, _rms_norm_vjp, 2, grad_output, value, weight, ctx.eps
         )
-        return None, grad_value, grad_weight, None
+        return None, grad_value, grad_weight.to(weight.dtype), None
 
 
 class _ResidualRMSNormVJP(torch.autograd.Function):
@@ -166,9 +201,10 @@ class _ResidualRMSNormVJP(torch.autograd.Function):
     def backward(ctx, grad_output, grad_residual):
         x, residual, weight = ctx.saved_tensors
         check_parameter_versions((weight,), ctx.versions)
-        grads = compiled_vjp_or_eager(
+        *grads, grad_weight = chunked_norm_vjp(
             _compiled_residual_rms_norm_vjp,
             _residual_rms_norm_vjp,
+            4,
             grad_output,
             grad_residual,
             x,
@@ -176,7 +212,7 @@ class _ResidualRMSNormVJP(torch.autograd.Function):
             weight,
             ctx.eps,
         )
-        return None, *grads, None
+        return None, *grads, grad_weight.to(weight.dtype), None
 
 
 class _GatedRMSNormVJP(torch.autograd.Function):
@@ -191,9 +227,10 @@ class _GatedRMSNormVJP(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, gate, weight = ctx.saved_tensors
         check_parameter_versions((weight,), ctx.versions)
-        grads = compiled_vjp_or_eager(
+        *grads, grad_weight = chunked_norm_vjp(
             _compiled_gated_rms_norm_vjp,
             _gated_rms_norm_vjp,
+            3,
             grad_output,
             x,
             gate,
@@ -201,7 +238,7 @@ class _GatedRMSNormVJP(torch.autograd.Function):
             ctx.group_size,
             ctx.eps,
         )
-        return None, *grads, None, None
+        return None, *grads, grad_weight.to(weight.dtype), None, None
 
 
 class GatedRMSNorm(torch.nn.Module):

@@ -495,6 +495,26 @@ def test_rms_norm_vjp_within_bf16_noise_floor(norm, kind):
     assert_within_noise_floor(names, actual, expected, reference, kind)
 
 
+@pytest.mark.gpus(1)
+def test_gated_rms_norm_vjp_independent_of_token_count():
+    """A token's norm gradients do not depend on how many tokens share the call
+    or on how many lengths were seen before (no per-length recompile/eager)."""
+    from megatron.lite.model.nemotron_h.vllm.primitive import dense
+
+    torch.manual_seed(0)
+    rows = [torch.randn(40000, 4096, device="cuda", dtype=torch.bfloat16) for _ in range(3)]
+    weight = torch.empty(4096, device="cuda").uniform_(0.5, 1.5)
+    head = None
+    for tokens in (1506, 17000, 40000, *range(2000, 2000 + 10 * 37, 37)):
+        grads = dense.chunked_norm_vjp(
+            dense._compiled_gated_rms_norm_vjp, dense._gated_rms_norm_vjp, 3,
+            *(r[:tokens] for r in rows), weight, 512, 1e-5)
+        part = [g[:1506] for g in grads[:-1]]
+        if head is None:
+            head = part
+        assert all(map(torch.equal, part, head)), tokens
+
+
 def _lightning_router():
     from types import SimpleNamespace
 
