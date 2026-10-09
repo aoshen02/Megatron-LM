@@ -205,11 +205,12 @@ def _check_runtime(ps):
 
     if not envs.VLLM_BATCH_INVARIANT:
         raise RuntimeError("Quantized Nemotron requires BI=1 before startup")
+    # Whole PP x EP replicas; more than one is expert data parallelism.
     if (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != ps.pp_size * ps.ep_size
+        or torch.distributed.get_world_size() % (ps.pp_size * ps.ep_size)
     ):
-        raise RuntimeError("Torch world must be PP x EP")
+        raise RuntimeError("Torch world must be a multiple of PP x EP")
 
 
 @torch.no_grad()
