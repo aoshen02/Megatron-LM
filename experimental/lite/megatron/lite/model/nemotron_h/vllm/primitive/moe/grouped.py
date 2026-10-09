@@ -565,6 +565,39 @@ def routed_vjp(x, fc1, visible, up, down, routes, ids, dy, activated=None, *, pe
     return dx.to(x.dtype), d_up, d_down, d_routes
 
 
+# Tokens per routed-expert VJP call; the [tokens*topk, K] FP32 temporaries of
+# one call otherwise grow with the sequence (~20 GB per 64K tokens).
+VJP_CHUNK_TOKENS = 16384
+
+
+def chunked_routed_vjp(x, slot_rows, up, down, routes, ids, dy, *, per_route=False):
+    """``routed_vjp`` over token chunks; ``slot_rows(a, b)`` returns the
+    ``(fc1, visible, activated)`` routes of tokens ``[a, b)``. Each token's
+    input and route gradients are its own; the expert-weight gradients add the
+    chunks' partial sums in FP32."""
+    m, k = x.shape
+    if m <= VJP_CHUNK_TOKENS:
+        fc1, visible, activated = slot_rows(0, m)
+        return routed_vjp(
+            x, fc1, visible, up, down, routes, ids, dy, activated, per_route=per_route
+        )
+    topk = ids.shape[1]
+    dx = x.new_empty((m, topk, k) if per_route else (m, k))
+    d_routes = routes.new_empty(m, topk)
+    d_up = torch.zeros_like(up, dtype=torch.float32)
+    d_down = torch.zeros_like(down, dtype=torch.float32)
+    for a in range(0, m, VJP_CHUNK_TOKENS):
+        b = min(a + VJP_CHUNK_TOKENS, m)
+        fc1, visible, activated = slot_rows(a, b)
+        dx[a:b], chunk_up, chunk_down, d_routes[a:b] = routed_vjp(
+            x[a:b], fc1, visible, up, down, routes[a:b], ids[a:b], dy[a:b], activated,
+            per_route=per_route,
+        )
+        d_up += chunk_up
+        d_down += chunk_down
+    return dx, d_up.to(up.dtype), d_down.to(down.dtype), d_routes
+
+
 def sum_route_grads(per_route):
     """[M, topk, K] -> [M, K] as DS4's deterministic scatter backward: slot
     order, rounded to BF16 after each add."""
@@ -588,8 +621,16 @@ class RoutedExpertsVJP(torch.autograd.Function):
         if ctx.owner.weights._versions() != ctx.versions:
             raise RuntimeError("Expert masters changed before backward")
         x, fc1, visible, up, down, routes, ids, activated = ctx.saved_tensors
-        dx, d_up, d_down, d_routes = routed_vjp(
-            x, fc1, visible, up, down, routes, ids, dy, activated
+        topk = ids.shape[1]
+
+        def slot_rows(a, b):
+            return tuple(
+                None if t is None else t[a * topk : b * topk]
+                for t in (fc1, visible, activated)
+            )
+
+        dx, d_up, d_down, d_routes = chunked_routed_vjp(
+            x, slot_rows, up, down, routes, ids, dy
         )
         return dx, d_up, d_down, d_routes, None, None
 

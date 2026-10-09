@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.lite.model.nemotron_h.vllm.primitive.moe.grouped import (
-    routed_vjp,
+    chunked_routed_vjp,
     sum_route_grads,
 )
 
@@ -209,18 +209,23 @@ class EPRoutedExpertsVJP(torch.autograd.Function):
         )
         m, k = ctx.x_shape
         topk = plan.ids.shape[1]
-        slots = recv_x.shape[0] * topk
-        fc1 = fc1.new_zeros(slots, fc1.shape[1]).index_copy_(0, owned, fc1)
-        visible = visible.new_zeros(slots, k).index_copy_(0, owned, visible)
-        activated = activated.new_zeros(slots, activated.shape[1]).index_copy_(
-            0, owned, activated
-        )
         rows_dy = dy.to(torch.bfloat16).index_select(0, plan.token).contiguous()
+
+        def slot_rows(a, b):
+            # This rank's routes among received rows [a, b), in slot layout.
+            lo, hi = torch.searchsorted(
+                owned, torch.tensor([a * topk, b * topk], device=owned.device)
+            ).tolist()
+            index = owned[lo:hi] - a * topk
+            return tuple(
+                t.new_zeros((b - a) * topk, t.shape[1]).index_copy_(0, index, t[lo:hi])
+                for t in (fc1, visible, activated)
+            )
+
         with _deepep_memory():
             recv_dy, *_ = buffer.dispatch(rows_dy, handle=handle)
-            dx_routes, d_up, d_down, dw_rows = routed_vjp(
-                recv_x, fc1, visible, up, down, recv_w, recv_idx, recv_dy, activated,
-                per_route=True,
+            dx_routes, d_up, d_down, dw_rows = chunked_routed_vjp(
+                recv_x, slot_rows, up, down, recv_w, recv_idx, recv_dy, per_route=True
             )
             returned_dx, returned_dw = _combine(
                 buffer, dx_routes.view(-1, topk * k), handle, topk_weights=dw_rows.float()
