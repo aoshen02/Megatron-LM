@@ -533,6 +533,7 @@ class GPTModel(LanguageModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
+        mtp_kwargs: Optional[dict] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -615,6 +616,7 @@ class GPTModel(LanguageModule):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            mtp_kwargs=mtp_kwargs,
         )
 
     def _postprocess(
@@ -639,6 +641,7 @@ class GPTModel(LanguageModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        mtp_kwargs=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -660,10 +663,12 @@ class GPTModel(LanguageModule):
         )
 
         # logits and loss
+        mtp_labels = (mtp_kwargs or {}).get("mtp_labels")
+        compute_mtp_loss = labels is not None or mtp_labels is not None
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if mtp_in_postprocess and compute_mtp_loss and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -696,7 +701,7 @@ class GPTModel(LanguageModule):
                     )
                 else:
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and compute_mtp_loss:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -712,7 +717,7 @@ class GPTModel(LanguageModule):
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=input_ids,
+                    input_ids=mtp_labels,
                 )
         sequence_parallel_override = False
 
