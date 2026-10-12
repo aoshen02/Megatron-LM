@@ -67,8 +67,9 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 try:
-    from torch_memory_saver import torch_memory_saver
+    from torch_memory_saver import TorchMemorySaver
 
+    torch_memory_saver = TorchMemorySaver()
     torch_memory_saver.hook_mode = "torch"
     HAVE_TORCH_MEMORY_SAVER = True
 except ImportError:

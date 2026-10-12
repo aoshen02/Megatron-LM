@@ -252,8 +252,8 @@ def get_load_checkpoint_path_by_args(args, load_arg='load'):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
-        iteration = args.ckpt_step
+    if getattr(args, "ckpt_step", None) is not None:
+        iteration, release = args.ckpt_step, False
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
@@ -1650,8 +1650,10 @@ def _load_base_checkpoint(
         if args.non_persistent_global_ckpt_dir or load_dir is None
         else os.path.join(load_dir, _NON_PERSISTENT_CKPT_SUBDIR)
     )
-    non_persistent_iteration = _get_non_persistent_iteration(
-        non_persistent_global_dir, args, checkpointing_context
+    non_persistent_iteration = (
+        _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing_context)
+        if getattr(args, "ckpt_step", None) is None
+        else -1
     )
     iteration, release = -1, False
     tracker_filename = 'because load directory is not defined'
@@ -1661,8 +1663,8 @@ def _load_base_checkpoint(
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
-    if getattr(args, 'ckpt_step', None):
-        iteration = args.ckpt_step
+    if getattr(args, "ckpt_step", None) is not None:
+        iteration, release = args.ckpt_step, False
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
