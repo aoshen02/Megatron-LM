@@ -711,7 +711,11 @@ class MegatronLiteEngine(BaseEngine):
             impl_cfg["mtp_loss_scaling_factor"] = float(
                 getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1)
             )
+            # The MTP learning rate comes from engine.impl_cfg.mtp_lr, or from
+            # model.mtp.lr where the verl config has that field.
             mtp_lr = getattr(mtp_cfg, "lr", None)
+            if mtp_lr is None:
+                mtp_lr = impl_cfg.get("mtp_lr")
             impl_cfg["mtp_lr"] = None if mtp_lr is None else float(mtp_lr)
         if self.engine_config.full_determinism:
             impl_cfg.setdefault("deterministic", True)
