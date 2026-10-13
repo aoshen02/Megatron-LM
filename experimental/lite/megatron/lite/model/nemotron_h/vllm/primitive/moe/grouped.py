@@ -10,7 +10,7 @@ from megatron.lite.model.nemotron_h.quantization import (
     full_master,
     load_quantized_weight,
     master_version,
-    requantize,
+    quantize_static,
 )
 from megatron.lite.model.nemotron_h.vllm.primitive.dense import require_batch_invariance
 
@@ -281,7 +281,8 @@ class Nvfp4ExpertWeights(torch.nn.Module):
     EP rank ``r`` owns the contiguous experts ``[r * E / EP, (r + 1) * E / EP)``.
     The deployment bytes are the checkpoint's until the first
     ``refresh_quantized(recompute_scales=True)``; from then on every refresh
-    requantizes the masters (``quantization.requantize``).
+    quantizes the masters on the scale buffers (``quantization.quantize_static``),
+    which ``freeze_static_scales`` sets once.
     """
 
     def __init__(
@@ -442,7 +443,7 @@ class Nvfp4ExpertWeights(torch.nn.Module):
 
     @torch.no_grad()
     def refresh_quantized(self, recompute_scales=False):
-        """Once the masters have been updated, requantize them in place."""
+        """Once the masters have been updated, quantize them on the frozen scales."""
         self._dirty = True
         self._validate_storage()
         self._requantized = getattr(self, "_requantized", False) | recompute_scales
@@ -450,13 +451,12 @@ class Nvfp4ExpertWeights(torch.nn.Module):
             for projection in ("up_proj", "down_proj"):
                 parameter = full_master(self._masters[projection])
                 for expert in range(self.num_local):
-                    tensors = requantize("W4A16_NVFP4", parameter[expert])
-                    getattr(self, f"_{projection}_packed")[expert].copy_(tensors["weight"])
-                    getattr(self, f"_{projection}_scale")[expert].copy_(
-                        tensors["weight_scale"]
-                    )
-                    getattr(self, f"_{projection}_global")[expert].copy_(
-                        tensors["weight_scale_2"]
+                    getattr(self, f"_{projection}_packed")[expert].copy_(
+                        quantize_static(
+                            "W4A16_NVFP4",
+                            parameter[expert],
+                            self._checkpoint(projection, expert).tensors,
+                        )
                     )
         self._synced_versions = self._versions()
         self._dirty = False

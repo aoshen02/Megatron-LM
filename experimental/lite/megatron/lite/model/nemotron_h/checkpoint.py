@@ -243,9 +243,10 @@ def _load_bf16_masters(model, root, master_root):
 
     Compatibility validation: every non-quantized tensor is bitwise equal to the checkpoint
     (FP32 router weights equal the BF16 upcast) and every quantized tensor is
-    its BF16 weight encoded on the checkpoint scales. Then every deployment is
-    requantized from its master, so the theta0 deployment is requant(BF16
-    master), not the checkpoint bytes.
+    its BF16 weight encoded on the checkpoint scales. Then the deployment
+    scales are frozen at ModelOpt's static calibration of these masters and
+    every deployment is quantized from its master on them, so the theta0
+    deployment is the ModelOpt rule on the BF16 master, not the checkpoint bytes.
     """
     from megatron.lite.model.nemotron_h.quantization import check_reversible
 
@@ -331,10 +332,80 @@ def _load_bf16_masters(model, root, master_root):
                 raise ValueError(
                     f"BF16 master source is incompatible with this checkpoint: {name}"
                 )
+    if verify:
+        freeze_static_scales(masters)
     refresh_quantized_projections([model], recompute_scales=True)
     if verify:
         _check_theta0_agreement(masters, root, index)
+        _write_deployment_digests(masters)
         model._bf16_master_verified = str(master_root.resolve())
+
+
+@torch.no_grad()
+def freeze_static_scales(masters):
+    """Set every deployment's weight scales to ModelOpt's static calibration of its master.
+
+    Called once, on the BF16 release masters (theta0). The scales live in the
+    modules' scale buffers, the tensors the forward uses and the export sends;
+    every later refresh quantizes the updated master on them. Checkpoints hold
+    parameters only: a resumed run rebuilds the model from the same BF16
+    release and recomputes the same scales here before its checkpoint loads.
+    """
+    import gc
+
+    from megatron.lite.model.nemotron_h.quantization import STATIC_SCALES, calibrate_static_scales
+
+    before = torch.cuda.memory_allocated()
+    scales = calibrate_static_scales(
+        {prefix: (algorithm, master) for prefix, algorithm, master, _ in masters}
+    )
+    for prefix, algorithm, _, deployed in masters:
+        tensors = deployed()
+        for suffix in STATIC_SCALES[algorithm]:
+            target, value = tensors[suffix], scales[prefix][suffix]
+            if value.dtype != target.dtype or value.numel() != target.numel():
+                raise RuntimeError(f"ModelOpt scale geometry differs for {prefix}.{suffix}")
+            target.copy_(value.reshape(target.shape))
+    # The calibrated ModelOpt tree sits in reference cycles; the colocated
+    # rollout needs its memory back before it starts.
+    del scales
+    gc.collect()
+    torch.cuda.empty_cache()
+    print(
+        f"[mlite static scales] {len(masters)} layers calibrated by ModelOpt; allocated "
+        f"{before / 2**30:.2f} -> {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
+        f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB, "
+        f"device free {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB",
+        flush=True,
+    )
+
+
+def _write_deployment_digests(masters):
+    """With MLITE_DEPLOY_DIGEST_DIR set, write this rank's theta0 deployment sha256 per tensor."""
+    import hashlib
+    import os
+
+    directory = os.environ.get("MLITE_DEPLOY_DIGEST_DIR")
+    if not directory:
+        return
+    digests = {}
+    for prefix, _, _, deployed in masters:
+        for suffix, tensor in deployed().items():
+            if suffix == "input_scale":
+                continue
+            data = tensor.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy()
+            digests[f"{prefix}.{suffix}"] = [
+                str(tensor.dtype), tensor.numel(), hashlib.sha256(data.tobytes()).hexdigest()
+            ]
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    os.makedirs(directory, exist_ok=True)
+    path = Path(directory) / f"theta0-rank{rank}-pid{os.getpid()}.json"
+    path.write_text(json.dumps(digests))
+    total = hashlib.sha256(json.dumps(digests, sort_keys=True).encode()).hexdigest()[:16]
+    print(
+        f"[mlite theta0 deployment] rank {rank}: {len(digests)} tensors, digest {total}",
+        flush=True,
+    )
 
 
 # Fail-closed theta0 floors for requant(BF16 master) against the checkpoint,
@@ -345,24 +416,33 @@ THETA0_NVFP4_MIN_VALUES = 0.998
 THETA0_NVFP4_MIN_NONZERO_BLOCKS = 0.997
 THETA0_NVFP4_TENSOR_MIN_VALUES = 0.95
 THETA0_NVFP4_TENSOR_MIN_NONZERO_BLOCKS = 0.95
+THETA0_FP8_MIN_CODES = 0.9
 
 
 @torch.no_grad()
 def _check_theta0_agreement(masters, root, index):
     """Compare the requantized theta0 deployment with the checkpoint.
 
-    NVFP4 values, codes and block scales must reach the floors above and every
-    global scale must be equal. FP8 tensors whose checkpoint scale is amax/448
-    must match exactly; the others carry a calibrated scale that requantization
-    replaces.
+    NVFP4 values (FP4 value times block scale), codes and block scales must
+    reach the floors above and every global scale must agree within one FP32
+    ulp (ModelOpt 0.47 differs from the checkpoint in the last place on some).
+    FP8 tensors deployed on the checkpoint's scale (within one ulp) must reach
+    the FP8 floor: on the GPU ``to_quantized_weight`` divides by the scale
+    rounded to BF16, the checkpoint by the FP32 scale. On the others the
+    calibration chose another scale.
     """
-    from megatron.lite.model.nemotron_h.quantization import QuantizedWeight
+    from megatron.lite.model.nemotron_h.quantization import nvfp4_decode_values
 
     suffixes = {
         "FP8": ("weight", "weight_scale"),
         "W4A16_NVFP4": ("weight", "weight_scale", "weight_scale_2"),
     }
     stats = {}
+
+    def block_values(tensors):
+        return nvfp4_decode_values(tensors["weight"]) * tensors[
+            "weight_scale"
+        ].float().repeat_interleave(16, -1)
 
     def add(key, same):
         entry = stats.setdefault(key, [0, 0])
@@ -374,18 +454,23 @@ def _check_theta0_agreement(masters, root, index):
         stored = _read_tensors(root, index, names, master.device)
         stored = {s: stored[f"{prefix}.{s}"] for s in suffixes[algorithm]}
         deployed = {k: deployed_fn()[k] for k in suffixes[algorithm]}
-        ours = QuantizedWeight(algorithm, stored).initial_master()
-        theirs = QuantizedWeight(algorithm, deployed).initial_master()
-        values_same = ours == theirs
         if algorithm == "FP8":
-            amax = master.float().abs().amax()
-            standard = torch.equal(
-                (amax / torch.tensor(448.0, device=amax.device)).reshape(()),
-                stored["weight_scale"].float().reshape(()),
-            )
-            if standard and not bool(values_same.all()):
-                raise RuntimeError(f"{prefix}: amax/448 checkpoint not reproduced")
+            a = stored["weight_scale"].double().reshape(())
+            b = deployed["weight_scale"].double().reshape(())
+            if (a - b).abs() <= a * 2.0**-23:
+                agreement = float(
+                    (deployed["weight"].view(torch.uint8) == stored["weight"].view(torch.uint8))
+                    .float()
+                    .mean()
+                )
+                if agreement < THETA0_FP8_MIN_CODES:
+                    raise RuntimeError(
+                        f"theta0 {prefix} codes agreement {agreement:.4%} on the "
+                        f"checkpoint scale is below {THETA0_FP8_MIN_CODES:.2%}"
+                    )
             continue
+        ours, theirs = block_values(stored), block_values(deployed)
+        values_same = ours == theirs
         agreement = float(values_same.float().mean())
         if agreement < THETA0_NVFP4_TENSOR_MIN_VALUES:
             raise RuntimeError(
@@ -403,7 +488,7 @@ def _check_theta0_agreement(masters, root, index):
             width = torch.uint8 if a.element_size() == 1 else torch.int32
             same = a.view(width) == b.view(width)
             if suffix == "weight_scale_2":
-                add(suffix, same)
+                add(suffix, (a.double() - b.double()).abs() <= a.double().abs() * 2.0**-23)
                 continue
             # packed codes: 8 bytes per 16-value block
             mask = nonzero if suffix == "weight_scale" else nonzero.repeat_interleave(8, -1)
@@ -430,7 +515,9 @@ def _check_theta0_agreement(masters, root, index):
             )
     equal, total = stats.get("weight_scale_2", (0, 0))
     if equal != total:
-        raise RuntimeError(f"theta0 NVFP4 global scales differ: {total - equal}")
+        raise RuntimeError(
+            f"theta0 NVFP4 global scales differ by more than one ulp: {total - equal}"
+        )
 
 
 @torch.no_grad()

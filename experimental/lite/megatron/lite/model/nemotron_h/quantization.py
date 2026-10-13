@@ -2,7 +2,19 @@
 
 from dataclasses import dataclass
 
+# Imported with this module, never inside a function: the first import of
+# ModelOpt keeps the importing call stack alive for the life of the process,
+# and under the weight loader that stack holds every BF16 master.
+import modelopt.torch.quantization as mtq
 import torch
+from modelopt.recipe import load_recipe
+from modelopt.torch.export.quant_utils import (
+    QUANTIZATION_FP8,
+    QUANTIZATION_W4A16_NVFP4,
+    get_scaling_factor,
+    to_quantized_weight,
+)
+from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
 
 
 FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -87,6 +99,92 @@ def requantize(algorithm, weight):
         ].contiguous(),
         "weight_scale_2": amax / torch.tensor(1536.0, device=amax.device),
     }
+
+
+# ModelOpt's recipe for the Lightning NVFP4 deployment (static NVFP4 4/6 by MSE,
+# FP8 Mamba in/out_proj by MSE over amax multipliers).
+MODELOPT_RECIPE = "models/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/ptq/w4a16_nvfp4_4o6"
+STATIC_SCALES = {"FP8": ("weight_scale",), "W4A16_NVFP4": ("weight_scale", "weight_scale_2")}
+
+
+@torch.no_grad()
+def calibrate_static_scales(masters):
+    """ModelOpt's static deployment scales of BF16 masters.
+
+    Runs ``mtq.quantize`` with the Lightning recipe (weight calibration only) on
+    the matrices under their HF module names and reads the scales ModelOpt's
+    exporter derives from the calibrated quantizers. The activation scales are
+    the checkpoint's static ones, so the input quantizers stay off.
+
+    Args:
+        masters: HF module name -> (algorithm, BF16 matrix).
+
+    Returns:
+        HF module name -> {"weight_scale": ...[, "weight_scale_2": ...]}.
+    """
+    holder = torch.nn.Module()
+    for name, (algorithm, weight) in masters.items():
+        if algorithm not in STATIC_SCALES or weight.dtype != torch.bfloat16 or weight.ndim != 2:
+            raise ValueError(f"Expected a BF16 master matrix of a quantized layer: {name}")
+        *path, leaf = name.split(".")
+        parent = holder
+        for part in path:
+            if part not in parent._modules:
+                parent.add_module(part, torch.nn.Module())
+            parent = parent._modules[part]
+        rows, cols = weight.shape
+        linear = torch.nn.utils.skip_init(
+            torch.nn.Linear, cols, rows, bias=False, device="meta", dtype=weight.dtype
+        )
+        linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+        parent.add_module(leaf, linear)
+    config = load_recipe(MODELOPT_RECIPE).quantize.model_dump()
+    config["quant_cfg"] = [
+        *config["quant_cfg"],
+        {"quantizer_name": "*input_quantizer", "enable": False},
+    ]
+    config["algorithm"] = {**config["algorithm"], "distributed_sync": False}
+    mtq.quantize(holder, config, forward_loop=None)
+    scales = {}
+    for name, (algorithm, _) in masters.items():
+        module = holder.get_submodule(name)
+        quantizer = module.weight_quantizer
+        if not quantizer.is_enabled or getattr(quantizer, "_amax", None) is None:
+            raise RuntimeError(
+                f"The ModelOpt recipe left {name} without a calibrated weight quantizer"
+            )
+        if algorithm == "FP8":
+            scales[name] = {"weight_scale": get_scaling_factor(quantizer).reshape(())}
+            continue
+        if quantizer.num_bits != (2, 1):
+            raise RuntimeError(f"The ModelOpt recipe does not quantize {name} to NVFP4")
+        global_scale = NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(
+            quantizer
+        ).reshape(())
+        scale = NVFP4QTensor.get_weights_scaling_factor_from_quantizer(
+            quantizer, module.weight, global_scale
+        )[0]
+        scales[name] = {"weight_scale": scale, "weight_scale_2": global_scale}
+    return scales
+
+
+def quantize_static(algorithm, weight, scales):
+    """Quantize a BF16 master on its frozen scales as ModelOpt's exporter does.
+
+    ``to_quantized_weight`` with the static scales. FP8: the scale is passed
+    0-dim so the quotient is BF16, E4M3(BF16(w) / scale); on the GPU PyTorch
+    rounds that scale to BF16 before dividing (the CPU divides by the FP32 scale).
+    """
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        raise ValueError("Expected a BF16 master matrix")
+    scale = scales["weight_scale"]
+    if algorithm == "FP8":
+        return to_quantized_weight(weight, scale.reshape(()), QUANTIZATION_FP8, None, 0)
+    if algorithm != "W4A16_NVFP4":
+        raise ValueError(f"Unsupported quantization: {algorithm}")
+    return to_quantized_weight(
+        weight, scale, QUANTIZATION_W4A16_NVFP4, scales["weight_scale_2"].reshape(()), 16
+    )
 
 
 def fp8_encode(weight, scale):

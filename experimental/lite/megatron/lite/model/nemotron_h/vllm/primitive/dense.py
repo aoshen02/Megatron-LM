@@ -14,7 +14,7 @@ from megatron.lite.model.nemotron_h.quantization import (
     full_master,
     load_quantized_weight,
     master_version,
-    requantize,
+    quantize_static,
 )
 
 
@@ -522,8 +522,10 @@ class CheckpointProjectionFactory:
 class Nvfp4TrainingLinear(torch.nn.Module):
     """Inference-visible W4A16 linear over a BF16 master weight.
 
-    The deployment starts from the checkpoint bytes and is requantized from the
-    master after ``refresh_deployment(recompute_scales=True)``.
+    The deployment starts from the checkpoint bytes; after
+    ``refresh_deployment(recompute_scales=True)`` it is the master quantized on
+    the scale buffers, which ``freeze_static_scales`` sets once (ModelOpt's
+    static calibration of the initial master).
     """
 
     def __init__(self, checkpoint, deployment_factory, *, device):
@@ -563,14 +565,11 @@ class Nvfp4TrainingLinear(torch.nn.Module):
 
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
-        """Reinstall; once the master has been updated, requantize it first."""
+        """Reinstall; once the master has been updated, quantize it on the frozen scales first."""
         self._requantized |= recompute_scales
         if self._requantized:
-            tensors = requantize("W4A16_NVFP4", full_master(self._master))
-            self._packed = tensors["weight"]
-            self.weight_scale.copy_(tensors["weight_scale"])
-            self.weight_scale_2.copy_(
-                tensors["weight_scale_2"].reshape(self.weight_scale_2.shape)
+            self._packed = quantize_static(
+                "W4A16_NVFP4", full_master(self._master), self._tensors()
             )
         self._install()
 
@@ -592,8 +591,9 @@ class Fp8TrainingLinear(torch.nn.Module):
     calibrated static input scale. Otherwise (W8A16) the input stays BF16 and
     multiplies ``fp8_w8a16_weight`` of the deployed FP8 weight through the
     unquantized batch-invariant linear, as vLLM serves it. Requantization
-    replaces the weight and its scale (amax / 448) and keeps the calibrated
-    input scale; both forwards deploy and export the same tensors.
+    replaces the weight on the frozen weight scale (``freeze_static_scales``)
+    and keeps the calibrated input scale; both forwards deploy and export the
+    same tensors.
     """
 
     def __init__(self, checkpoint, *, device, fp8_activations=True):
@@ -643,12 +643,10 @@ class Fp8TrainingLinear(torch.nn.Module):
 
     @torch.no_grad()
     def refresh_deployment(self, recompute_scales=False):
-        """Once the master has been updated, requantize it."""
+        """Once the master has been updated, quantize it on the frozen scale."""
         self._requantized |= recompute_scales
         if self._requantized:
-            tensors = requantize("FP8", full_master(self._master))
-            self._packed = tensors["weight"]
-            self.weight_scale.copy_(tensors["weight_scale"].reshape(1))
+            self._packed = quantize_static("FP8", full_master(self._master), self._tensors())
         self._deployed_version = master_version(self._master)
 
     def export_quantized(self):
