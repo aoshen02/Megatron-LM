@@ -1,0 +1,347 @@
+"""Nemotron-H checkpoint quantization policy shared by load and resync."""
+
+from dataclasses import dataclass
+
+# Imported with this module, never inside a function: the first import of
+# ModelOpt keeps the importing call stack alive for the life of the process,
+# and under the weight loader that stack holds every BF16 master.
+import modelopt.torch.quantization as mtq
+import torch
+from modelopt.recipe import load_recipe
+from modelopt.torch.export.quant_utils import (
+    QUANTIZATION_FP8,
+    QUANTIZATION_W4A16_NVFP4,
+    get_scaling_factor,
+    to_quantized_weight,
+)
+from modelopt.torch.quantization.qtensor.nvfp4_tensor import NVFP4QTensor
+
+
+FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+STATIC_FP8_KV_CACHE = {"dynamic": False, "num_bits": 8, "type": "float"}
+# How the actor and the rollout serve the release checkpoint's activations.
+# release: FP8 W8A8 Mamba in/out_proj, FP8 query and static FP8 KV cache.
+# bf16: W8A16 Mamba in/out_proj (fp8_w8a16_weight), BF16 query and KV cache.
+# The routed experts are W4A16 NVFP4 in both.
+ACTIVATION_PRECISIONS = ("release", "bf16")
+
+
+def check_activation_precision(value):
+    if value not in ACTIVATION_PRECISIONS:
+        raise ValueError(
+            f"activation_precision must be one of {ACTIVATION_PRECISIONS}, got {value!r}"
+        )
+
+
+def check_static_fp8_kv_cache(recipe):
+    """The release's KV cache recipe: static FP8 with fixed k/v scales.
+
+    The BF16 activation mode serves a BF16 KV cache and ignores it.
+    """
+    scheme = recipe.get("kv_cache_scheme")
+    algorithm = recipe.get("kv_cache_quant_algo")
+    if algorithm is not None or scheme != STATIC_FP8_KV_CACHE:
+        raise ValueError(
+            "Expected the static FP8 KV cache scheme, got "
+            f"kv_cache_scheme={scheme}, kv_cache_quant_algo={algorithm}"
+        )
+
+
+def fp8_w8a16_weight(weight, weight_scale):
+    """The BF16 weight of a per-tensor FP8 projection served W8A16.
+
+    Mirrors vLLM's load-time dequantization in the BF16 activation mode,
+    ``(weight.float() * weight_scale).to(torch.bfloat16)``: E4M3 codes times
+    the FP32 per-tensor scale in FP32, rounded once to BF16. The product then
+    goes through the unquantized batch-invariant linear.
+    """
+    if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+        raise ValueError("Expected an E4M3 FP8 weight matrix")
+    if weight_scale.dtype != torch.float32 or weight_scale.numel() != 1:
+        raise ValueError("Expected one FP32 per-tensor weight scale")
+    return (weight.float() * weight_scale).to(torch.bfloat16)
+
+
+def requantize(algorithm, weight):
+    """Quantize a BF16 master with the rule that produced the Lightning checkpoint.
+
+    NVFP4: Transformer Engine 4over6 with the 256 E4M3 bound, choosing map4/map6
+    by squared error (ModelOpt's static-MSE 4over6), global = amax / 1536. FP8:
+    per-tensor scale = amax / 448, codes = E4M3(BF16(w / scale)) as ModelOpt
+    rounds the quotient.
+    """
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        raise ValueError("Expected a BF16 master matrix")
+    if algorithm == "FP8":
+        values = weight.float()
+        scale = values.abs().amax() / torch.tensor(448.0, device=values.device)
+        scale = torch.where(scale > 0, scale, torch.ones_like(scale))
+        return {"weight": fp8_encode(weight, scale), "weight_scale": scale}
+    if algorithm != "W4A16_NVFP4" or weight.shape[-1] % 16:
+        raise ValueError(f"Unsupported requantization: {algorithm}")
+    from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
+
+    quantizer = NVFP4Quantizer(
+        rowwise=True,
+        columnwise=False,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=256,
+        nvfp4_4over6_err_mode="MSE",
+    )
+    quantized = quantizer(weight.contiguous())
+    rows, cols = weight.shape
+    amax = quantized._amax_rowwise.float().reshape(())
+    return {
+        "weight": quantized._rowwise_data.view(torch.uint8)[:rows, : cols // 2]
+        .contiguous(),
+        "weight_scale": quantized._rowwise_scale_inv.view(torch.float8_e4m3fn)[
+            :rows, : cols // 16
+        ].contiguous(),
+        "weight_scale_2": amax / torch.tensor(1536.0, device=amax.device),
+    }
+
+
+# ModelOpt's recipe for the Lightning NVFP4 deployment (static NVFP4 4/6 by MSE,
+# FP8 Mamba in/out_proj by MSE over amax multipliers).
+MODELOPT_RECIPE = "models/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/ptq/w4a16_nvfp4_4o6"
+STATIC_SCALES = {"FP8": ("weight_scale",), "W4A16_NVFP4": ("weight_scale", "weight_scale_2")}
+
+
+@torch.no_grad()
+def calibrate_static_scales(masters):
+    """ModelOpt's static deployment scales of BF16 masters.
+
+    Runs ``mtq.quantize`` with the Lightning recipe (weight calibration only) on
+    the matrices under their HF module names and reads the scales ModelOpt's
+    exporter derives from the calibrated quantizers. The activation scales are
+    the checkpoint's static ones, so the input quantizers stay off.
+
+    Args:
+        masters: HF module name -> (algorithm, BF16 matrix).
+
+    Returns:
+        HF module name -> {"weight_scale": ...[, "weight_scale_2": ...]}.
+    """
+    holder = torch.nn.Module()
+    for name, (algorithm, weight) in masters.items():
+        if algorithm not in STATIC_SCALES or weight.dtype != torch.bfloat16 or weight.ndim != 2:
+            raise ValueError(f"Expected a BF16 master matrix of a quantized layer: {name}")
+        *path, leaf = name.split(".")
+        parent = holder
+        for part in path:
+            if part not in parent._modules:
+                parent.add_module(part, torch.nn.Module())
+            parent = parent._modules[part]
+        rows, cols = weight.shape
+        linear = torch.nn.utils.skip_init(
+            torch.nn.Linear, cols, rows, bias=False, device="meta", dtype=weight.dtype
+        )
+        linear.weight = torch.nn.Parameter(weight, requires_grad=False)
+        parent.add_module(leaf, linear)
+    config = load_recipe(MODELOPT_RECIPE).quantize.model_dump()
+    config["quant_cfg"] = [
+        *config["quant_cfg"],
+        {"quantizer_name": "*input_quantizer", "enable": False},
+    ]
+    config["algorithm"] = {**config["algorithm"], "distributed_sync": False}
+    mtq.quantize(holder, config, forward_loop=None)
+    scales = {}
+    for name, (algorithm, _) in masters.items():
+        module = holder.get_submodule(name)
+        quantizer = module.weight_quantizer
+        if not quantizer.is_enabled or getattr(quantizer, "_amax", None) is None:
+            raise RuntimeError(
+                f"The ModelOpt recipe left {name} without a calibrated weight quantizer"
+            )
+        if algorithm == "FP8":
+            scales[name] = {"weight_scale": get_scaling_factor(quantizer).reshape(())}
+            continue
+        if quantizer.num_bits != (2, 1):
+            raise RuntimeError(f"The ModelOpt recipe does not quantize {name} to NVFP4")
+        global_scale = NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(
+            quantizer
+        ).reshape(())
+        scale = NVFP4QTensor.get_weights_scaling_factor_from_quantizer(
+            quantizer, module.weight, global_scale
+        )[0]
+        scales[name] = {"weight_scale": scale, "weight_scale_2": global_scale}
+    return scales
+
+
+def quantize_static(algorithm, weight, scales):
+    """Quantize a BF16 master on its frozen scales as ModelOpt's exporter does.
+
+    ``to_quantized_weight`` with the static scales. FP8: the scale is passed
+    0-dim so the quotient is BF16, E4M3(BF16(w) / scale); on the GPU PyTorch
+    rounds that scale to BF16 before dividing (the CPU divides by the FP32 scale).
+    """
+    if weight.dtype != torch.bfloat16 or weight.ndim != 2:
+        raise ValueError("Expected a BF16 master matrix")
+    scale = scales["weight_scale"]
+    if algorithm == "FP8":
+        return to_quantized_weight(weight, scale.reshape(()), QUANTIZATION_FP8, None, 0)
+    if algorithm != "W4A16_NVFP4":
+        raise ValueError(f"Unsupported quantization: {algorithm}")
+    return to_quantized_weight(
+        weight, scale, QUANTIZATION_W4A16_NVFP4, scales["weight_scale_2"].reshape(()), 16
+    )
+
+
+def fp8_encode(weight, scale):
+    """E4M3 codes of ``weight / scale`` with the quotient rounded to BF16 first."""
+    quotient = (weight.float() / scale.float().reshape(())).to(torch.bfloat16)
+    return quotient.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+
+
+def nvfp4_decode_values(packed):
+    """Signed FP4 values of packed NVFP4 codes (low nibble first)."""
+    codes = torch.stack((packed & 15, packed >> 4), -1).flatten(-2)
+    levels = torch.tensor(FP4_LEVELS, device=packed.device)
+    values = levels[(codes & 7).long()]
+    return torch.where((codes & 8) != 0, -values, values)
+
+
+def nvfp4_encode_values(weight, scale, global_scale):
+    """FP4 values (round to nearest even) of a master on given NVFP4 scales."""
+    levels = torch.tensor(FP4_LEVELS, device=weight.device)
+    midpoints = (levels[1:] + levels[:-1]) / 2
+    rows, cols = weight.shape
+    blocks = weight.float().reshape(rows, cols // 16, 16)
+    unit = (scale.float() * global_scale.float().reshape(()))[..., None]
+    y = torch.where(unit > 0, blocks / unit, torch.zeros_like(blocks))
+    magnitude = y.abs().clamp(max=6.0)
+    index = torch.bucketize(magnitude, midpoints)
+    tie = (index < 7) & (magnitude == midpoints[index.clamp(max=6)])
+    index = torch.where(tie & (index % 2 == 1), index + 1, index)
+    return torch.where(y < 0, -levels[index], levels[index]).reshape(rows, cols)
+
+
+def check_reversible(algorithm, master, tensors, name, *, exact_global=False):
+    """Compatibility: fail unless the checkpoint is the master encoded on its scales.
+
+    Not an identity check (a master moved within its cells passes). FP8:
+    E4M3(BF16(master / scale)) must give the checkpoint codes. NVFP4: FP4
+    rounding of master / (block scale * global scale) must give the checkpoint
+    FP4 values wherever that unit is positive (no product is compared); with
+    ``exact_global`` (the master is the original BF16 source) the global scale
+    must also be amax / 1536.
+    """
+    master = master.detach()
+    tensors = {key: value.to(master.device) for key, value in tensors.items()}
+    if algorithm == "FP8":
+        codes = fp8_encode(master, tensors["weight_scale"]).view(torch.uint8)
+        expected = tensors["weight"].view(torch.uint8)
+        changed = int((codes != expected).sum())
+    elif algorithm == "W4A16_NVFP4":
+        global_scale = tensors["weight_scale_2"].float()
+        scale = tensors["weight_scale"]
+        values = nvfp4_encode_values(master, scale, global_scale)
+        unit = (scale.float() * global_scale.reshape(())).repeat_interleave(16, -1)
+        stored = nvfp4_decode_values(tensors["weight"])
+        changed = int(((values != stored) & (unit > 0)).sum())
+        if exact_global:
+            amax = master.float().abs().amax()
+            derived = amax / torch.tensor(1536.0, device=master.device)
+            if not torch.equal(derived.reshape(()), global_scale.reshape(())):
+                raise RuntimeError(f"{name}: checkpoint global scale is not amax/1536")
+    else:
+        raise ValueError(f"Unsupported quantization: {algorithm}")
+    if changed:
+        raise RuntimeError(
+            f"{name} is not its BF16 master on the checkpoint scales: "
+            f"{changed} values changed"
+        )
+
+
+@dataclass(frozen=True)
+class QuantizedWeight:
+    """Keep serialized scales separate from runtime-specific packed layouts."""
+
+    algorithm: str
+    tensors: dict[str, torch.Tensor]
+
+    def initial_master(self):
+        """Dequantize the checkpoint to FP32."""
+        weight = self.tensors["weight"]
+        scale = self.tensors["weight_scale"]
+        if self.algorithm == "FP8":
+            if weight.dtype != torch.float8_e4m3fn or scale.numel() != 1:
+                raise ValueError("Expected tensor-scaled E4M3 FP8 weights")
+            factors = scale.float()
+            values = weight.float()
+        elif self.algorithm == "W4A16_NVFP4":
+            if weight.dtype != torch.uint8 or weight.ndim != 2:
+                raise ValueError("Expected a packed uint8 NVFP4 matrix")
+            if scale.dtype != torch.float8_e4m3fn:
+                raise ValueError("Expected E4M3 group scales")
+            if scale.shape != (weight.shape[0], weight.shape[1] // 8):
+                raise ValueError("Expected group16 scales for packed NVFP4")
+            if weight.shape[1] % 8:
+                raise ValueError("NVFP4 K must be divisible by 16")
+            global_scale = self.tensors["weight_scale_2"]
+            if global_scale.dtype != torch.float32 or global_scale.numel() != 1:
+                raise ValueError("Expected one FP32 checkpoint global scale")
+            values = nvfp4_decode_values(weight)
+            factors = scale.float().repeat_interleave(16, -1) * global_scale
+        else:
+            raise ValueError(f"Unsupported quantization: {self.algorithm}")
+        if not torch.isfinite(factors).all() or (factors < 0).any():
+            raise ValueError("Weight scales must be finite and nonnegative")
+        if self.algorithm == "FP8" and not (factors > 0).all():
+            raise ValueError("FP8 weight scales must be positive")
+        if self.algorithm == "W4A16_NVFP4" and not (global_scale > 0).all():
+            raise ValueError("NVFP4 global scales must be positive")
+        result = values * factors
+        if not torch.isfinite(result).all():
+            raise ValueError("Nonfinite checkpoint weights")
+        return result
+
+
+def full_master(master):
+    """The BF16 master the forward sees: an FSDP2 shard is gathered, then cast
+    as FSDP2's BF16 unshard casts it."""
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(master, DTensor):
+        master = master.full_tensor()
+    return master.detach().to(torch.bfloat16)
+
+
+def master_version(master):
+    """Version of a master, advanced by any in-place update: an FSDP2 shard
+    counts updates through the DTensor and through its local tensor apart."""
+    return master._version, getattr(master, "_local_tensor", master)._version
+
+
+def load_quantized_weight(root, prefix, recipe):
+    """Read one explicitly described module without changing its recipe.
+
+    Args:
+        root: HF checkpoint directory.
+        prefix: Full HF module name, without a tensor suffix.
+        recipe: This module's entry from quantized_layers.
+    """
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    algorithm = recipe["quant_algo"]
+    if algorithm == "W4A16_NVFP4":
+        if recipe.get("group_size") != 16:
+            raise ValueError("Only NVFP4 group16 is supported")
+        suffixes = ("weight", "weight_scale", "weight_scale_2")
+    elif algorithm == "FP8":
+        suffixes = ("weight", "weight_scale", "input_scale")
+    else:
+        raise ValueError(f"Unsupported quantization: {algorithm}")
+    root = Path(root)
+    index = json.loads((root / "model.safetensors.index.json").read_text())[
+        "weight_map"
+    ]
+    tensors = {}
+    for suffix in suffixes:
+        name = f"{prefix}.{suffix}"
+        with safe_open(root / index[name], framework="pt", device="cpu") as handle:
+            tensors[suffix] = handle.get_tensor(name)
+    return QuantizedWeight(algorithm, tensors)

@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.ckpt.local_stage import run_on_all_ranks
 from megatron.lite.primitive.modules import router_replay
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
@@ -134,9 +135,14 @@ class _MegatronLiteLRScheduler:
         lr = self._get_lr()
         wd = self._get_wd()
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+            # A group with its own max_lr (MTP) follows the same schedule shape.
+            group_max = param_group.get("max_lr")
+            if group_max is None:
+                param_group["lr"] = lr
+            else:
+                param_group["lr"] = lr * group_max / self.max_lr if self.max_lr > 0 else group_max
             if param_group.get("weight_decay", None) is not None:
-                param_group["weight_decay"] = wd
+                param_group["weight_decay"] = wd * param_group.get("wd_mult", 1.0)
 
     def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
@@ -194,6 +200,15 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
+        # Without a scheduler, still apply wd_mult once: Megatron Core builds
+        # every group with the base weight decay and relies on the scheduler.
+        for param_group in optimizer.param_groups:
+            if param_group.get("weight_decay", None) is not None:
+                param_group["weight_decay"] = opt.weight_decay * param_group.get(
+                    "wd_mult", 1.0
+                )
+            if param_group.get("max_lr") is not None:
+                param_group["lr"] = param_group["max_lr"]
         return None
 
     warmup_steps = opt.lr_warmup_steps if opt.lr_warmup_steps is not None else -1
@@ -232,7 +247,16 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         self._runtime_ctx = None
 
     def __enter__(self):
-        super().__enter__()
+        # Optimizer offload: the train context keeps the optimizer state on the
+        # host through forward/backward and optimizer_step() brings it in for the
+        # step alone. Loading it on entry kept Adam's moments (~60 GiB per PP4
+        # stage of Nemotron-H 30B) resident under every 128K micro-batch from
+        # the second step on.
+        self.engine._defer_optimizer_load = self.mode == "train"
+        try:
+            super().__enter__()
+        finally:
+            self.engine._defer_optimizer_load = False
         assert self.engine.runtime is not None and self.engine.handle is not None
         if self.mode == "train":
             self._runtime_ctx = self.engine.runtime.train_mode(self.engine.handle)
@@ -245,6 +269,10 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
+        # A nested context (one per mini-batch, auto offload disabled) leaves
+        # the deferral to the context that requested it.
+        if not self.disable_auto_offload:
+            self.engine._optimizer_load_pending = False
         return False
 
 
@@ -273,6 +301,8 @@ class MegatronLiteEngine(BaseEngine):
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        self._defer_optimizer_load = False
+        self._optimizer_load_pending = False
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -325,7 +355,17 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
-        _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        if not self._optimizer_load_pending:
+            _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        else:
+            self.runtime.to(self.handle, "cuda", model=False, optimizer=True, grad=False)
+            try:
+                _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+            finally:
+                self.runtime.to(self.handle, "cpu", model=False, optimizer=True, grad=False)
+        # Separately clipped groups (the trained MTP block); the base engine logs it.
+        norms = getattr(self.handle._optimizer, "grad_norms_by_group", None) or {}
+        self.mtp_grad_norm = norms.get("mtp")
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -434,6 +474,10 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
+        if optimizer and device != "cpu" and self._defer_optimizer_load:
+            self._optimizer_load_pending, optimizer = True, False
+        elif optimizer and device == "cpu" and self._optimizer_load_pending:
+            optimizer = False
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
@@ -468,6 +512,10 @@ class MegatronLiteEngine(BaseEngine):
         if reload_params_for_save:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
+        scheduler = self.handle._lr_scheduler
+        rank0_states = (
+            {_LR_SCHEDULER_STATE: scheduler.state_dict()} if scheduler is not None else None
+        )
         try:
             if save_model or save_optimizer:
                 save_training_checkpoint(
@@ -481,11 +529,7 @@ class MegatronLiteEngine(BaseEngine):
                     is_expert=expert_classifier,
                     save_model=save_model,
                     save_optimizer=save_optimizer,
-                )
-            if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(
-                    self.handle._lr_scheduler.state_dict(),
-                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+                    rank0_states=rank0_states,
                 )
             if save_hf_model:
                 self._save_hf_checkpoint(local_path)
@@ -559,6 +603,18 @@ class MegatronLiteEngine(BaseEngine):
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
+            scheduler_state = []
+            if self.handle._lr_scheduler is not None:
+                run_on_all_ranks(
+                    lambda: scheduler_state.append(
+                        torch.load(
+                            os.path.join(local_path, _LR_SCHEDULER_STATE),
+                            map_location="cpu",
+                            weights_only=False,
+                        )
+                    ),
+                    "reading the LR scheduler state",
+                )
             load_training_checkpoint(
                 self.module,
                 self.handle._optimizer,
@@ -570,15 +626,21 @@ class MegatronLiteEngine(BaseEngine):
                 load_model=True,
                 load_optimizer=True,
             )
-            scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
-            if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
-                state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
-                self.handle._lr_scheduler.load_state_dict(state)
+            post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
+            if scheduler_state:
+                self.handle._lr_scheduler.load_state_dict(scheduler_state[0])
             if dist.is_initialized():
                 dist.barrier()
         finally:
-            if reload_params_for_load:
-                self.to(device="cpu", model=True, optimizer=False, grad=False)
+            if reload_params_for_load or self.is_optimizer_offload_enabled:
+                self.to(
+                    device="cpu",
+                    model=reload_params_for_load,
+                    optimizer=self.is_optimizer_offload_enabled,
+                    grad=False,
+                )
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:
@@ -649,6 +711,12 @@ class MegatronLiteEngine(BaseEngine):
             impl_cfg["mtp_loss_scaling_factor"] = float(
                 getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1)
             )
+            # The MTP learning rate comes from engine.impl_cfg.mtp_lr, or from
+            # model.mtp.lr where the verl config has that field.
+            mtp_lr = getattr(mtp_cfg, "lr", None)
+            if mtp_lr is None:
+                mtp_lr = impl_cfg.get("mtp_lr")
+            impl_cfg["mtp_lr"] = None if mtp_lr is None else float(mtp_lr)
         if self.engine_config.full_determinism:
             impl_cfg.setdefault("deterministic", True)
         if self.engine_config.forward_only:
@@ -758,23 +826,13 @@ class MegatronLiteEngine(BaseEngine):
         if loss_function is not None or forward_only:
             runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
 
-        replay_specs = [
-            runtime_batch.routed_experts is not None
-            for runtime_batch, _loss_context in runtime_batches
-        ]
-        replay_enabled = self.engine_config.router_replay_mode == "R3"
-        if replay_enabled and not all(replay_specs):
-            raise ValueError(
-                "router_replay_mode='R3' requires routed_experts on every "
-                "actor micro-batch in a step."
-            )
         result = self.runtime.forward_backward(
             self.handle,
             iter(runtime_batches),
             loss_fn=runtime_loss_fn,
             num_microbatches=num_micro_batches,
             forward_only=forward_only,
-            router_replay={"action": "replay"} if replay_enabled else None,
+            router_replay=self._router_replay_spec(data, runtime_batches, forward_only),
         )
         if reduced_outputs is not None:
             return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
@@ -795,6 +853,31 @@ class MegatronLiteEngine(BaseEngine):
             },
         }
 
+    def _router_replay_spec(self, data: TensorDict, runtime_batches, forward_only: bool):
+        """R3 replays rollout routes; R2 records them in the actor's old-log-prob
+        forward and replays them in every update of the step."""
+        mode = self.engine_config.router_replay_mode
+        if mode == "disabled":
+            return None
+        has_routes = [batch.routed_experts is not None for batch, _ in runtime_batches]
+        if mode == "R3" or any(has_routes):
+            if not all(has_routes):
+                raise ValueError(
+                    f"router_replay_mode={mode!r} requires routed_experts on every "
+                    "actor micro-batch in a step."
+                )
+            return {"action": "replay"}
+        if not forward_only:
+            raise ValueError(
+                "router_replay_mode='R2' training requires the routed_experts that "
+                "compute_log_prob recorded for the same samples."
+            )
+        # VERL sets this flag only for megatron/veomni actors (False on the ref
+        # forward); without it every R2 forward-only call is the actor's.
+        if tu.get_non_tensor_data(data, key="enable_routing_replay", default=True):
+            return {"action": "record"}
+        return None
+
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
         """Flatten a jagged no-padding batch to a model-agnostic ``PackedBatch``.
 
@@ -808,15 +891,18 @@ class MegatronLiteEngine(BaseEngine):
                 "MegatronLiteEngine supports only nested no-padding THD batches."
             )
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
-        r3_replay_mask = None
-        if self.engine_config.router_replay_mode == "R3":
-            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
         routed_experts = micro_batch.get("routed_experts", None)
         if routed_experts is not None and not getattr(routed_experts, "is_nested", False):
             raise ValueError(
-                "R3 routed_experts must use VERL's jagged no-padding layout; "
+                "routed_experts must use VERL's jagged no-padding layout; "
                 f"got shape {tuple(routed_experts.shape)}."
             )
+        r3_replay_mask = None
+        if self.engine_config.router_replay_mode == "R3":
+            r3_replay_mask = self._r3_replay_mask_for_packing(micro_batch, input_ids)
+        elif self.engine_config.router_replay_mode == "R2" and routed_experts is not None:
+            # R2 routes were recorded for every input row.
+            r3_replay_mask = torch.ones_like(input_ids, dtype=torch.bool)
         return PackedBatch(
             input_ids=input_ids.values().contiguous(),
             labels=input_ids.values().contiguous(),
@@ -928,6 +1014,8 @@ class MegatronLiteEngine(BaseEngine):
         entropy = raw_output.get("entropy")
         if entropy is not None:
             output["entropy"] = unpack(self.module, runtime_batch, entropy)
+        if raw_output.get("routed_experts") is not None:
+            output["routed_experts"] = raw_output["routed_experts"]
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
@@ -959,6 +1047,10 @@ class MegatronLiteEngine(BaseEngine):
                 metrics["mtp_losses/mtp_1_loss"] = (
                     float(mtp_loss.item()) if mtp_loss.numel() == 1 else mtp_loss.cpu().tolist()
                 )
+                if raw_output.get("mtp_acc") is not None:
+                    metrics["mtp_losses/mtp_1_top1"] = float(
+                        self._reduce_mtp_metric(raw_output["mtp_acc"]).item()
+                    )
 
             raw_output["_verl_metrics"] = metrics
             assert loss_fn_ref is not None

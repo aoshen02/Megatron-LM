@@ -56,14 +56,14 @@ def _engine_config(**kwargs):
     return MegatronLiteEngineConfig(**values)
 
 
-def _initialized_engine(*, checkpoint_config=None, param_offload=False):
+def _initialized_engine(*, checkpoint_config=None, param_offload=False, optimizer_offload=False):
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
         ),
-        engine_config=_engine_config(param_offload=param_offload),
+        engine_config=_engine_config(param_offload=param_offload, optimizer_offload=optimizer_offload),
         optimizer_config=_optimizer_config(),
         checkpoint_config=checkpoint_config or {},
     )
@@ -141,10 +141,7 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
     assert save_kwargs["is_expert"] is expert_classifier
     assert save_kwargs["save_model"] is True
     assert save_kwargs["save_optimizer"] is False
-    assert (
-        torch.load(tmp_path / "lr_scheduler.pt", map_location="cpu", weights_only=False)
-        == scheduler.state_dict()
-    )
+    assert save_kwargs["rank0_states"] == {"lr_scheduler.pt": scheduler.state_dict()}
 
 
 def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(tmp_path, monkeypatch):
@@ -162,7 +159,11 @@ def test_save_checkpoint_skips_when_contents_exclude_model_and_optimizer(tmp_pat
     assert not checkpoint_path.exists()
 
 
-def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, monkeypatch):
+@pytest.mark.parametrize("param_offload", [False, True])
+@pytest.mark.parametrize("optimizer_offload", [False, True])
+def test_load_checkpoint_restores_scheduler_and_configured_offload(
+    tmp_path, monkeypatch, param_offload, optimizer_offload
+):
     (
         engine,
         module,
@@ -172,7 +173,7 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
         parallel_state,
         placement_fn,
         expert_classifier,
-    ) = _initialized_engine(param_offload=True)
+    ) = _initialized_engine(param_offload=param_offload, optimizer_offload=optimizer_offload)
     torch.save({"step": 23, "lr": 0.125}, tmp_path / "lr_scheduler.pt")
     to_calls = []
     load_calls = []
@@ -186,11 +187,16 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
 
     engine.load_checkpoint(str(tmp_path))
 
-    assert to_calls == [
-        {"device": "cuda", "model": True, "optimizer": False, "grad": False},
-        {"device": "cpu", "model": True, "optimizer": False, "grad": False},
-    ]
-    assert sync_calls == [True]
+    expected = []
+    if param_offload:
+        expected.append({"device": "cuda", "model": True, "optimizer": False, "grad": False})
+    if param_offload or optimizer_offload:
+        expected.append({
+            "device": "cpu", "model": param_offload,
+            "optimizer": optimizer_offload, "grad": False,
+        })
+    assert to_calls == expected
+    assert sync_calls == ([True] if param_offload else [])
     assert scheduler.loaded_state == {"step": 23, "lr": 0.125}
     assert len(load_calls) == 1
     load_args, load_kwargs = load_calls[0]
@@ -199,6 +205,20 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
+
+
+def test_load_checkpoint_rejects_a_missing_scheduler_state(tmp_path, monkeypatch):
+    """The scheduler state is read before the collective model load."""
+    engine, *_ = _initialized_engine()
+    load_calls = []
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        lambda *a, **k: load_calls.append(a),
+    )
+
+    with pytest.raises(FileNotFoundError, match="lr_scheduler.pt"):
+        engine.load_checkpoint(str(tmp_path))
+    assert load_calls == []
 
 
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):

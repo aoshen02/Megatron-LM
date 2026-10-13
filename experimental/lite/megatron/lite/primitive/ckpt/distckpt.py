@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import replace
+from pathlib import Path
 from types import MethodType
 from typing import Any
 
@@ -13,7 +14,14 @@ import torch
 import torch.nn as nn
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, is_main_replica
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.lite.primitive.ckpt.local_stage import (
+    NodeLocalStagingFileSystem,
+    allocate_stage_path,
+    publish_staged_file,
+    run_on_all_ranks,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -22,9 +30,12 @@ from megatron.lite.primitive.protocols import (
     default_placement_fn,
 )
 
+# Each rank writes its DistributedOptimizer buckets in place (Megatron-LM's
+# default). "fully_reshardable" first gathers the parameter state into new FP32
+# host buffers, at least three times the size of the rank's optimizer state,
+# which a CPU-offloaded optimizer cannot afford. Checkpoints of either type load.
 _DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "distrib_optim_sharding_type": "dp_reshardable",
     "chained_optim_avoid_prefix": True,
 }
 
@@ -66,6 +77,7 @@ def save_dist_opt_checkpoint(
     *,
     save_model: bool = True,
     save_optimizer: bool = True,
+    local_stage_root: Path | None = None,
 ) -> None:
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
@@ -84,12 +96,80 @@ def save_dist_opt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
+    if save_model:
+        _stage_model_state_on_host(model_sd)
+    save_strategy = (
+        _NodeLocalDistSaveStrategy(local_stage_root)
+        if local_stage_root is not None
+        else None
+    )
     dist_checkpointing.save(
         state_dict,
         checkpoint_dir,
+        sharded_strategy=save_strategy,
         validate_access_integrity=False,
         content_metadata=metadata,
     )
+
+
+def _stage_model_state_on_host(model_sd: dict[str, Any]) -> None:
+    """Copy the model's GPU tensors to pageable host memory for a synchronous save.
+
+    dist_checkpointing otherwise stages them in pinned buffers, which the caching
+    host allocator rounds up to a power of two and keeps after the save; these
+    copies are freed when the save returns. Only main replicas are written.
+    """
+    for chunk_sd in model_sd.values():
+        for sh_ten in chunk_sd.values():
+            if not isinstance(sh_ten, ShardedTensor) or not is_main_replica(sh_ten.replica_id):
+                continue
+            if type(sh_ten.data) in (torch.Tensor, nn.Parameter) and sh_ten.data.is_cuda:
+                sh_ten.data = sh_ten.data.detach().to("cpu")
+
+
+class _NodeLocalDistSaveStrategy(TorchDistSaveShardedStrategy):
+    def __init__(self, stage_root: Path):
+        super().__init__()
+        self._stage_root = stage_root
+
+    def _get_save_and_finalize_callbacks(
+        self, writer, save_state_dict_ret, async_strategy
+    ):
+        writer.fs = NodeLocalStagingFileSystem(self._stage_root)
+        request = super()._get_save_and_finalize_callbacks(
+            writer, save_state_dict_ret, async_strategy
+        )
+        # A rank without write buckets still joins every collective below.
+        write_buckets = request.async_fn_args[1] if request.async_fn_args else []
+        staged_files: list[tuple[Path, Path]] = []
+
+        def allocate() -> None:
+            for index, (destination, storage_key, payload) in enumerate(write_buckets):
+                destination = Path(destination)
+                stage_path = allocate_stage_path(self._stage_root, destination.name)
+                write_buckets[index] = (str(stage_path), storage_key, payload)
+                staged_files.append((stage_path, destination))
+
+        run_on_all_ranks(allocate, "allocating checkpoint staging files")
+
+        original_finalize_fns = tuple(request.finalize_fns)
+
+        def publish() -> None:
+            for stage_path, destination in staged_files:
+                publish_staged_file(stage_path, destination)
+
+        # The original finalizers write .metadata, so they run only once every
+        # rank has published its shards.
+        def finalize_and_publish() -> None:
+            try:
+                run_on_all_ranks(publish, "publishing staged checkpoint shards")
+                for finalize_fn in original_finalize_fns:
+                    finalize_fn()
+            finally:
+                for stage_path, _ in staged_files:
+                    stage_path.unlink(missing_ok=True)
+
+        return request._replace(finalize_fns=[finalize_and_publish])
 
 
 def load_dist_opt_checkpoint(
@@ -102,19 +182,10 @@ def load_dist_opt_checkpoint(
 ) -> int:
     """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
 
-    metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
     load_sd: dict[str, Any] = {"step": 0}
     if load_model:
         load_sd.update(model_sd)
-    if load_optimizer and optimizer is not None:
-        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
-        try:
-            load_sd["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd), is_loading=True, metadata=metadata
-            )
-        finally:
-            _restore_state_dict_patches(patches)
     # torch>=2.6 flips torch.load's weights_only default to True, which rejects the trusted dist_opt
     # common state (mcore's load_common torch.loads optimizer/scheduler classes like AdamW). We are
     # loading our OWN checkpoint -> force weights_only=False for the duration of the load.
@@ -126,6 +197,17 @@ def load_dist_opt_checkpoint(
 
     torch.load = _trusted_torch_load
     try:
+        if load_optimizer and optimizer is not None:
+            metadata = _dist_opt_checkpoint_metadata(
+                optimizer, dist_checkpointing.load_content_metadata(checkpoint_dir)
+            )
+            patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
+            try:
+                load_sd["optimizer"] = optimizer.sharded_state_dict(
+                    _single_or_all_model_state(model_sd), is_loading=True, metadata=metadata
+                )
+            finally:
+                _restore_state_dict_patches(patches)
         state_dict = dist_checkpointing.load(
             load_sd, checkpoint_dir, validate_access_integrity=False
         )
@@ -263,12 +345,20 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
     yield from visit(optimizer)
 
 
-def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
-    dist_opts = tuple(_iter_distributed_optimizers(optimizer))
-    return {
-        **_DISTOPT_METADATA,
-        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
-    }
+def _dist_opt_checkpoint_metadata(
+    optimizer: Any, saved: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Save metadata, or with ``saved`` (a checkpoint's) the metadata to load it."""
+
+    key = "distrib_optim_sharding_type"
+    sharding_type = (saved or {}).get(key, _DISTOPT_METADATA[key])
+    metadata = {**_DISTOPT_METADATA, key: sharding_type}
+    if sharding_type == "fully_reshardable":
+        dist_opts = tuple(_iter_distributed_optimizers(optimizer))
+        metadata["distrib_optim_fully_reshardable_mem_efficient"] = bool(dist_opts) and all(
+            getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts
+        )
+    return metadata
 
 
 def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:

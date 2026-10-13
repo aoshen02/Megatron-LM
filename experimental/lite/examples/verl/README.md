@@ -103,9 +103,10 @@ not compare those telemetry values as though they were the training-loss
 normalization denominator.
 
 Ordinary pipeline parallelism and R2/R3 router replay are supported. Virtual
-pipeline parallelism remains unsupported and fails loudly. R2/R3 also require
-`moe_router_fusion=False`, because the fused router path bypasses the replay
-hook; this restriction does not apply when router replay is disabled.
+pipeline parallelism remains unsupported and fails loudly, as does R2 route
+recording (the actor's old-log-prob forward) under dynamic CP or PP>1. R2/R3
+also require `moe_router_fusion=False`, because the fused router path bypasses
+the replay hook; this restriction does not apply when router replay is disabled.
 
 Dynamic CP is not unconditionally faster. Its benefit depends on a sequence
 length distribution that lets the scheduler use smaller CP groups for enough

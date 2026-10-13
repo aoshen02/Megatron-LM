@@ -74,7 +74,19 @@ class RouterReplayDriver:
         self._ps = parallel_state_from_model(self._chunks[-1])
         self._compute_pp_layout()
         if self.action == "record":
+            self._check_record_layout()
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+    def _check_record_layout(self) -> None:
+        if self._ps is not None and self._ps.pp_size > 1:
+            raise NotImplementedError("R2 route recording does not support PP>1.")
+        if "_dcp_original_forward" in self.handle._extras:
+            raise NotImplementedError("R2 route recording does not support dynamic CP.")
+        if not callable(getattr(self._protocol, "unpack_routed_experts", None)):
+            raise NotImplementedError(
+                "R2 route recording requires the model protocol to define "
+                "unpack_routed_experts."
+            )
 
     def _compute_pp_layout(self) -> None:
         ps = self._ps
@@ -99,9 +111,24 @@ class RouterReplayDriver:
     def _wrap_record(self, forward_step: Callable) -> Callable:
         def stepped(model, batch):
             RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-            return forward_step(model, batch)
+            output = forward_step(model, batch)
+            output["routed_experts"] = self._take_recorded_routes(model, batch)
+            return output
 
         return stepped
+
+    def _take_recorded_routes(self, model, batch) -> torch.Tensor:
+        """Unpack this micro-batch's routes to jagged ``[seq, layers, topk]``."""
+        recorded = RouterReplay.get_recorded_data()
+        missing = sum(route is None for route in recorded)
+        if missing:
+            raise RuntimeError(
+                f"R2 route recording missed {missing} of {len(recorded)} routers."
+            )
+        for instance in RouterReplay.global_router_replay_instances:
+            instance.recorded_topk_idx = None
+        routes = torch.stack([r.to(torch.int16) for r in recorded], dim=1)
+        return self._protocol.unpack_routed_experts(model, batch, routes)
 
     def _wrap_replay(self, forward_step: Callable) -> Callable:
         def stepped(model, batch):

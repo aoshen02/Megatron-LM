@@ -3,6 +3,7 @@
 """Unit tests for chunked optimizer state and master-weight offload."""
 
 import dataclasses
+import gc
 import logging
 import sys
 from contextlib import nullcontext
@@ -802,6 +803,55 @@ def test_state_eligibility_is_identical_for_d2h_and_cpu_adoption():
     assert "moment" in manager._cpu_state.get(param, {})
     assert "step" not in manager._cpu_state.get(param, {})
     assert "found_inf" not in manager._cpu_state.get(param, {})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_canonical_cpu_buffers_are_pinned_at_their_exact_size():
+    """The caching host allocator would round each buffer up to a power of two."""
+
+    torch.cuda.init()
+    template = torch.empty(3 << 18, dtype=torch.float32)  # 3 MiB
+    cached_before = torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+
+    buffer = ChunkedOptimizerStateOffloader._new_cpu_buffer(template)
+
+    assert buffer.is_pinned()
+    assert buffer.shape == template.shape and buffer.dtype == template.dtype
+    assert buffer.untyped_storage().nbytes() == template.nbytes
+    assert torch.cuda.host_memory_stats().get("allocated_bytes.current", 0) == cached_before
+    source = torch.randn(template.shape, device="cuda")
+    buffer.copy_(source, non_blocking=True)
+    restored = torch.empty_like(source)
+    restored.copy_(buffer, non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.equal(restored, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_exact_size_pinned_buffer_stays_pinned_while_an_alias_lives(monkeypatch):
+    """Unregistration follows the storage, not the tensor object that was returned."""
+
+    torch.cuda.init()
+    cudart = torch.cuda.cudart()
+    unregistered = []
+    real_unregister = cudart.cudaHostUnregister
+
+    def record_unregister(ptr):
+        unregistered.append(ptr)
+        return real_unregister(ptr)
+
+    monkeypatch.setattr(cudart, "cudaHostUnregister", record_unregister)
+    buffer = ChunkedOptimizerStateOffloader._new_cpu_buffer(torch.empty(3 << 18))
+    ptr = buffer.data_ptr()
+    alias = buffer.view(-1)
+
+    del buffer
+    gc.collect()
+    assert alias.is_pinned() and unregistered == []
+
+    del alias
+    gc.collect()
+    assert unregistered == [ptr]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

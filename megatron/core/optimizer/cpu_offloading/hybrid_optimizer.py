@@ -262,6 +262,17 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         gpu_params_map_cpu_copy = {}
         cpu_copys_map_gpu_param = {}
         param_to_fp32_param = {}
+        # Rebuilding after load_state_dict reuses the previous copies: fresh ones
+        # would hold a second copy of every offloaded parameter during the rebuild.
+        prev_copies = {
+            **getattr(self, "param_to_fp32_param", {}),
+            **getattr(self, "gpu_params_map_cpu_copy", {}),
+        }
+        master_ids = {
+            id(s["master_param"])
+            for s in self.state.values()
+            if isinstance(s, dict) and isinstance(s.get("master_param"), torch.Tensor)
+        }
         for group in self.param_groups:
             gpu_group = group.copy()
             cpu_group = group.copy()
@@ -269,13 +280,30 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             cpu_group["params"] = []
             for param in group["params"]:
                 orig_param = param
-                cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
-                    param = param.detach().clone().cpu().pin_memory()
+                cpu_copy = offload_params_numel < offload_threshold and param.is_cuda
+                to_fp32 = self.param_update_in_fp32 and param.dtype != torch.float32
+                prev = prev_copies.get(orig_param)
+                if cpu_copy:
                     offload_params_numel += param.numel()
-                    cpu_copy = True
-                if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                if (
+                    prev is not None
+                    and prev.is_cuda == (param.is_cuda and not cpu_copy)
+                    and prev.dtype == (torch.float32 if to_fp32 else param.dtype)
+                    and prev.shape == param.shape
+                ):
+                    # A copy that is an FP32 master is overwritten from the master
+                    # after the rebuild (_update_fp32_params_by_new_state). The skip
+                    # relies on the master having been loaded in place into prev;
+                    # otherwise prev is copied here and overwritten later anyway.
+                    if not (to_fp32 and id(prev) in master_ids):
+                        prev.copy_(param.detach())
+                    param = prev
+                else:
+                    if cpu_copy:
+                        param = param.detach().clone().cpu().pin_memory()
+                    if to_fp32:
+                        param = param.detach().clone().float()
+                if to_fp32:
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:

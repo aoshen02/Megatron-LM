@@ -160,10 +160,10 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
-            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
+            # The microbatch loop never enters no_sync: an overlapped reduce
+            # would fire on partial gradients.
             use_distributed_optimizer=True,
-            overlap_grad_reduce=True,
+            overlap_grad_reduce=False,
             overlap_param_gather=True,
             grad_reduce_in_fp32=True,
         )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -15,10 +16,12 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
+    _NodeLocalDistSaveStrategy,
     _dist_opt_checkpoint_metadata,
     _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
+    _stage_model_state_on_host,
     _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
 )
@@ -28,8 +31,14 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
+def test_dist_opt_checkpoint_saves_buckets_in_place() -> None:
+    """The distributed-optimizer checkpoint defaults to dp_reshardable."""
+    assert _dist_opt_checkpoint_metadata(SimpleNamespace()) == DISTOPT_METADATA
+
+
 @pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
 def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
+    """A fully_reshardable checkpoint loads through the gloo exchange only if every group has one."""
     opts = [
         SimpleNamespace(
             data_parallel_group_gloo=group,
@@ -40,7 +49,11 @@ def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None
         )
         for group in groups
     ]
-    metadata = _dist_opt_checkpoint_metadata(SimpleNamespace(chained_optimizers=opts))
+    metadata = _dist_opt_checkpoint_metadata(
+        SimpleNamespace(chained_optimizers=opts),
+        {**DISTOPT_METADATA, "distrib_optim_sharding_type": "fully_reshardable"},
+    )
+    assert metadata["distrib_optim_sharding_type"] == "fully_reshardable"
     assert metadata["distrib_optim_fully_reshardable_mem_efficient"] is expected
 
 
@@ -57,6 +70,111 @@ def _assert_state_equal(actual, expected) -> None:
             _assert_state_equal(actual_item, expected_item)
     else:
         assert actual == expected
+
+
+@pytest.mark.gpus(2)
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world not in (2, 4):
+        pytest.skip("Run with torchrun using 2 or 4 ranks")
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    owned_group = not dist.is_initialized()
+    if owned_group:
+        dist.init_process_group("nccl" if device == "cuda" else "gloo")
+    try:
+        rank = dist.get_rank()
+        dp = world // 2
+        mesh = init_device_mesh(device, (2, dp), mesh_dim_names=("ep", "dp"))
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        local = torch.full((2, 4), float(rank + 1), device=device)
+        model.experts.weight0 = torch.nn.Parameter(DTensor.from_local(local.clone(), mesh["dp"], [Shard(0)]))
+        ps = SimpleNamespace(pp_size=1, pp_rank=0, ep_size=2, ep_rank=rank // dp)
+        monkeypatch.setattr(dcp, "_build_meshes", lambda config: (mesh, mesh))
+        path = [str(tmp_path) if rank == 0 else None]
+        dist.broadcast_object_list(path)
+        dcp.save_training_checkpoint(
+            model, None, 1, path[0], config=object(), ps=ps, save_rng=False, save_optimizer=False
+        )
+        with torch.no_grad():
+            model.experts.weight0.to_local().zero_()
+        dcp.load_training_checkpoint(
+            model, None, path[0], config=object(), ps=ps, load_rng=False, load_optimizer=False
+        )
+        assert torch.equal(model.experts.weight0.to_local(), local)
+        model.experts.weight0 = torch.nn.Parameter(torch.zeros_like(local))
+        dcp.load_training_checkpoint(
+            model,
+            None,
+            path[0],
+            config=object(),
+            ps=ps,
+            get_placements=lambda name: [Replicate(), Shard(0)],
+            load_rng=False,
+            load_optimizer=False,
+        )
+        assert torch.equal(model.experts.weight0, local)
+        ps.ep_size = 4
+        with pytest.raises(torch.distributed.checkpoint.CheckpointException):
+            dcp.load_training_checkpoint(
+                model,
+                None,
+                path[0],
+                config=object(),
+                ps=ps,
+                get_placements=lambda name: [Replicate(), Shard(0)],
+                load_rng=False,
+                load_optimizer=False,
+            )
+        assert torch.equal(model.experts.weight0, local)
+    finally:
+        if owned_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_dcp_save_does_not_keep_pinned_staging(monkeypatch, tmp_path) -> None:
+    """DCP stages GPU shards in pinned memory; the save must not leave them cached."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    assert not dist.is_initialized(), "needs to own a single-rank process group"
+    dist.init_process_group(
+        "cpu:gloo,cuda:nccl", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cuda", (1,))
+        model = torch.nn.Linear(1024, 1024, device="cuda")
+        monkeypatch.setattr(dcp, "_build_meshes", lambda config: (mesh, mesh))
+        ps = SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0)
+
+        def pinned() -> int:
+            return torch.cuda.host_memory_stats().get("allocated_bytes.current", 0)
+
+        before = pinned()
+        dcp.save_training_checkpoint(
+            model,
+            None,
+            1,
+            str(tmp_path / "ckpt"),
+            config=object(),
+            ps=ps,
+            get_placements=lambda name: [Replicate()],
+            save_rng=False,
+            save_optimizer=False,
+        )
+        assert pinned() <= before
+    finally:
+        dist.destroy_process_group()
 
 
 def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
@@ -81,14 +199,104 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
+def test_optimizer_checkpoint_load_uses_mmap(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    dcp._save_optimizer_checkpoint(optimizer, str(tmp_path))
+    original_load = dcp.torch.load
+    load_kwargs = {}
+
+    def observed_load(*args, **kwargs):
+        load_kwargs.update(kwargs)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(dcp.torch, "load", observed_load)
+
+    dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+
+    assert load_kwargs["mmap"] is True
+
+
+@pytest.mark.parametrize("writer_closes_stream", [False, True])
+def test_dcp_local_stage_publishes_completed_shard(tmp_path, writer_closes_stream) -> None:
+    stage_root = tmp_path / "stage"
+    destination = tmp_path / "checkpoint" / "__0_0.distcp"
+    filesystem = dcp._NodeLocalStagingFileSystem(stage_root)
+
+    with filesystem.create_stream(str(destination), "wb") as stream:
+        stream.write(b"checkpoint bytes")
+        if writer_closes_stream:
+            stream.close()
+
+    assert destination.read_bytes() == b"checkpoint bytes"
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_dcp_local_stage_does_not_publish_failed_write(tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    destination = tmp_path / "checkpoint" / "__0_0.distcp"
+    filesystem = dcp._NodeLocalStagingFileSystem(stage_root)
+
+    with (
+        pytest.raises(RuntimeError, match="write failed"),
+        filesystem.create_stream(str(destination), "wb") as stream,
+    ):
+        stream.write(b"partial checkpoint bytes")
+        raise RuntimeError("write failed")
+
+    assert not destination.exists()
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_dcp_local_stage_writer_is_opt_in(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("MLITE_DCP_LOCAL_STAGE_DIR", raising=False)
+    assert dcp._staged_dcp_writer(str(tmp_path / "checkpoint")) is None
+
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(tmp_path / "stage"))
+    writer = dcp._staged_dcp_writer(str(tmp_path / "checkpoint"))
+
+    assert isinstance(writer.fs, dcp._NodeLocalStagingFileSystem)
+
+
+def test_dcp_local_stage_publishes_optimizer(monkeypatch, tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+
+    dcp._save_optimizer_checkpoint(optimizer, str(tmp_path))
+
+    checkpoint = tmp_path / "optimizer_rank_0.pt"
+    assert checkpoint.exists()
+    _assert_state_equal(
+        torch.load(checkpoint, weights_only=False), optimizer.state_dict()
+    )
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_dcp_local_stage_publishes_rng_sidecar(monkeypatch, tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+    expected = {"torch_rng_state": torch.arange(4)}
+    monkeypatch.setattr(dcp, "_get_rng_state", lambda: expected)
+
+    dcp._save_rng_sidecar(tmp_path)
+
+    checkpoint = tmp_path / "rng_state_rank_00000.pt"
+    assert checkpoint.exists()
+    _assert_state_equal(torch.load(checkpoint, weights_only=False), expected)
+    assert not list(stage_root.rglob("*.stage"))
+
+
 class FakeDistOpt:
-    def __init__(self):
+    def __init__(self, metadata=None):
+        self.metadata = metadata or DISTOPT_METADATA
         self.save_model_sd = None
         self.load_model_sd = None
         self.loaded_state = None
 
     def sharded_state_dict(self, model_sd, is_loading: bool = False, metadata=None):
-        assert metadata == DISTOPT_METADATA
+        assert metadata == self.metadata
         if is_loading:
             self.load_model_sd = model_sd
         else:
@@ -114,8 +322,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
-    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "distrib_optim_sharding_type": "dp_reshardable",
     "chained_optim_avoid_prefix": True,
 }
 
@@ -145,7 +352,302 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert saved["checkpoint_dir"] == str(tmp_path / "step_5")
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
+    assert saved["kwargs"]["sharded_strategy"] is None
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_dist_opt_save_stages_main_model_replicas_in_pageable_host_memory() -> None:
+    """GPU model state is written from pageable copies, not cached pinned buffers."""
+    model = torch.nn.Linear(4, 2).cuda()
+    attach_model_sharded_state_dict([model], ParallelState(dp_size=2, dp_rank=0, dp_cp_rank=0))
+    main = _model_sharded_state_dict(model)
+    attach_model_sharded_state_dict([model], ParallelState(dp_size=2, dp_rank=1, dp_cp_rank=1))
+    replica = _model_sharded_state_dict(model)
+
+    _stage_model_state_on_host(main)
+    _stage_model_state_on_host(replica)
+
+    for name, param in model.named_parameters():
+        staged = main["model"][name].data
+        assert staged.device.type == "cpu" and not staged.is_pinned()
+        assert torch.equal(staged, param.detach().cpu())
+        assert replica["model"][name].data.is_cuda
+
+
+def test_dist_opt_checkpoint_uses_local_stage_strategy(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    saved = {}
+
+    def fake_save(_state_dict, _checkpoint_dir, **kwargs):
+        saved.update(kwargs)
+
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(tmp_path / "stage"))
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save
+    )
+
+    dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
+
+    strategy = saved["sharded_strategy"]
+    assert isinstance(strategy, _NodeLocalDistSaveStrategy)
+    assert strategy._stage_root == tmp_path / "stage"
+
+
+def test_dist_opt_local_stage_saves_checkpoint_end_to_end(
+    monkeypatch, tmp_path
+) -> None:
+    assert not torch.distributed.is_initialized(), (
+        "requires ownership of the default process group"
+    )
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'dist-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        stage_root = tmp_path / "stage"
+        checkpoint_root = tmp_path / "checkpoint"
+        monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = torch.nn.Linear(4, 2)
+        attach_model_sharded_state_dict([model], ParallelState())
+
+        dcp.save_training_checkpoint(
+            model, None, 5, str(checkpoint_root), use_dcp=True
+        )
+
+        step_path = checkpoint_root / "step_5"
+        assert (step_path / ".metadata").exists()
+        assert list(step_path.glob("*.distcp"))
+        assert not list(stage_root.rglob("*.stage"))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _save_with_failing_publish(rank, world, tmp_path, kind, failing_file, results) -> None:
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from megatron.core import dist_checkpointing
+    from megatron.core.dist_checkpointing.mapping import ShardedTensor
+    from megatron.lite.primitive.ckpt import distckpt, local_stage
+
+    stage_root = tmp_path / "stage"
+    os.environ["MLITE_DCP_LOCAL_STAGE_DIR"] = str(stage_root)
+    torch.cuda.synchronize = lambda *args, **kwargs: None
+    torch.cuda.current_device = lambda: torch.device("cpu")
+    publish = local_stage.publish_staged_file
+
+    def publish_or_fail(source, destination):
+        if destination.name == failing_file:
+            raise OSError("simulated publish failure")
+        publish(source, destination)
+
+    local_stage.publish_staged_file = publish_or_fail
+    distckpt.publish_staged_file = publish_or_fail
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'dist-init'}", rank=rank, world_size=world
+    )
+    try:
+        if kind == "dist_opt":
+            state = {
+                "w": ShardedTensor.from_rank_offsets(
+                    "w", torch.full((2, 4), float(rank)), (0, rank, world)
+                )
+            }
+            dist_checkpointing.save(
+                state,
+                str(tmp_path / "ckpt"),
+                sharded_strategy=distckpt._NodeLocalDistSaveStrategy(stage_root),
+                validate_access_integrity=False,
+            )
+        elif kind == "dist_opt_replicated":
+            # Rank 1 holds only a replica, so it has no write buckets.
+            model = torch.nn.Linear(4, 2)
+            attach_model_sharded_state_dict(
+                [model], ParallelState(dp_size=world, dp_rank=rank, dp_cp_rank=rank)
+            )
+            dcp.save_training_checkpoint(
+                model,
+                None,
+                1,
+                str(tmp_path / "ckpt"),
+                save_rng=False,
+                rank0_states={"lr_scheduler.pt": {"step": 1}},
+            )
+        else:
+            mesh = init_device_mesh("cpu", (world,))
+            dcp._build_meshes = lambda config: (mesh, mesh)
+            model = torch.nn.Linear(4, 2)
+            dcp.save_training_checkpoint(
+                model,
+                torch.optim.AdamW(model.parameters()),
+                1,
+                str(tmp_path / "ckpt"),
+                config=object(),
+                ps=SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0),
+                get_placements=lambda name: [Replicate()],
+                save_rng=False,
+            )
+        results.put((rank, None))
+    except Exception as exc:
+        results.put((rank, str(exc)))
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_two_ranks(target, *args) -> dict[int, str | None]:
+    import multiprocessing
+
+    world = 2
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(target=target, args=(rank, world, *args, results))
+        for rank in range(world)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        return dict(results.get(timeout=120) for _ in workers)
+    finally:
+        for worker in workers:
+            worker.join(timeout=30)
+            if worker.is_alive():
+                worker.terminate()
+
+
+@pytest.mark.parametrize(
+    "kind, failing_file, failing_rank",
+    [
+        ("dist_opt", "__1_0.distcp", 1),
+        ("dist_opt_replicated", "__0_0.distcp", 0),
+        ("fsdp2", "optimizer_rank_1.pt", 1),
+    ],
+)
+def test_local_stage_publish_failure_on_one_rank_raises_everywhere_without_metadata(
+    tmp_path, kind, failing_file, failing_rank
+) -> None:
+    """A failed publish raises on every rank and leaves no commit marker, even one
+    left by an earlier save into the same directory."""
+    checkpoint = tmp_path / "ckpt" / ("" if kind == "dist_opt" else "step_1")
+    checkpoint.mkdir(parents=True)
+    if kind != "dist_opt":
+        (checkpoint / ".metadata").write_bytes(b"stale")
+        (checkpoint / "metadata.json").write_text("{}")
+
+    errors = _run_two_ranks(_save_with_failing_publish, tmp_path, kind, failing_file)
+
+    assert "simulated publish failure" in errors[failing_rank]
+    assert "failed on another rank" in errors[1 - failing_rank]
+    assert not (checkpoint / ".metadata").exists()
+    assert not (checkpoint / "metadata.json").exists()
+    assert not list((tmp_path / "stage").rglob("*.stage"))
+
+
+def test_dist_opt_save_with_a_rank_without_shards_commits(tmp_path) -> None:
+    """A rank with nothing to write still joins the publication collective."""
+    errors = _run_two_ranks(_save_with_failing_publish, tmp_path, "dist_opt_replicated", None)
+
+    assert errors == {0: None, 1: None}
+    checkpoint = tmp_path / "ckpt" / "step_1"
+    assert (checkpoint / ".metadata").exists()
+    assert (checkpoint / "metadata.json").exists()
+    assert torch.load(tmp_path / "ckpt" / "lr_scheduler.pt") == {"step": 1}
+
+
+def _save_then_resume(rank, world, tmp_path, kind, overwrite, missing_file, loads, results):
+    """Save step 1, overwrite it with the ``overwrite`` save kwargs or drop rank 1's
+    ``missing_file``, then resume once per entry of ``loads``."""
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    os.environ["MLITE_DCP_LOCAL_STAGE_DIR"] = str(tmp_path / "stage")
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'dist-init'}", rank=rank, world_size=world
+    )
+    try:
+        model = torch.nn.Linear(4, 2)
+        if kind == "dist_opt":
+            torch.cuda.synchronize = lambda *args, **kwargs: None
+            torch.cuda.current_device = lambda: torch.device("cpu")
+            attach_model_sharded_state_dict(
+                [model], ParallelState(dp_size=world, dp_rank=rank, dp_cp_rank=rank)
+            )
+            optimizer = None
+            topology = {}
+        else:
+            mesh = init_device_mesh("cpu", (world,))
+            dcp._build_meshes = lambda config: (mesh, mesh)
+            optimizer = torch.optim.AdamW(model.parameters())
+            topology = {
+                "config": object(),
+                "ps": SimpleNamespace(pp_size=1, pp_rank=0, ep_size=1, ep_rank=0),
+                "get_placements": lambda name: [Replicate()],
+            }
+        path = str(tmp_path / "ckpt")
+        dcp.save_training_checkpoint(model, optimizer, 1, path, **topology)
+        if overwrite is not None:
+            dcp.save_training_checkpoint(model, optimizer, 1, path, **topology, **overwrite)
+        if missing_file is not None and rank == 1:
+            (tmp_path / "ckpt" / "step_1" / missing_file).unlink()
+        dist.barrier()
+        outcomes = []
+        for load_kwargs in loads:
+            try:
+                dcp.load_training_checkpoint(model, optimizer, path, **topology, **load_kwargs)
+                outcomes.append(None)
+            except BaseException as exc:  # DCP's CheckpointException is a BaseException
+                outcomes.append(f"{type(exc).__name__}: {exc}")
+        results.put((rank, outcomes))
+    except BaseException as exc:
+        results.put((rank, [f"save failed: {exc}"]))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "kind, overwrite, skip, stale",
+    [
+        ("fsdp2", {"save_optimizer": False}, {"load_optimizer": False}, "optimizer_rank_"),
+        ("fsdp2", {"save_rng": False}, {"load_rng": False}, "rng_state_rank_"),
+        ("dist_opt", {"save_rng": False}, {"load_rng": False}, "rng_state_rank_"),
+    ],
+)
+def test_overwrite_with_fewer_contents_leaves_no_stale_sidecars(
+    tmp_path, kind, overwrite, skip, stale
+) -> None:
+    """Sidecars from an earlier save into the same step directory are removed, so a
+    resume that needs them fails on every rank instead of loading stale state."""
+    outcomes = _run_two_ranks(_save_then_resume, tmp_path, kind, overwrite, None, [{}, skip])
+
+    for rank in (0, 1):
+        assert "FileNotFoundError: checkpoint file" in outcomes[rank][0], outcomes
+        assert outcomes[rank][1] is None, outcomes
+    assert not list((tmp_path / "ckpt" / "step_1").glob(f"{stale}*"))
+
+
+@pytest.mark.parametrize(
+    "kind, missing_file",
+    [
+        ("fsdp2", "optimizer_rank_1.pt"),
+        ("fsdp2", "rng_state_rank_00001.pt"),
+        ("dist_opt", "rng_state_rank_00001.pt"),
+    ],
+)
+def test_resume_with_one_rank_missing_a_sidecar_raises_on_every_rank(
+    tmp_path, kind, missing_file
+) -> None:
+    outcomes = _run_two_ranks(_save_then_resume, tmp_path, kind, None, missing_file, [{}])
+
+    assert missing_file in outcomes[1][0]
+    assert "failed on another rank" in outcomes[0][0]
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
@@ -260,10 +762,29 @@ def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
     assert _single_or_all_model_state(vpp_sd) is vpp_sd
 
 
-def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize(
+    "saved",
+    [
+        DISTOPT_METADATA,
+        {
+            "distrib_optim_sharding_type": "fully_reshardable",
+            "distrib_optim_fully_reshardable_mem_efficient": True,
+            "chained_optim_avoid_prefix": True,
+        },
+    ],
+)
+def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path, saved) -> None:
+    """The optimizer state is read in the sharding type the checkpoint was saved with."""
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
-    optimizer = FakeDistOpt()
+    expected_metadata = {
+        **DISTOPT_METADATA,
+        "distrib_optim_sharding_type": saved["distrib_optim_sharding_type"],
+    }
+    if saved["distrib_optim_sharding_type"] == "fully_reshardable":
+        # This optimizer has no gloo group, whatever the saving run had.
+        expected_metadata["distrib_optim_fully_reshardable_mem_efficient"] = False
+    optimizer = FakeDistOpt(expected_metadata)
     attach_model_sharded_state_dict([model], ParallelState())
     expected_weight = torch.full_like(wrapped_module.weight, 3.0)
     expected_bias = torch.full_like(wrapped_module.bias, -2.0)
@@ -281,8 +802,14 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
         }
 
     monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load_content_metadata",
+        lambda checkpoint_dir: saved,
+    )
 
-    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
+    step = dcp.load_training_checkpoint(
+        model, optimizer, str(tmp_path / "step_5"), use_dcp=True, load_rng=False
+    )
 
     assert step == 5
     assert not model.wrapper_load_called

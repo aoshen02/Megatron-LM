@@ -313,3 +313,45 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         assert torch.allclose(
             v, ref_params[k], atol=1e-03
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
+
+
+def test_load_state_dict_reuses_offloaded_copies_and_keeps_fp32_masters():
+    """Rebuilding after a load must not allocate a second copy of every parameter."""
+
+    def build():
+        setup_seed(42)
+        model = Fp32MarkedToyNet().cuda()
+        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+        optimizer = HybridDeviceOptimizer(
+            model.parameters(),
+            offload_fraction=1.0,
+            cpu_optimizer_cls=Adam,
+            gpu_optimizer_cls=GPUAdam,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=False,
+            lr=1e-3,
+        )
+        return model, optimizer
+
+    inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+    model, optimizer = build()
+    ref_model, ref_optimizer = build()
+    for m, o in ((model, optimizer), (ref_model, ref_optimizer)):
+        m(inputs).sum().backward()
+        o.step()
+
+    copies = dict(optimizer.gpu_params_map_cpu_copy)
+    optimizer.load_state_dict(optimizer.state_dict())
+    assert all(optimizer.gpu_params_map_cpu_copy[p] is c for p, c in copies.items())
+    for p, ref_p in zip(model.parameters(), ref_model.parameters()):
+        if p in optimizer.param_to_fp32_param:
+            assert torch.equal(
+                optimizer.param_to_fp32_param[p], ref_optimizer.param_to_fp32_param[ref_p]
+            )
+
+    for m, o in ((model, optimizer), (ref_model, ref_optimizer)):
+        o.zero_grad()
+        m(inputs).sum().backward()
+        o.step()
+    for p, ref_p in zip(model.parameters(), ref_model.parameters()):
+        assert torch.equal(p, ref_p)
