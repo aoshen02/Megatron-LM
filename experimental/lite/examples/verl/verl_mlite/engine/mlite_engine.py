@@ -269,7 +269,10 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         assert self._runtime_ctx is not None
         self._runtime_ctx.__exit__(exc_type, exc_val, exc_tb)
         super().__exit__(exc_type, exc_val, exc_tb)
-        self.engine._optimizer_load_pending = False
+        # A nested context (one per mini-batch, auto offload disabled) leaves
+        # the deferral to the context that requested it.
+        if not self.disable_auto_offload:
+            self.engine._optimizer_load_pending = False
         return False
 
 
