@@ -1,0 +1,3 @@
+# NeMo-RL with the external policy worker and vLLM worker extension hooks,
+# plus the Nemotron-H true-on-policy recipe and image.
+nemo-rl @ git+https://github.com/aoshen02/RL.git@nemotron-h-mlite-true-on-policy
