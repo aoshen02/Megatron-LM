@@ -1156,12 +1156,7 @@ class _ParamAndGradBuffer:
             if self.ddp_config.use_distributed_optimizer and any(
                 is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
             ):
-                self.shared_buffer = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+                self.shared_buffer = self._allocate_buffer("shared", self.numel, self.grad_dtype)
                 # For FP32 weight grads, only half of the buffer is used to store params in bf16.
                 if self.grad_dtype == torch.float32:
                     self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
@@ -1174,18 +1169,8 @@ class _ParamAndGradBuffer:
                 # Only re-map param tensors if using distributed optimizer.
                 if self.ddp_config.use_distributed_optimizer:
                     numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
-                    self.param_data = torch.zeros(
-                        numel,
-                        dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
-                self.grad_data = torch.zeros(
-                    self.numel,
-                    dtype=self.grad_dtype,
-                    device=torch.cuda.current_device(),
-                    requires_grad=False,
-                )
+                    self.param_data = self._allocate_buffer("param", numel, self.param_dtype)
+                self.grad_data = self._allocate_buffer("grad", self.numel, self.grad_dtype)
 
         self.grad_data_size = 0
         self.param_data_size = 0
@@ -1426,6 +1411,11 @@ class _ParamAndGradBuffer:
             "\n".join(log_strs),
             tp_group=self.tp_group,
             dp_cp_group=self.dp_cp_group,
+        )
+
+    def _allocate_buffer(self, buffer_type, numel, dtype):
+        return torch.zeros(
+            numel, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
         )
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
